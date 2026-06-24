@@ -1,0 +1,35 @@
+#pragma once
+#include <Arduino.h>
+
+// Pixel-art Clawd, the Claude Code mascot.
+// 0 = transparent, 1 = orange body, 2 = eye
+#define MASCOT_COLS 12
+#define MASCOT_ROWS 12
+
+static const uint8_t MASCOT[MASCOT_ROWS][MASCOT_COLS] = {
+    {0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0},
+    {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0},
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+    {1, 1, 2, 2, 1, 1, 1, 1, 2, 2, 1, 1},
+    {1, 1, 2, 2, 1, 1, 1, 1, 2, 2, 1, 1},
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+    {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0},
+    {0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0},
+    {0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0},
+    {0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0},
+};
+
+template <typename Display>
+inline void drawMascot(Display &tft, int x, int y, int scale,
+                       uint16_t body, uint16_t eye) {
+    for (int r = 0; r < MASCOT_ROWS; r++) {
+        for (int c = 0; c < MASCOT_COLS; c++) {
+            uint8_t v = MASCOT[r][c];
+            if (v == 0) continue;
+            tft.fillRect(x + c * scale, y + r * scale, scale, scale,
+                         v == 1 ? body : eye);
+        }
+    }
+}
