@@ -1,24 +1,23 @@
 #pragma once
 #include <Arduino.h>
 
-// Pixel-art Clawd, the Claude Code mascot.
+// Pixel-art Clawd, the Claude Code mascot - the "space invader" look:
+// a rounded body with two eyes, horns poking out the sides, four legs under.
 // 0 = transparent, 1 = orange body, 2 = eye
-#define MASCOT_COLS 12
-#define MASCOT_ROWS 12
+#define MASCOT_COLS 13
+#define MASCOT_ROWS 10
 
 static const uint8_t MASCOT[MASCOT_ROWS][MASCOT_COLS] = {
-    {0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0},
-    {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0},
-    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
-    {1, 1, 2, 2, 1, 1, 1, 1, 2, 2, 1, 1},
-    {1, 1, 2, 2, 1, 1, 1, 1, 2, 2, 1, 1},
-    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
-    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
-    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
-    {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0},
-    {0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0},
-    {0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0},
-    {0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0},
+    {0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0},  // body (rounded top)
+    {0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0},
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},  // horns out the sides + body
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},  // horns out the sides + body
+    {0, 0, 1, 1, 2, 2, 1, 2, 2, 1, 1, 0, 0},  // eyes
+    {0, 0, 1, 1, 2, 2, 1, 2, 2, 1, 1, 0, 0},  // eyes
+    {0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0},
+    {0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0},  // body (rounded bottom)
+    {0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0},  // legs
+    {0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0},  // legs
 };
 
 template <typename Display>

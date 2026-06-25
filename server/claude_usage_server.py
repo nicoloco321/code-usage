@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Companion server for the ESP32 Claude Code usage display.
 
-LEGACY / OPTIONAL: the firmware now reads usage directly from Anthropic (see
-README and `claude setup-token`), so this server is no longer required. It's
-kept as a fallback and for its `--fake` demo mode. The only Mac-side helper you
-need for the live display is server/beacon.py (the "Claude is thinking" LED).
+LEGACY / OPTIONAL: the firmware now reads usage directly from Anthropic using a
+dedicated login (see README and server/device_login.py), so this server is no
+longer required. It's kept as a fallback and for its `--fake` demo mode. The
+only Mac-side helper you need for the live display is server/beacon.py (the
+"Claude is thinking" LED).
 
 Serves GET /usage as JSON:
 

@@ -1,17 +1,23 @@
 #pragma once
 
+// Copy this file to config.h and fill in your values:
+//   cp config.h.example config.h
+// config.h is gitignored because it holds secrets (Wi-Fi password, OAuth token).
+
 // ---- Fill these in before flashing ----
 
-#define WIFI_SSID   "SSID"
-#define WIFI_PASS   "PASSWORD"
+#define WIFI_SSID   "YourWiFiName"
+#define WIFI_PASS   "YourWiFiPassword"
 
-// Dedicated long-lived OAuth token for THIS device.
-//   1. On any machine logged into Claude Code, run:  claude setup-token
-//   2. Paste the sk-ant-oat01-... value it prints here.
-// This token is separate from your everyday Claude Code login, so the device
-// using (and occasionally refreshing) it never logs you out anywhere else.
-// Treat it like a password - anyone with it can read your usage.
-#define ANTHROPIC_TOKEN "sk-ant-oat01-REPLACE_ME"
+// Dedicated OAuth refresh token for THIS device. Mint one with:
+//   python3 server/device_login.py
+// (do NOT use `claude setup-token` - those tokens lack the user:profile scope
+// the usage endpoint requires, so they 403.) It's a separate login from your
+// everyday Claude Code session, so the device refreshing it never logs you out
+// elsewhere. The device turns it into short-lived access tokens on its own and
+// remembers the rotated token in flash (NVS), so you only paste it once.
+// Treat it like a password.
+#define DEVICE_REFRESH_TOKEN "REPLACE_ME"
 
 // Your local timezone, as a POSIX TZ string, so the device can render reset
 // times in local time. A few examples:
@@ -22,9 +28,12 @@
 // Full list: https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
 #define TIMEZONE    "PST8PDT,M3.2.0,M11.1.0"
 
-// How often to refetch usage from Anthropic (ms). The API is cached server-side;
-// keep this gentle - the LED reacts instantly via beacons regardless.
-#define USAGE_POLL_MS 30000
+// How often to refetch usage from Anthropic (ms). The login token tolerates
+// this easily - the only limit left is a burst one (~5 requests in a few
+// seconds trips a 5-min cooldown), which spaced polling never hits. 30s is also
+// fine; going much below ~15s risks the burst limit. The LED reacts instantly
+// via beacons regardless, and on a 429/403 the device auto-backs-off.
+#define USAGE_POLL_MS 60000   // 60 seconds
 
 // ---- "thinking" beacons ----
 // The display listens on this mDNS name + port for pings from your computers.
@@ -46,3 +55,8 @@
 #else
 #define RGB_LED_PIN  -1
 #endif
+
+// Some WS2812s (including this Waveshare board's) wire red and green opposite to
+// what neopixelWrite() assumes, so "green" comes out red. Set to 1 to swap them.
+// If the breathing light shows the wrong colour, flip this.
+#define RGB_LED_SWAP_RG 1

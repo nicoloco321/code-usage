@@ -1,0 +1,6 @@
+.pio
+firmware/.vscode
+.claude
+__pycache__/
+
+

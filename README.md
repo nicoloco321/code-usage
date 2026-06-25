@@ -35,11 +35,14 @@ the 480x320 landscape boards are still supported (see [Hardware](#hardware)).
 The ESP32 talks to Anthropic directly — **no companion server required**:
 
 1. **Usage** — the device fetches your real 5-hour / weekly utilization straight
-   from Anthropic's OAuth usage API over HTTPS, using a **dedicated long-lived
-   token** you mint once with `claude setup-token`. That token is separate from
-   your everyday Claude Code login, so the device refreshing it never logs you
-   out anywhere. The device also syncs time over NTP to render reset times
-   locally.
+   from Anthropic's OAuth usage API over HTTPS, using a **dedicated login** you
+   mint once with `server/device_login.py`. It's a separate authorization from
+   your everyday Claude Code session, so the device refreshing its token never
+   logs you out anywhere. The access token is short-lived, so the device
+   refreshes it itself and remembers the rotated token in flash (NVS). It also
+   syncs time over NTP to render reset times locally.
+   (Note: `claude setup-token` does **not** work here — those tokens lack the
+   `user:profile` scope the usage endpoint requires.)
 2. **"Claude is thinking"** — the usage API has no real-time activity signal, so
    the device listens for tiny HTTP *beacons* instead. **`server/beacon.py`** is
    a small, dependency-free script you run on any computer you use Claude Code on
@@ -89,32 +92,27 @@ layout scales from those.
 
 ## Setup
 
-### 1. Mint a token for the device
-
-On any machine logged into Claude Code:
+### 1. Mint a login for the device
 
 ```sh
-claude setup-token
+python3 server/device_login.py
 ```
 
-Copy the `sk-ant-oat01-...` value it prints. This is a long-lived token just for
-the display; it won't disturb your normal Claude Code login.
+Open the URL it prints, approve access, and paste the code back. It runs the
+same OAuth flow Claude Code uses (requesting the `user:profile` scope the usage
+endpoint needs), checks the new token against the usage API, and prints a
+`DEVICE_REFRESH_TOKEN` line to paste into config.h. This is a separate login
+from your everyday Claude Code session, so it won't disturb it.
 
-Optionally verify it can read usage before flashing — this should print JSON
-with a `five_hour` block:
-
-```sh
-curl -s https://api.anthropic.com/api/oauth/usage \
-  -H "Authorization: Bearer sk-ant-oat01-..." \
-  -H "anthropic-beta: oauth-2025-04-20" | head -c 200
-```
+> Don't use `claude setup-token` — those tokens are inference-only and lack
+> `user:profile`, so the usage endpoint returns `403`.
 
 ### 2. Configure and flash the ESP32
 
 Edit [config.h](firmware/src/config.h):
 
 - `WIFI_SSID` / `WIFI_PASS` — your 2.4 GHz network (ESP32 has no 5 GHz)
-- `ANTHROPIC_TOKEN` — the `sk-ant-oat01-...` value from step 1
+- `DEVICE_REFRESH_TOKEN` — the value printed by step 1
 - `TIMEZONE` — your POSIX TZ string (examples are in the file) for reset times
 
 Then plug in the board and:
@@ -188,7 +186,9 @@ On **Windows**, drop a shortcut to `pythonw beacon.py` in
   `beacon.py`, and how long the LED keeps blinking after the last beacon is
   `BEACON_TTL_MS` in config.h.
 - **RGB LED** — pin is `RGB_LED_PIN` in config.h (GPIO8 on the Waveshare C6,
-  `-1` to disable). Colour/blink rate live in `updateLed()` in main.cpp.
+  `-1` to disable); `RGB_LED_SWAP_RG` fixes boards that show the wrong colour.
+  The green "breathing" effect (brightness, speed) lives in `updateLed()` /
+  `RGB_LED_MAX` / `LED_BREATHE_MS` in main.cpp.
 
 ## Troubleshooting
 
@@ -196,7 +196,8 @@ On **Windows**, drop a shortcut to `pythonw beacon.py` in
 |---|---|
 | White / blank screen | Wrong driver for your panel — try the other env, check `TFT_BL` pin |
 | Bars show `--` | No successful fetch yet; check the status line and Wi-Fi |
-| "token rejected" | Re-run `claude setup-token` and update `ANTHROPIC_TOKEN` in config.h |
+| "auth failed - run device_login.py" | The refresh token was rejected (revoked, or NVS was wiped and config.h's token is stale). Re-run `python3 server/device_login.py` and update `DEVICE_REFRESH_TOKEN` in config.h |
+| "rate limited, retry in …s" | Throttled on the usage endpoint. The device backs off automatically (honors `Retry-After`) and clears itself. Don't lower `USAGE_POLL_MS` much, and avoid polling the same token from elsewhere |
 | "usage fetch failed" | Wi-Fi/DNS issue, or Anthropic unreachable; the device keeps retrying |
 | Reset times look wrong | Set the correct `TIMEZONE` in config.h; they're blank until NTP syncs (~few s) |
 | LED/spinner never moves | Run `server/beacon.py` on the busy machine; check it prints `blinking`, not `could not reach …` |

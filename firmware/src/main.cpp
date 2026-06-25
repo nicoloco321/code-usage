@@ -2,8 +2,8 @@
 //
 // Fully self-contained: the ESP32 fetches your real 5-hour / weekly rate-limit
 // utilization straight from Anthropic's OAuth usage API over HTTPS, using a
-// dedicated long-lived token (see config.h, `claude setup-token`). No companion
-// server needed.
+// dedicated login it refreshes itself (see config.h and server/device_login.py).
+// No companion server needed.
 //
 // "Claude is thinking right now" can't be read from the usage API, so the
 // device listens for tiny HTTP "beacons" instead: run server/beacon.py on any
@@ -25,6 +25,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <time.h>
 #include <ctype.h>
 
@@ -36,6 +37,18 @@ DisplayTFT tft;
 DisplaySprite spin(&tft);
 
 static const char *USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+static const char *TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
+static const char *OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";  // Claude Code's public client
+
+// OAuth tokens. The usage endpoint needs a user:profile-scoped token, which the
+// device gets from DEVICE_REFRESH_TOKEN (minted by server/device_login.py). The
+// access token lasts only ~8h, so the device refreshes it itself and remembers
+// the rotated refresh token in flash (NVS) - it's a separate login from your
+// Mac's, so this never disturbs Claude Code there.
+static Preferences prefs;
+static String g_access;
+static String g_refresh;
+static long   g_expiresAt = 0;  // epoch seconds when g_access expires
 
 // ---- palette (RGB565) ----
 static const uint16_t COL_BG     = 0x1082;  // #121212 near-black
@@ -76,6 +89,7 @@ static WebServer beacon(BEACON_PORT);
 static volatile unsigned long lastBeacon = 0;  // millis() of the last "thinking" ping
 
 static unsigned long lastPoll = 0;
+static unsigned long pollBackoff = 0;   // >0 => wait this long before next poll (429 cooldown)
 static unsigned long lastFrame = 0;
 static unsigned long lastOkFetch = 0;
 static int  frame = 0;
@@ -90,20 +104,31 @@ static void ledSet(uint8_t r, uint8_t g, uint8_t b) {
     uint32_t packed = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
     if (packed == lastLed) return;  // neopixelWrite re-clocks the LED; skip no-ops
     lastLed = packed;
+#if RGB_LED_SWAP_RG
+    neopixelWrite(RGB_LED_PIN, g, r, b);  // board wires R/G swapped
+#else
     neopixelWrite(RGB_LED_PIN, r, g, b);
+#endif
 #else
     (void)r; (void)g; (void)b;
 #endif
 }
 
-// Blink green while a beacon is live, otherwise off.
+static const int RGB_LED_MAX   = 70;     // peak green brightness (full is harsh)
+static const int LED_BREATHE_MS = 3500;  // one inhale+exhale
+
+// Breathe green while a beacon is live, otherwise off.
 static void updateLed(bool active, unsigned long now) {
-    if (active) {
-        bool on = (now / 150) % 2 == 0;     // ~3 Hz blink
-        ledSet(0, on ? 40 : 0, 0);          // modest green, full brightness is harsh
-    } else {
+    if (!active) {
         ledSet(0, 0, 0);
+        return;
     }
+    // Smooth 0->1->0 over LED_BREATHE_MS; squared for a more natural ease that
+    // lingers dim, like breathing rather than a triangle fade.
+    float phase = (now % LED_BREATHE_MS) / (float)LED_BREATHE_MS;  // 0..1
+    float level = 0.5f - 0.5f * cosf(phase * 2.0f * PI);           // 0..1..0
+    level *= level;
+    ledSet(0, (uint8_t)(level * RGB_LED_MAX + 0.5f), 0);
 }
 
 // ---------------------------------------------------------------- time
@@ -252,7 +277,7 @@ static void drawBars() {
 
 static void drawStaticUI() {
     tft.fillScreen(COL_BG);
-    drawMascot(tft, BAR_X, 12, 4, COL_ORANGE, TFT_BLACK);  // 12x12 grid -> 48x48
+    drawMascot(tft, BAR_X, 12, 4, COL_ORANGE, TFT_BLACK);  // 13x10 grid -> 52x40
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(COL_ORANGE, COL_BG);
     tft.drawString("Claude Code", 68, 18, 2);
@@ -262,11 +287,74 @@ static void drawStaticUI() {
     drawBars();
 }
 
+// ---------------------------------------------------------------- oauth tokens
+
+static void loadTokens() {
+    prefs.begin("clt", false);
+    g_refresh   = prefs.getString("refresh", "");
+    g_access    = prefs.getString("access", "");
+    g_expiresAt = prefs.getLong("exp", 0);
+    if (g_refresh.length() == 0) g_refresh = DEVICE_REFRESH_TOKEN;  // first boot: seed from config.h
+}
+
+static void saveTokens() {
+    prefs.putString("refresh", g_refresh);
+    prefs.putString("access", g_access);
+    prefs.putLong("exp", g_expiresAt);
+}
+
+// Exchange a refresh token for a fresh access token (and the rotated refresh
+// token), Claude Code-style. Persists the result. Returns true on success.
+static bool tryRefresh(const String &refreshTok) {
+    if (refreshTok.length() == 0) return false;
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setTimeout(8000);
+    if (!http.begin(client, TOKEN_URL)) return false;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("User-Agent", "claude-usage-display/1.0");  // Cloudflare 1010-blocks the default UA
+    String body = String("{\"grant_type\":\"refresh_token\",\"refresh_token\":\"") +
+                  refreshTok + "\",\"client_id\":\"" + OAUTH_CLIENT_ID + "\"}";
+    int code = http.POST(body);
+    if (code != 200) { http.end(); return false; }
+    String resp = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    if (deserializeJson(doc, resp)) return false;
+    const char *at = doc["access_token"] | "";
+    if (!at[0]) return false;
+    g_access = at;
+    const char *rt = doc["refresh_token"] | "";
+    if (rt[0]) g_refresh = rt;  // refresh tokens rotate; keep the new one
+    long expires_in = doc["expires_in"] | 28800;       // ~8h default
+    g_expiresAt = (long)time(nullptr) + expires_in;
+    saveTokens();
+    return true;
+}
+
+// Make sure g_access is valid, refreshing if it's missing or about to expire.
+// Falls back to the config.h token if the stored (rotated) one is rejected -
+// e.g. after a full flash erase wiped NVS but left a fresh token in config.h.
+static bool ensureAccessToken() {
+    time_t now = time(nullptr);
+    bool synced = now > 1700000000;  // NTP set the clock (after ~2023)
+    if (g_access.length() && synced && now < g_expiresAt - 300) return true;
+    if (tryRefresh(g_refresh)) return true;
+    String cfg = DEVICE_REFRESH_TOKEN;
+    if (g_refresh != cfg && tryRefresh(cfg)) return true;
+    return false;
+}
+
 // ---------------------------------------------------------------- network
 
-// Fetch usage straight from Anthropic. Returns the HTTP status code (200 on
-// success), or a negative HTTPClient error code on a transport failure.
-static int fetchUsage(Usage &u) {
+// One GET to the usage endpoint with the current access token. Returns the HTTP
+// status (200 ok), or a negative HTTPClient error. On 429/403, retryAfter is
+// set to the server's requested cooldown in seconds.
+static int usageRequest(Usage &u, int &retryAfter) {
+    retryAfter = 0;
     WiFiClientSecure client;
     client.setInsecure();  // skip CA validation; fine on a home LAN to a known host
 
@@ -274,13 +362,16 @@ static int fetchUsage(Usage &u) {
     http.setConnectTimeout(5000);
     http.setTimeout(5000);
     if (!http.begin(client, USAGE_URL)) return -1;
-    http.addHeader("Authorization", String("Bearer ") + ANTHROPIC_TOKEN);
+    http.addHeader("Authorization", String("Bearer ") + g_access);
     http.addHeader("anthropic-beta", "oauth-2025-04-20");
     http.addHeader("Content-Type", "application/json");
     http.addHeader("User-Agent", "claude-usage-display/1.0");
+    const char *collect[] = {"Retry-After"};
+    http.collectHeaders(collect, 1);
 
     int code = http.GET();
     if (code != 200) {
+        if (code == 429 || code == 403) retryAfter = http.header("Retry-After").toInt();
         http.end();
         return code;
     }
@@ -304,6 +395,21 @@ static int fetchUsage(Usage &u) {
     return 200;
 }
 
+// Fetch usage, getting/refreshing the access token as needed. Returns the HTTP
+// status (200 ok), -3 if no valid token could be obtained, or a negative
+// HTTPClient error. A 401 means the token went stale mid-flight: refresh once
+// and retry.
+static int fetchUsage(Usage &u, int &retryAfter) {
+    retryAfter = 0;
+    if (!ensureAccessToken()) return -3;
+    int code = usageRequest(u, retryAfter);
+    if (code == 401) {
+        g_expiresAt = 0;  // force a refresh
+        if (ensureAccessToken()) code = usageRequest(u, retryAfter);
+    }
+    return code;
+}
+
 // ---------------------------------------------------------------- beacons
 
 static void handleBeacon() {
@@ -325,6 +431,7 @@ static bool beaconActive(unsigned long now) {
 void setup() {
     Serial.begin(115200);
     ledSet(0, 0, 0);
+    loadTokens();
 
     tft.init();
     tft.setRotation(SCREEN_ROTATION);  // C6 portrait=0 (use 2 if upside down); landscape boards=1
@@ -366,12 +473,15 @@ void loop() {
 
     beacon.handleClient();
 
-    if (lastPoll == 0 || now - lastPoll >= USAGE_POLL_MS) {
+    unsigned long interval = pollBackoff ? pollBackoff : USAGE_POLL_MS;
+    if (lastPoll == 0 || now - lastPoll >= interval) {
         lastPoll = now;
         if (WiFi.status() == WL_CONNECTED) {
             Usage u;
-            int code = fetchUsage(u);
+            int retryAfter = 0;
+            int code = fetchUsage(u, retryAfter);
             if (code == 200) {
+                pollBackoff = 0;
                 bool barsChanged = !cur.valid ||
                                    u.fivePct != cur.fivePct ||
                                    u.weekPct != cur.weekPct ||
@@ -383,8 +493,18 @@ void loop() {
                 snprintf(msg, sizeof(msg), "usage ok  %s.local", MDNS_NAME);
                 drawStatusLine(msg, COL_GREEN);
                 lastOkFetch = now;
-            } else if (code == 401 || code == 403) {
-                drawStatusLine("token rejected - claude setup-token", COL_RED);
+            } else if (code == 401 || code == -3) {
+                drawStatusLine("auth failed - run device_login.py", COL_RED);
+            } else if (code == 429 || code == 403) {
+                // A 403 here is the edge rate-limiter, not a real auth failure: a
+                // valid token still gets it when hammered. Back off (plus a small
+                // margin) so the cooldown actually expires instead of being
+                // re-armed by the next poll. Default 10 min if no Retry-After.
+                unsigned long secs = (retryAfter > 0 ? (unsigned long)retryAfter : 600) + 30;
+                pollBackoff = secs * 1000UL;
+                char msg[48];
+                snprintf(msg, sizeof(msg), "rate limited, retry in %lus", secs);
+                drawStatusLine(msg, COL_YELLOW);
             } else if (now - lastOkFetch > 90000) {
                 char msg[40];
                 snprintf(msg, sizeof(msg), "usage fetch failed (%d)", code);
