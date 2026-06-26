@@ -28,12 +28,12 @@
 // Full list: https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
 #define TIMEZONE    "PST8PDT,M3.2.0,M11.1.0"
 
-// How often to refetch usage from Anthropic (ms). The login token tolerates
-// this easily - the only limit left is a burst one (~5 requests in a few
-// seconds trips a 5-min cooldown), which spaced polling never hits. 30s is also
-// fine; going much below ~15s risks the burst limit. The LED reacts instantly
-// via beacons regardless, and on a 429/403 the device auto-backs-off.
-#define USAGE_POLL_MS 60000   // 60 seconds
+// How often to refetch usage from Anthropic (ms). The usage endpoint is
+// rate-limited tighter than a pure burst - 60s still tripped the cooldown in
+// practice, so keep this generous. The numbers move slowly and the LED reacts
+// instantly via beacons regardless, so this only paces the bars. On a 429/403
+// the device auto-backs-off, so an occasional trip self-heals.
+#define USAGE_POLL_MS 90000   // 90 seconds
 
 // ---- "thinking" beacons ----
 // The display listens on this mDNS name + port for pings from your computers.
