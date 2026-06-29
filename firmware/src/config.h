@@ -43,9 +43,11 @@
 #define MDNS_NAME    "claude-display"
 #define BEACON_PORT  8080
 
-// Keep blinking for this long after the last beacon. Senders ping every few
-// seconds while active; this is the gap they're allowed before "idle".
-#define BEACON_TTL_MS 12000
+// Safety backstop only: if no beacon arrives for this long, fall back to idle.
+// The precise "stopped" signal is an explicit POST /thinking/off (e.g. from a
+// Claude Code Stop hook - see README), so this just catches a sender that died
+// mid-turn. Keep it well above the longest gap between "on" pings.
+#define BEACON_TTL_MS 300000   // 5 minutes
 
 // Onboard RGB status LED. The Waveshare ESP32-C6-LCD-1.47 has a WS2812 on
 // GPIO8. The 480x320 TFT_eSPI boards have no onboard RGB LED, so it's disabled

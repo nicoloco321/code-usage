@@ -412,16 +412,26 @@ static int fetchUsage(Usage &u, int &retryAfter) {
 
 // ---------------------------------------------------------------- beacons
 
-static void handleBeacon() {
+// /thinking and /thinking/on -> Claude is working (refresh the keep-alive).
+static void handleThinkingOn() {
     lastBeacon = millis();
-    beacon.send(200, "text/plain", "ok\n");
+    beacon.send(200, "text/plain", "on\n");
+}
+
+// /thinking/off -> Claude stopped: go idle immediately, no trailing timeout.
+static void handleThinkingOff() {
+    lastBeacon = 0;
+    beacon.send(200, "text/plain", "off\n");
 }
 
 static void handleRoot() {
     beacon.send(200, "text/plain",
-                "Claude Code usage display. POST or GET /thinking to blink.\n");
+                "Claude Code usage display. POST /thinking/on while working, "
+                "/thinking/off when done.\n");
 }
 
+// "Thinking" is sticky between an explicit on and off. BEACON_TTL_MS is only a
+// backstop: if a sender dies mid-turn and never sends /thinking/off, fall idle.
 static bool beaconActive(unsigned long now) {
     return lastBeacon != 0 && (now - lastBeacon) < BEACON_TTL_MS;
 }
@@ -454,8 +464,12 @@ void setup() {
         // Local time for reset formatting, plus mDNS + beacon listener.
         configTzTime(TIMEZONE, "pool.ntp.org", "time.google.com", "time.nist.gov");
         if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", BEACON_PORT);
-        beacon.on("/thinking", HTTP_POST, handleBeacon);
-        beacon.on("/thinking", HTTP_GET, handleBeacon);
+        beacon.on("/thinking", HTTP_POST, handleThinkingOn);
+        beacon.on("/thinking", HTTP_GET, handleThinkingOn);
+        beacon.on("/thinking/on", HTTP_POST, handleThinkingOn);
+        beacon.on("/thinking/on", HTTP_GET, handleThinkingOn);
+        beacon.on("/thinking/off", HTTP_POST, handleThinkingOff);
+        beacon.on("/thinking/off", HTTP_GET, handleThinkingOff);
         beacon.on("/", handleRoot);
         beacon.begin();
 

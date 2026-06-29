@@ -1,0 +1,38 @@
+{
+  "//": "Precise 'Claude is thinking' signal for the usage display. Merge these",
+  "//hooks": "into your ~/.claude/settings.json (user-level = applies everywhere).",
+  "//host": "Replace claude-display.local with the device's IP if mDNS doesn't resolve (e.g. on Windows without Bonjour).",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sf -m 1 -X POST http://claude-display.local:8080/thinking/on >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sf -m 1 -X POST http://claude-display.local:8080/thinking/on >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sf -m 1 -X POST http://claude-display.local:8080/thinking/off >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ]
+  }
+}

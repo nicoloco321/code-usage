@@ -47,8 +47,8 @@ def recently_active():
     return False
 
 
-def ping(host, port):
-    url = f"http://{host}:{port}/thinking"
+def ping(host, port, path="/thinking/on"):
+    url = f"http://{host}:{port}{path}"
     try:
         req = urllib.request.Request(url, method="POST")
         urllib.request.urlopen(req, timeout=2).read()
@@ -69,19 +69,24 @@ def main():
               file=sys.stderr)
 
     print(f"Beaconing {args.host}:{args.port} while Claude Code is active here. Ctrl-C to stop.")
-    state = None  # None / "up" / "down" / "idle", only to print on change
-    while True:
-        if recently_active():
-            ok = ping(args.host, args.port)
-            new = "up" if ok else "down"
-            if new != state:
-                print("blinking" if ok else f"could not reach {args.host}:{args.port}")
-                state = new
-            time.sleep(PING_EVERY_SECS)
-        else:
-            if state != "idle":
+    print("(For a more precise signal, use Claude Code hooks instead - see README.)")
+    state = None  # None / "active" / "idle", only act/print on change
+    try:
+        while True:
+            if recently_active():
+                ok = ping(args.host, args.port, "/thinking/on")
+                if state != "active":
+                    print("blinking" if ok else f"could not reach {args.host}:{args.port}")
+                    state = "active"
+                time.sleep(PING_EVERY_SECS)
+            else:
+                if state == "active":              # just went idle: turn it off now
+                    ping(args.host, args.port, "/thinking/off")
+                    print("idle")
                 state = "idle"
-            time.sleep(IDLE_POLL_SECS)
+                time.sleep(IDLE_POLL_SECS)
+    finally:
+        ping(args.host, args.port, "/thinking/off")  # don't leave it stuck on when we exit
 
 
 if __name__ == "__main__":

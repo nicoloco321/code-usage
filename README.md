@@ -44,12 +44,17 @@ The ESP32 talks to Anthropic directly — **no companion server required**:
    (Note: `claude setup-token` does **not** work here — those tokens lack the
    `user:profile` scope the usage endpoint requires.)
 2. **"Claude is thinking"** — the usage API has no real-time activity signal, so
-   the device listens for tiny HTTP *beacons* instead. **`server/beacon.py`** is
-   a small, dependency-free script you run on any computer you use Claude Code on
-   (macOS, Windows, Linux). It watches that machine's `~/.claude/projects`
-   session logs and pings the display while Claude is working — and the green LED
-   blinks. Run it on every machine you use; the display blinks whenever *any* of
-   them is active. (It's optional — skip it and you just lose the LED/spinner.)
+   the device listens for tiny HTTP *beacons* on `/thinking/on` and
+   `/thinking/off`. There are two ways to send them (both optional — skip them
+   and you just lose the LED/spinner):
+   - **Claude Code hooks (precise, recommended)** — fire `on` the instant you
+     submit a prompt and `off` the instant Claude finishes, straight from Claude
+     Code's lifecycle events. No timeout, no guessing. See
+     [Precise thinking via hooks](#3-optional-light-up-while-claude-is-thinking).
+   - **`server/beacon.py` (no config)** — a dependency-free watcher that infers
+     activity from `~/.claude/projects` session-log writes. Less precise (a small
+     trailing delay) but needs zero setup. Run it on any machine; the display
+     reacts whenever *any* of them is active.
 
 > The old `server/claude_usage_server.py` (a Mac-side usage proxy) is no longer
 > needed and is kept only as a fallback. The display is self-contained now.
@@ -130,23 +135,58 @@ shows its address (e.g. `claude-display.local  192.168.1.42`) on the status line
 
 The bars should fill in within ~30 s. If they show `--`, see Troubleshooting.
 
-### 3. (Optional) Blink the LED while Claude is thinking
+### 3. (Optional) Light up while Claude is thinking
 
-Run the beacon on each computer you use Claude Code on:
+Pick **one** of these per machine. Hooks are precise (exact start/stop); the
+beacon needs zero config but lags a little.
+
+#### Option A — Claude Code hooks (recommended)
+
+Claude Code fires lifecycle [hooks](https://docs.claude.com/en/docs/claude-code/hooks)
+you can hang a command on. We use three: `UserPromptSubmit` → **on**, `Stop` →
+**off**, and `PreToolUse` → **on** (a keep-alive for long turns). Merge
+[`server/claude-hooks.example.json`](server/claude-hooks.example.json) into your
+`~/.claude/settings.json` (user-level, so it applies to every project), replacing
+`claude-display.local` with the device's IP if mDNS doesn't resolve. Each hook is
+just:
+
+```sh
+curl -sf -m 1 -X POST http://claude-display.local:8080/thinking/on  >/dev/null 2>&1 || true
+curl -sf -m 1 -X POST http://claude-display.local:8080/thinking/off >/dev/null 2>&1 || true
+```
+
+The LED turns on the moment you hit enter and off the moment Claude stops — no
+trailing delay. (`-m 1` keeps a hook from ever blocking Claude Code; the device's
+5-min `BEACON_TTL_MS` is just a backstop if a `Stop` hook is ever missed.)
+
+> **Use the device's IP, not `claude-display.local`, in hooks.** With the 1s
+> `curl` timeout, `.local` mDNS names often don't resolve in time (macOS `ping`
+> resolves them, but `curl` frequently can't), so the hook silently no-ops. Get
+> the IP from the device's status line, or run
+> [`python3 server/find_display.py`](server/find_display.py) — it resolves the
+> device and prints the IP plus the exact hook commands ready to paste.
+>
+> Then **pin that IP** so it doesn't change out from under the hooks: add a
+> **DHCP reservation** for the device in your router (map the display's MAC
+> address to a fixed IP). Otherwise a new lease can reassign the address and the
+> hooks quietly stop working. Hooks also load at **session start**, so restart
+> Claude Code after editing `settings.json`.
+
+#### Option B — the beacon watcher (no config)
 
 ```sh
 python3 server/beacon.py            # auto-finds the display at claude-display.local
 python3 server/beacon.py --host 192.168.1.42   # or point at its IP
 ```
 
-No dependencies — Python 3 stdlib only, and it works on macOS, Windows and Linux.
-While Claude is working on that machine it pings the display and the green LED
-blinks; run it on several machines and the display reacts to whichever is busy.
+No dependencies — Python 3 stdlib only, macOS/Windows/Linux. It infers activity
+from session-log writes, sends `/thinking/on` while busy and `/thinking/off` when
+idle. Simpler, but a few seconds less precise than hooks.
 
 > On **Windows**, the `claude-display.local` name needs Apple Bonjour installed.
-> If it can't resolve, pass `--host <the IP shown on the display>`.
+> If it can't resolve, use the device's IP (in the hook URLs, or `--host`).
 
-To keep it running across reboots on macOS, add a LaunchAgent:
+To keep the beacon running across reboots on macOS, add a LaunchAgent:
 
 ```sh
 cat > ~/Library/LaunchAgents/com.nicoloco.claude-beacon.plist <<EOF
