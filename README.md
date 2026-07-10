@@ -9,6 +9,10 @@ the 480x320 landscape boards are still supported (see [Hardware](#hardware)).
 - **Bottom** — two live bars: your **5-hour limit** and **weekly limit**,
   with real utilization percentages and reset times (green < 50%, yellow < 80%, red above)
 - **Onboard RGB LED** — blinks green whenever Claude is thinking (Waveshare C6 board)
+- **Spotify mode** — flip the same screen to a Spotify **now playing** view
+  (track, artist, album, live progress bar). Switch from inside Claude Code
+  with the **`/switch`** slash command, or with a one-line `curl`; the choice
+  survives power cycles
 
 ```
 +------------------+   172x320 portrait
@@ -55,6 +59,14 @@ The ESP32 talks to Anthropic directly — **no companion server required**:
      activity from `~/.claude/projects` session-log writes. Less precise (a small
      trailing delay) but needs zero setup. Run it on any machine; the display
      reacts whenever *any* of them is active.
+
+3. **Screen modes** — the same tiny HTTP server switches what's on screen:
+   `POST /mode/usage`, `/mode/spotify` or `/mode/toggle` (and `GET /mode` to
+   ask). In Spotify mode the device polls Spotify's currently-playing endpoint
+   with its own login (minted once with `server/spotify_login.py`, PKCE — no
+   client secret on the device) and ticks the progress bar locally between
+   polls. The repo ships a [`/switch` Claude Code command](.claude/commands/switch.md)
+   that drives this. See [Spotify now-playing mode](#4-optional-spotify-now-playing-mode).
 
 > The old `server/claude_usage_server.py` (a Mac-side usage proxy) is no longer
 > needed and is kept only as a fallback. The display is self-contained now.
@@ -208,6 +220,49 @@ launchctl load ~/Library/LaunchAgents/com.nicoloco.claude-beacon.plist
 On **Windows**, drop a shortcut to `pythonw beacon.py` in
 `shell:startup`, or register it with Task Scheduler at logon.
 
+### 4. (Optional) Spotify now-playing mode
+
+The display can flip to a "now playing" screen. It needs its own Spotify
+authorization (any free account works):
+
+1. Create an app at <https://developer.spotify.com/dashboard> (any
+   name/description). In the app's settings add this **exact Redirect URI**:
+   `http://127.0.0.1:8898/callback`, and tick **Web API**. You never need the
+   client secret — the login uses PKCE.
+2. Mint the token (paste the app's **Client ID** when prompted):
+
+   ```sh
+   python3 server/spotify_login.py
+   ```
+
+3. Paste the two printed `#define` lines (`SPOTIFY_CLIENT_ID`,
+   `SPOTIFY_REFRESH_TOKEN`) into `firmware/src/config.h` and reflash.
+
+Switch screens any time (the device remembers the mode across power cycles,
+and the thinking LED keeps working in both modes):
+
+```sh
+curl -X POST http://claude-display.local:8080/mode/spotify   # now playing
+curl -X POST http://claude-display.local:8080/mode/usage     # back to usage
+curl -X POST http://claude-display.local:8080/mode/toggle    # flip
+curl      http://claude-display.local:8080/mode              # ask
+```
+
+#### The `/switch` command in Claude Code
+
+The repo ships a slash command at
+[.claude/commands/switch.md](.claude/commands/switch.md) — inside this repo,
+just type `/switch`. To use it from **any** project, copy it to your user
+commands folder:
+
+```sh
+mkdir -p ~/.claude/commands && cp .claude/commands/switch.md ~/.claude/commands/
+```
+
+Then `/switch spotify`, `/switch usage`, `/switch toggle` — or plain
+`/switch` to be asked which one you want. (Claude Code discovers new commands
+at session start, so restart it once after copying.)
+
 ## Customizing
 
 - **Mascot** — pixel grid in [mascot.h](firmware/src/mascot.h); edit the
@@ -225,6 +280,10 @@ On **Windows**, drop a shortcut to `pythonw beacon.py` in
   `barColor()`; "working" detection window is `ACTIVE_WINDOW_SECS` in
   `beacon.py`, and how long the LED keeps blinking after the last beacon is
   `BEACON_TTL_MS` in config.h.
+- **Spotify poll rate** — `SPOTIFY_POLL_MS` in config.h paces how fast track
+  changes/seeks show up; the progress bar animates locally between polls
+  either way. The Spotify screen layout lives in the `SP_*` constants in
+  [main.cpp](firmware/src/main.cpp).
 - **RGB LED** — pin is `RGB_LED_PIN` in config.h (GPIO8 on the Waveshare C6,
   `-1` to disable); `RGB_LED_SWAP_RG` fixes boards that show the wrong colour.
   The green "breathing" effect (brightness, speed) lives in `updateLed()` /
@@ -242,3 +301,6 @@ On **Windows**, drop a shortcut to `pythonw beacon.py` in
 | Reset times look wrong | Set the correct `TIMEZONE` in config.h; they're blank until NTP syncs (~few s) |
 | LED/spinner never moves | Run `server/beacon.py` on the busy machine; check it prints `blinking`, not `could not reach …` |
 | Beacon can't find device | Use `--host <IP shown on the display>` (Windows needs Bonjour for `.local`) |
+| `/mode/spotify` answers 409 / "spotify not set up" | Spotify isn't configured: run `python3 server/spotify_login.py`, paste both `#define`s into config.h, reflash |
+| "spotify auth failed" | Refresh token revoked or wrong client id — re-run `spotify_login.py`. A persistent 403 usually means your account isn't added to the Spotify app (Dashboard → your app → User Management) |
+| "nothing playing" but music is on | Spotify only reports an *active* device; start playback from any Spotify app and it appears within one poll (~5 s) |

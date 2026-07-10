@@ -11,6 +11,12 @@
 // while Claude is working. The onboard RGB LED blinks green whenever a beacon
 // is live, from any machine.
 //
+// The same little HTTP server also switches what's on screen: the usage view,
+// or a Spotify "now playing" view (track / artist / progress bar) fetched with
+// a dedicated Spotify login (see server/spotify_login.py). POST /mode/usage,
+// /mode/spotify or /mode/toggle - e.g. from the /switch Claude Code command -
+// and the choice persists across power cycles.
+//
 // Layout (portrait 172x320, e.g. Waveshare ESP32-C6-LCD-1.47):
 //   top:     Clawd mascot + title
 //   middle:  animated thinking spinner while a beacon says Claude is working
@@ -40,6 +46,11 @@ static const char *USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 static const char *TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 static const char *OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";  // Claude Code's public client
 
+// Spotify (only used when SPOTIFY_* are set in config.h).
+static const char *SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
+static const char *SPOTIFY_NOW_URL =
+    "https://api.spotify.com/v1/me/player/currently-playing?additional_types=episode";
+
 // OAuth tokens. The usage endpoint needs a user:profile-scoped token, which the
 // device gets from DEVICE_REFRESH_TOKEN (minted by server/device_login.py). The
 // access token lasts only ~8h, so the device refreshes it itself and remembers
@@ -50,6 +61,12 @@ static String g_access;
 static String g_refresh;
 static long   g_expiresAt = 0;  // epoch seconds when g_access expires
 
+// Spotify tokens, refreshed the same way. The login is a PKCE app, so only the
+// client id is needed - no secret ever touches the device.
+static String g_spAccess;
+static String g_spRefresh;
+static long   g_spExpiresAt = 0;
+
 // ---- palette (RGB565) ----
 static const uint16_t COL_BG     = 0x1082;  // #121212 near-black
 static const uint16_t COL_CARD   = 0x2945;  // dark gray track
@@ -59,6 +76,7 @@ static const uint16_t COL_DIM    = 0x7BCF;  // mid gray
 static const uint16_t COL_GREEN  = 0x3DCA;
 static const uint16_t COL_YELLOW = 0xDD08;
 static const uint16_t COL_RED    = 0xE289;
+static const uint16_t COL_SPOTIFY = 0x1DCA;  // #1DB954 Spotify green
 
 // SCREEN_W / SCREEN_H / SCREEN_ROTATION come from display.h (per board).
 
@@ -76,6 +94,18 @@ static const int SEC1_Y = 176;              // 5-hour section
 static const int SEC2_Y = 244;              // weekly section
 static const int STATUS_Y = 304;
 
+// ---- layout (Spotify mode) ----
+static const int SP_DIV_Y    = 60;    // divider under the header
+static const int SP_TRACK_Y  = 72;    // track name, up to two lines
+static const int SP_ARTIST_Y = 114;   // artists, tucked under the track
+static const int SP_ALBUM_Y  = 138;   // album title
+static const int SP_ART_Y    = 156;   // album art, centered (LovyanGFX only)
+static const int SP_ART_SIZE = 64;    // Spotify's smallest native variant
+static const int SP_TIME_Y   = 238;   // elapsed / total readouts
+static const int SP_BAR_Y    = 252;   // progress bar
+static const int SP_BAR_H    = 10;
+static const int SP_STATE_Y  = 272;   // playing / paused
+
 struct Usage {
     bool  valid = false;
     float fivePct = -1;
@@ -85,6 +115,35 @@ struct Usage {
 };
 
 static Usage cur;
+
+// Which screen is showing. Persisted in NVS so the display comes back up in
+// the same mode after a power cycle.
+enum DisplayMode : uint8_t { MODE_USAGE = 0, MODE_SPOTIFY = 1 };
+static DisplayMode g_mode = MODE_USAGE;
+
+struct NowPlaying {
+    bool valid = false;      // at least one successful fetch
+    bool hasTrack = false;
+    bool playing = false;
+    long progressMs = 0;
+    long durationMs = 0;
+    char track[80] = "";
+    char artist[64] = "";
+    char album[64] = "";
+    char artUrl[120] = "";   // smallest suitable album-art jpeg
+    long artW = 0;           // its native width, for scaling
+};
+
+static NowPlaying np;
+static unsigned long npFetchedAt = 0;   // millis() when np.progressMs was current
+static unsigned long spLastPoll = 0;
+static unsigned long spBackoff = 0;     // 429 cooldown, like pollBackoff
+static unsigned long spLastOk = 0;
+static char spSig[192] = "\x01";        // what the track area currently shows
+static char spShownArt[120] = "";       // art url currently on screen (or tried)
+static long spShownSec = -1;            // progress second on screen
+static int  spShownState = -1;          // 0=paused 1=playing
+
 static WebServer beacon(BEACON_PORT);
 static volatile unsigned long lastBeacon = 0;  // millis() of the last "thinking" ping
 
@@ -287,6 +346,179 @@ static void drawStaticUI() {
     drawBars();
 }
 
+// ---------------------------------------------------------------- spotify screen
+
+// The built-in fonts are ASCII-only, so drop other UTF-8 bytes instead of
+// rendering them as garbage glyphs ("Beyoncé" -> "Beyonc").
+static void asciiCopy(char *dst, size_t n, const char *src) {
+    size_t j = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && j + 1 < n; p++)
+        if (*p >= 0x20 && *p < 0x7F) dst[j++] = (char)*p;
+    dst[j] = '\0';
+}
+
+// Shorten s in place (appending "..") until it fits in maxW pixels.
+static void ellipsize(char *s, size_t cap, int maxW, int font) {
+    tft.setTextFont(font);
+    if ((int)tft.textWidth(s) <= maxW) return;
+    char buf[96];
+    size_t len = strlen(s);
+    do {
+        len--;
+        snprintf(buf, sizeof(buf), "%.*s..", (int)len, s);
+    } while (len > 0 && (int)tft.textWidth(buf) > maxW);
+    strlcpy(s, buf, cap);
+}
+
+// Break s at a word boundary so the first line fits in maxW; the remainder is
+// ellipsized into l2. A single overlong word gets hard-broken instead.
+static void wrapTwoLines(const char *s, char *l1, size_t n1, char *l2, size_t n2,
+                         int maxW, int font) {
+    tft.setTextFont(font);
+    strlcpy(l1, s, n1);
+    l2[0] = '\0';
+    if ((int)tft.textWidth(l1) <= maxW) return;
+
+    size_t fit = strlen(l1);
+    while (fit > 1) {  // longest prefix that fits
+        l1[--fit] = '\0';
+        if ((int)tft.textWidth(l1) <= maxW) break;
+    }
+    size_t brk = fit;
+    while (brk > 0 && l1[brk - 1] != ' ') brk--;  // back up to a space
+    size_t split = brk > 0 ? brk : fit;
+    strlcpy(l2, s + split, n2);
+    l1[split] = '\0';
+    while (split > 0 && l1[split - 1] == ' ') l1[--split] = '\0';
+    ellipsize(l2, n2, maxW, font);
+}
+
+static void fmtMs(long ms, char *out, size_t n) {
+    if (ms < 0) ms = 0;
+    long s = ms / 1000;
+    snprintf(out, n, "%ld:%02ld", s / 60, s % 60);
+}
+
+static void drawSpotifyLogo(int cx, int cy, int r) {
+    tft.fillCircle(cx, cy, r, COL_SPOTIFY);
+    // flat take on the three "sound wave" bars of the Spotify mark
+    tft.fillRoundRect(cx - 13, cy - 9, 27, 4, 2, COL_BG);
+    tft.fillRoundRect(cx - 11, cy - 1, 22, 4, 2, COL_BG);
+    tft.fillRoundRect(cx - 8,  cy + 7, 17, 4, 2, COL_BG);
+}
+
+static void drawSpotifyProgress(long ms) {
+    char el[12], tot[12];
+    fmtMs(ms, el, sizeof(el));
+    fmtMs(np.durationMs, tot, sizeof(tot));
+
+    tft.fillRect(BAR_X, SP_TIME_Y, BAR_W, 12, COL_BG);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(el, BAR_X, SP_TIME_Y, 1);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(tot, PCT_X, SP_TIME_Y, 1);
+
+    tft.fillRoundRect(BAR_X, SP_BAR_Y, BAR_W, SP_BAR_H, 4, COL_CARD);
+    if (np.durationMs > 0) {
+        int fw = (int)((long long)BAR_W * ms / np.durationMs);
+        if (fw > 6) tft.fillRoundRect(BAR_X, SP_BAR_Y, fw, SP_BAR_H, 4, COL_SPOTIFY);
+    }
+}
+
+// The built-in bitmap fonts are ASCII-only, so there is no ▶ / ⏸ glyph to
+// print - drawString("▶") just emits the raw UTF-8 bytes as junk. Draw the
+// icons as shapes instead: a triangle while playing, two bars while paused.
+static void drawSpotifyStateWord(bool playing) {
+    tft.fillRect(0, SP_STATE_Y, SCREEN_W, 18, COL_BG);
+    const int cx = SCREEN_W / 2, y = SP_STATE_Y + 1, h = 14;
+    if (playing) {
+        tft.fillTriangle(cx - 5, y, cx - 5, y + h, cx + 7, y + h / 2, COL_SPOTIFY);
+    } else {
+        tft.fillRoundRect(cx - 8, y, 5, h, 1, COL_DIM);
+        tft.fillRoundRect(cx + 3, y, 5, h, 1, COL_DIM);
+    }
+}
+
+static void spSignature(char *out, size_t n) {
+    snprintf(out, n, "%d|%d|%ld|%s|%s|%s", (int)np.valid, (int)np.hasTrack,
+             np.durationMs, np.track, np.artist, np.album);
+}
+
+// Repaint the whole track area (everything between the header divider and the
+// status line) from np. Progress/state redraw right after via their caches.
+static void drawSpotifyTrack() {
+    spSignature(spSig, sizeof(spSig));
+    spShownSec = -1;
+    spShownState = -1;
+    tft.fillRect(0, SP_DIV_Y + 2, SCREEN_W, STATUS_Y - SP_DIV_Y - 6, COL_BG);
+    if (!np.hasTrack) {
+        tft.setTextDatum(TC_DATUM);
+        tft.setTextColor(COL_DIM, COL_BG);
+        tft.drawString(np.valid ? "nothing playing" : "loading...",
+                       SCREEN_W / 2, (SP_DIV_Y + STATUS_Y) / 2 - 8, 2);
+        return;
+    }
+
+    char l1[80], l2[80];
+    wrapTwoLines(np.track, l1, sizeof(l1), l2, sizeof(l2), BAR_W, 2);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(COL_TEXT, COL_BG);
+    tft.drawString(l1, BAR_X, SP_TRACK_Y, 2);
+    if (l2[0]) tft.drawString(l2, BAR_X, SP_TRACK_Y + 20, 2);
+
+    char line[64];
+    strlcpy(line, np.artist, sizeof(line));
+    ellipsize(line, sizeof(line), BAR_W, 2);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString(line, BAR_X, SP_ARTIST_Y, 2);
+
+    strlcpy(line, np.album, sizeof(line));
+    ellipsize(line, sizeof(line), BAR_W, 1);
+    tft.drawString(line, BAR_X, SP_ALBUM_Y, 1);
+
+#if defined(USE_LOVYANGFX)
+    // Album art placeholder; drawAlbumArt() paints over it once fetched.
+    spShownArt[0] = '\0';
+    if (np.artUrl[0])
+        tft.fillRoundRect((SCREEN_W - SP_ART_SIZE) / 2, SP_ART_Y,
+                          SP_ART_SIZE, SP_ART_SIZE, 4, COL_CARD);
+#endif
+}
+
+static void drawSpotifyStaticUI() {
+    tft.fillScreen(COL_BG);
+    drawSpotifyLogo(BAR_X + 20, 32, 20);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(COL_SPOTIFY, COL_BG);
+    tft.drawString("Spotify", 68, 18, 2);
+    tft.setTextColor(COL_DIM, COL_BG);
+    tft.drawString("now playing", 68, 40, 1);
+    tft.drawFastHLine(BAR_X, SP_DIV_Y, BAR_W, COL_CARD);
+    drawSpotifyTrack();
+}
+
+// Flip between the usage screen and the Spotify screen (persisted in NVS).
+static void applyMode(DisplayMode m) {
+    if (m == g_mode) return;
+    g_mode = m;
+    prefs.putUChar("mode", (uint8_t)m);
+    if (m == MODE_SPOTIFY) {
+        spLastPoll = 0;  // fetch as soon as loop() comes back around
+        spBackoff = 0;
+        drawSpotifyStaticUI();
+        drawStatusLine("fetching spotify...", COL_DIM);
+    } else {
+        idleSpinnerDrawn = false;  // loop() repaints the spinner + status word
+        lastStatusWord = -1;
+        drawStaticUI();            // bars redraw from the cached usage numbers
+        char msg[48];
+        snprintf(msg, sizeof(msg), "%s.local  %s", MDNS_NAME,
+                 WiFi.localIP().toString().c_str());
+        drawStatusLine(msg, COL_DIM);
+    }
+}
+
 // ---------------------------------------------------------------- oauth tokens
 
 static void loadTokens() {
@@ -295,6 +527,14 @@ static void loadTokens() {
     g_access    = prefs.getString("access", "");
     g_expiresAt = prefs.getLong("exp", 0);
     if (g_refresh.length() == 0) g_refresh = DEVICE_REFRESH_TOKEN;  // first boot: seed from config.h
+
+    g_spRefresh   = prefs.getString("sp_refresh", "");
+    g_spAccess    = prefs.getString("sp_access", "");
+    g_spExpiresAt = prefs.getLong("sp_exp", 0);
+    if (g_spRefresh.length() == 0) g_spRefresh = SPOTIFY_REFRESH_TOKEN;
+
+    g_mode = (DisplayMode)prefs.getUChar("mode", MODE_USAGE);
+    if (g_mode == MODE_SPOTIFY && g_spRefresh.length() == 0) g_mode = MODE_USAGE;
 }
 
 static void saveTokens() {
@@ -345,6 +585,50 @@ static bool ensureAccessToken() {
     if (tryRefresh(g_refresh)) return true;
     String cfg = DEVICE_REFRESH_TOKEN;
     if (g_refresh != cfg && tryRefresh(cfg)) return true;
+    return false;
+}
+
+// Spotify's equivalent of tryRefresh(): swap the refresh token for an access
+// token. PKCE app, so the body is form-encoded and carries no client secret.
+// Spotify sometimes rotates the refresh token too; keep whatever comes back.
+static bool trySpotifyRefresh(const String &refreshTok) {
+    if (refreshTok.length() == 0 || strlen(SPOTIFY_CLIENT_ID) == 0) return false;
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setTimeout(8000);
+    if (!http.begin(client, SPOTIFY_TOKEN_URL)) return false;
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    String body = String("grant_type=refresh_token&refresh_token=") + refreshTok +
+                  "&client_id=" + SPOTIFY_CLIENT_ID;
+    int code = http.POST(body);
+    if (code != 200) { http.end(); return false; }
+    String resp = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    if (deserializeJson(doc, resp)) return false;
+    const char *at = doc["access_token"] | "";
+    if (!at[0]) return false;
+    g_spAccess = at;
+    const char *rt = doc["refresh_token"] | "";
+    if (rt[0]) g_spRefresh = rt;
+    long expires_in = doc["expires_in"] | 3600;
+    g_spExpiresAt = (long)time(nullptr) + expires_in;
+    prefs.putString("sp_refresh", g_spRefresh);
+    prefs.putString("sp_access", g_spAccess);
+    prefs.putLong("sp_exp", g_spExpiresAt);
+    return true;
+}
+
+static bool ensureSpotifyToken() {
+    time_t now = time(nullptr);
+    bool synced = now > 1700000000;
+    if (g_spAccess.length() && synced && now < g_spExpiresAt - 300) return true;
+    if (trySpotifyRefresh(g_spRefresh)) return true;
+    String cfg = SPOTIFY_REFRESH_TOKEN;
+    if (cfg.length() && g_spRefresh != cfg && trySpotifyRefresh(cfg)) return true;
     return false;
 }
 
@@ -410,6 +694,155 @@ static int fetchUsage(Usage &u, int &retryAfter) {
     return code;
 }
 
+// Pick the art variant to fetch: the smallest one that's still >= SP_ART_SIZE
+// (Spotify lists images largest first; albums ship 640/300/64). Falls back to
+// the largest available if nothing reaches SP_ART_SIZE.
+static void pickArt(JsonArray imgs, NowPlaying &out) {
+    long best = 0;
+    for (JsonObject im : imgs) {
+        const char *u = im["url"] | "";
+        long w = im["width"] | 0L;
+        if (!u[0]) continue;
+        bool haveGood = best >= SP_ART_SIZE;
+        bool thisGood = w >= SP_ART_SIZE;
+        bool better = !out.artUrl[0] ||
+                      (thisGood && !haveGood) ||
+                      (thisGood && haveGood && w < best) ||
+                      (!thisGood && !haveGood && w > best);
+        if (better) {
+            best = w;
+            out.artW = w;
+            strlcpy(out.artUrl, u, sizeof(out.artUrl));
+        }
+    }
+}
+
+// One GET to Spotify's currently-playing endpoint. 204 means nothing is
+// playing - that's a success, just an empty one.
+static int spotifyRequest(NowPlaying &out, int &retryAfter) {
+    retryAfter = 0;
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setTimeout(5000);
+    if (!http.begin(client, SPOTIFY_NOW_URL)) return -1;
+    http.addHeader("Authorization", String("Bearer ") + g_spAccess);
+    const char *collect[] = {"Retry-After"};
+    http.collectHeaders(collect, 1);
+
+    int code = http.GET();
+    if (code == 204) {
+        http.end();
+        out = NowPlaying();
+        out.valid = true;
+        return 200;
+    }
+    if (code != 200) {
+        if (code == 429) retryAfter = http.header("Retry-After").toInt();
+        http.end();
+        return code;
+    }
+    String body = http.getString();
+    http.end();
+
+    // The full response is several KB of album art URLs etc.; filter it down
+    // to the handful of fields we render.
+    JsonDocument filter;
+    filter["is_playing"] = true;
+    filter["progress_ms"] = true;
+    filter["item"]["name"] = true;
+    filter["item"]["duration_ms"] = true;
+    filter["item"]["artists"][0]["name"] = true;
+    filter["item"]["album"]["name"] = true;
+    filter["item"]["album"]["images"][0]["url"] = true;
+    filter["item"]["album"]["images"][0]["width"] = true;
+    filter["item"]["show"]["name"] = true;  // podcast episodes have a show, not artists
+    filter["item"]["images"][0]["url"] = true;   // ...and their art hangs off the item
+    filter["item"]["images"][0]["width"] = true;
+    JsonDocument doc;
+    if (deserializeJson(doc, body, DeserializationOption::Filter(filter))) return -2;
+
+    out = NowPlaying();
+    out.valid = true;
+    out.hasTrack = !doc["item"].isNull();
+    if (!out.hasTrack) return 200;
+    out.playing = doc["is_playing"] | false;
+    out.progressMs = doc["progress_ms"] | 0L;
+    out.durationMs = doc["item"]["duration_ms"] | 0L;
+    asciiCopy(out.track, sizeof(out.track), doc["item"]["name"] | "");
+    asciiCopy(out.album, sizeof(out.album), doc["item"]["album"]["name"] | "");
+    for (JsonObject a : doc["item"]["artists"].as<JsonArray>()) {
+        char nm[48];
+        asciiCopy(nm, sizeof(nm), a["name"] | "");
+        if (!nm[0]) continue;
+        if (out.artist[0]) strlcat(out.artist, ", ", sizeof(out.artist));
+        strlcat(out.artist, nm, sizeof(out.artist));
+    }
+    if (!out.artist[0])
+        asciiCopy(out.artist, sizeof(out.artist), doc["item"]["show"]["name"] | "");
+    pickArt(doc["item"]["album"]["images"].as<JsonArray>(), out);
+    if (!out.artUrl[0]) pickArt(doc["item"]["images"].as<JsonArray>(), out);
+    return 200;
+}
+
+static int fetchNowPlaying(NowPlaying &out, int &retryAfter) {
+    retryAfter = 0;
+    if (!ensureSpotifyToken()) return -3;
+    int code = spotifyRequest(out, retryAfter);
+    if (code == 401) {
+        g_spExpiresAt = 0;  // force a refresh
+        if (ensureSpotifyToken()) code = spotifyRequest(out, retryAfter);
+    }
+    return code;
+}
+
+#if defined(USE_LOVYANGFX)
+// Fetch np.artUrl and draw it centered in the art slot. Blocking for ~1s on a
+// track change; on any failure the placeholder square just stays. LovyanGFX
+// bundles a jpeg decoder, so only the compressed image (a few KB at 64px) ever
+// sits in RAM, and it's freed on every path. TFT_eSPI builds skip album art -
+// they'd need the TJpg_Decoder library.
+static void drawAlbumArt() {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setConnectTimeout(4000);
+    http.setTimeout(5000);
+    if (!http.begin(client, np.artUrl)) return;
+    if (http.GET() != 200) { http.end(); return; }
+    int len = http.getSize();
+    if (len <= 0 || len > 60000) { http.end(); return; }
+
+    uint8_t *buf = (uint8_t *)malloc(len);
+    if (!buf) { http.end(); return; }
+    WiFiClient *stream = http.getStreamPtr();
+    int got = 0;
+    unsigned long deadline = millis() + 6000;
+    while (got < len && (long)(deadline - millis()) > 0) {
+        int avail = stream->available();
+        if (avail > 0) {
+            int want = len - got;
+            if (want > avail) want = avail;
+            int n = stream->read(buf + got, want);
+            if (n > 0) got += n;
+        } else if (!client.connected()) {
+            break;
+        } else {
+            delay(1);
+        }
+    }
+    http.end();
+
+    if (got == len) {
+        float scale = np.artW > 0 ? (float)SP_ART_SIZE / np.artW : 1.0f;
+        tft.drawJpg(buf, len, (SCREEN_W - SP_ART_SIZE) / 2, SP_ART_Y,
+                    SP_ART_SIZE, SP_ART_SIZE, 0, 0, scale, scale);
+    }
+    free(buf);
+}
+#endif
+
 // ---------------------------------------------------------------- beacons
 
 // /thinking and /thinking/on -> Claude is working (refresh the keep-alive).
@@ -427,13 +860,118 @@ static void handleThinkingOff() {
 static void handleRoot() {
     beacon.send(200, "text/plain",
                 "Claude Code usage display. POST /thinking/on while working, "
-                "/thinking/off when done.\n");
+                "/thinking/off when done. POST /mode/usage, /mode/spotify or "
+                "/mode/toggle to switch screens; GET /mode to ask.\n");
+}
+
+// ---- screen mode switching (used by the /switch Claude Code command) ----
+
+static const char *modeName(DisplayMode m) {
+    return m == MODE_SPOTIFY ? "spotify" : "usage";
+}
+
+static void handleModeGet() {
+    beacon.send(200, "text/plain", String(modeName(g_mode)) + "\n");
+}
+
+static void handleModeUsage() {
+    applyMode(MODE_USAGE);
+    beacon.send(200, "text/plain", "usage\n");
+}
+
+static void handleModeSpotify() {
+    if (g_spRefresh.length() == 0) {
+        beacon.send(409, "text/plain",
+                    "spotify not configured - run server/spotify_login.py and "
+                    "set SPOTIFY_CLIENT_ID / SPOTIFY_REFRESH_TOKEN in config.h\n");
+        return;
+    }
+    applyMode(MODE_SPOTIFY);
+    beacon.send(200, "text/plain", "spotify\n");
+}
+
+static void handleModeToggle() {
+    if (g_mode == MODE_USAGE) handleModeSpotify();
+    else handleModeUsage();
 }
 
 // "Thinking" is sticky between an explicit on and off. BEACON_TTL_MS is only a
 // backstop: if a sender dies mid-turn and never sends /thinking/off, fall idle.
 static bool beaconActive(unsigned long now) {
     return lastBeacon != 0 && (now - lastBeacon) < BEACON_TTL_MS;
+}
+
+// ---------------------------------------------------------------- spotify tick
+
+// Everything Spotify mode does per loop(): poll on its own schedule, repaint
+// the track area when the song changes, and tick the progress bar locally
+// between polls (1 Hz) so it moves smoothly without hammering the API.
+static void spotifyTick(unsigned long now) {
+    unsigned long interval = spBackoff ? spBackoff : SPOTIFY_POLL_MS;
+    if (spLastPoll == 0 || now - spLastPoll >= interval) {
+        spLastPoll = now;
+        if (WiFi.status() != WL_CONNECTED) {
+            drawStatusLine("WiFi reconnecting...", COL_RED);
+        } else if (g_spRefresh.length() == 0) {
+            drawStatusLine("spotify not set up - spotify_login.py", COL_YELLOW);
+        } else {
+            NowPlaying u;
+            int retryAfter = 0;
+            int code = fetchNowPlaying(u, retryAfter);
+            if (code == 200) {
+                spBackoff = 0;
+                np = u;
+                npFetchedAt = now;
+                spLastOk = now;
+                char msg[48];
+                snprintf(msg, sizeof(msg), "spotify ok  %s.local", MDNS_NAME);
+                drawStatusLine(msg, COL_GREEN);
+            } else if (code == 401 || code == 403 || code == -3) {
+                // 403 usually means the Spotify app doesn't include this
+                // account (Dashboard -> app -> User Management).
+                drawStatusLine("spotify auth failed - spotify_login.py", COL_RED);
+            } else if (code == 429) {
+                unsigned long secs = (retryAfter > 0 ? (unsigned long)retryAfter : 30) + 2;
+                spBackoff = secs * 1000UL;
+                char msg[48];
+                snprintf(msg, sizeof(msg), "spotify rate limited, %lus", secs);
+                drawStatusLine(msg, COL_YELLOW);
+            } else if (now - spLastOk > 30000) {
+                char msg[40];
+                snprintf(msg, sizeof(msg), "spotify fetch failed (%d)", code);
+                drawStatusLine(msg, COL_RED);
+            }
+        }
+    }
+
+    char sig[192];
+    spSignature(sig, sizeof(sig));
+    if (strcmp(sig, spSig) != 0) drawSpotifyTrack();
+
+#if defined(USE_LOVYANGFX)
+    if (np.hasTrack && np.artUrl[0] && strcmp(np.artUrl, spShownArt) != 0) {
+        strlcpy(spShownArt, np.artUrl, sizeof(spShownArt));  // one attempt per track
+        drawAlbumArt();
+    }
+#endif
+
+    if (!np.hasTrack) return;
+    long est = np.progressMs + (np.playing ? (long)(now - npFetchedAt) : 0);
+    if (np.durationMs > 0 && est > np.durationMs) {
+        est = np.durationMs;
+        // Track should have ended - poll right away to catch the next one.
+        if (np.playing && now - spLastPoll > 3000) spLastPoll = 0;
+    }
+    long sec = est / 1000;
+    if (sec != spShownSec) {
+        spShownSec = sec;
+        drawSpotifyProgress(est);
+    }
+    int st = np.playing ? 1 : 0;
+    if (st != spShownState) {
+        spShownState = st;
+        drawSpotifyStateWord(np.playing);
+    }
 }
 
 // ---------------------------------------------------------------- arduino
@@ -448,9 +986,13 @@ void setup() {
     spin.setColorDepth(16);
     spin.createSprite(SPIN_SIZE, SPIN_SIZE);
 
-    drawStaticUI();
-    drawSpinner(false);
-    drawStatusWord(false);
+    if (g_mode == MODE_SPOTIFY) {
+        drawSpotifyStaticUI();
+    } else {
+        drawStaticUI();
+        drawSpinner(false);
+        drawStatusWord(false);
+    }
     drawStatusLine("connecting to WiFi...", COL_DIM);
 
     WiFi.mode(WIFI_STA);
@@ -470,6 +1012,10 @@ void setup() {
         beacon.on("/thinking/on", HTTP_GET, handleThinkingOn);
         beacon.on("/thinking/off", HTTP_POST, handleThinkingOff);
         beacon.on("/thinking/off", HTTP_GET, handleThinkingOff);
+        beacon.on("/mode", handleModeGet);
+        beacon.on("/mode/usage", handleModeUsage);
+        beacon.on("/mode/spotify", handleModeSpotify);
+        beacon.on("/mode/toggle", handleModeToggle);
         beacon.on("/", handleRoot);
         beacon.begin();
 
@@ -487,6 +1033,9 @@ void loop() {
 
     beacon.handleClient();
 
+    // Usage keeps polling in both modes (so the bars are current the moment
+    // you switch back), but only paints the screen in usage mode.
+    bool showUsage = g_mode == MODE_USAGE;
     unsigned long interval = pollBackoff ? pollBackoff : USAGE_POLL_MS;
     if (lastPoll == 0 || now - lastPoll >= interval) {
         lastPoll = now;
@@ -502,13 +1051,15 @@ void loop() {
                                    strcmp(u.fiveReset, cur.fiveReset) != 0 ||
                                    strcmp(u.weekReset, cur.weekReset) != 0;
                 cur = u;
-                if (barsChanged) drawBars();
-                char msg[48];
-                snprintf(msg, sizeof(msg), "usage ok  %s.local", MDNS_NAME);
-                drawStatusLine(msg, COL_GREEN);
+                if (showUsage && barsChanged) drawBars();
+                if (showUsage) {
+                    char msg[48];
+                    snprintf(msg, sizeof(msg), "usage ok  %s.local", MDNS_NAME);
+                    drawStatusLine(msg, COL_GREEN);
+                }
                 lastOkFetch = now;
             } else if (code == 401 || code == -3) {
-                drawStatusLine("auth failed - run device_login.py", COL_RED);
+                if (showUsage) drawStatusLine("auth failed - run device_login.py", COL_RED);
             } else if (code == 429 || code == 403) {
                 // A 403 here is the edge rate-limiter, not a real auth failure: a
                 // valid token still gets it when hammered. Back off (plus a small
@@ -516,33 +1067,43 @@ void loop() {
                 // re-armed by the next poll. Default 10 min if no Retry-After.
                 unsigned long secs = (retryAfter > 0 ? (unsigned long)retryAfter : 600) + 30;
                 pollBackoff = secs * 1000UL;
-                char msg[48];
-                snprintf(msg, sizeof(msg), "rate limited, retry in %lus", secs);
-                drawStatusLine(msg, COL_YELLOW);
+                if (showUsage) {
+                    char msg[48];
+                    snprintf(msg, sizeof(msg), "rate limited, retry in %lus", secs);
+                    drawStatusLine(msg, COL_YELLOW);
+                }
             } else if (now - lastOkFetch > 90000) {
-                char msg[40];
-                snprintf(msg, sizeof(msg), "usage fetch failed (%d)", code);
-                drawStatusLine(msg, COL_RED);
+                if (showUsage) {
+                    char msg[40];
+                    snprintf(msg, sizeof(msg), "usage fetch failed (%d)", code);
+                    drawStatusLine(msg, COL_RED);
+                }
             }
-        } else {
+        } else if (showUsage) {
             drawStatusLine("WiFi reconnecting...", COL_RED);
         }
     }
 
+    if (g_mode == MODE_SPOTIFY) spotifyTick(now);
+
+    // The LED breathes while Claude is thinking in either mode; the spinner
+    // and working/idle word only exist on the usage screen.
     bool active = beaconActive(now);
 
-    if (active) {
-        idleSpinnerDrawn = false;
-        if (now - lastFrame >= 90) {
-            lastFrame = now;
-            frame = (frame + 1) % 48;
-            drawSpinner(true);
+    if (g_mode == MODE_USAGE) {
+        if (active) {
+            idleSpinnerDrawn = false;
+            if (now - lastFrame >= 90) {
+                lastFrame = now;
+                frame = (frame + 1) % 48;
+                drawSpinner(true);
+            }
+        } else if (!idleSpinnerDrawn) {
+            idleSpinnerDrawn = true;
+            drawSpinner(false);
         }
-    } else if (!idleSpinnerDrawn) {
-        idleSpinnerDrawn = true;
-        drawSpinner(false);
+        drawStatusWord(active);
     }
-    drawStatusWord(active);
     updateLed(active, now);
 
     delay(10);

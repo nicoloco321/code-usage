@@ -35,6 +35,23 @@
 // the device auto-backs-off, so an occasional trip self-heals.
 #define USAGE_POLL_MS 90000   // 90 seconds
 
+// ---- Spotify "now playing" mode (optional) ----
+// The display can also show what Spotify is playing. Switch screens with the
+// /switch Claude Code command, or directly:
+//   curl -X POST http://claude-display.local:8080/mode/spotify
+//   curl -X POST http://claude-display.local:8080/mode/usage      (or /mode/toggle)
+// Mint both values with:  python3 server/spotify_login.py
+// (it walks you through creating the free Spotify app first). Leave both empty
+// to disable Spotify mode. Treat the token like a password.
+#define SPOTIFY_CLIENT_ID     ""
+#define SPOTIFY_REFRESH_TOKEN ""
+
+// How often to refetch the currently playing track while in Spotify mode (ms).
+// The progress bar ticks locally between fetches, so this only paces how fast
+// track changes / seeks show up. Spotify's rate limits are far friendlier than
+// Anthropic's, so 5s is fine.
+#define SPOTIFY_POLL_MS 5000
+
 // ---- "thinking" beacons ----
 // The display listens on this mDNS name + port for pings from your computers.
 // Run server/beacon.py on each machine you use Claude Code on; it pings here
