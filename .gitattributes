@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts run on the Raspberry Pi - a CRLF checkout on Windows breaks them
+*.sh text eol=lf

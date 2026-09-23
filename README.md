@@ -14,6 +14,11 @@ the 480x320 landscape boards are still supported (see [Hardware](#hardware)).
   with the **`/switch`** slash command, or with a one-line `curl`; the choice
   survives power cycles
 
+No ESP32? The same display also runs as a **fullscreen Raspberry Pi app** that
+starts on boot ([Raspberry Pi edition](#raspberry-pi-edition)), and a
+**Windows tray helper** puts your usage next to the clock
+([Windows tray helper](#windows-tray-helper)).
+
 ```
 +------------------+   172x320 portrait
 |  [Clawd] Claude  |
@@ -67,6 +72,8 @@ The ESP32 talks to Anthropic directly — **no companion server required**:
    client secret on the device) and ticks the progress bar locally between
    polls. The repo ships a [`/switch` Claude Code command](.claude/commands/switch.md)
    that drives this. See [Spotify now-playing mode](#4-optional-spotify-now-playing-mode).
+   `GET /usage` returns the numbers on screen as JSON (the Windows tray helper
+   reads it).
 
 > The old `server/claude_usage_server.py` (a Mac-side usage proxy) is no longer
 > needed and is kept only as a fallback. The display is self-contained now.
@@ -217,8 +224,9 @@ EOF
 launchctl load ~/Library/LaunchAgents/com.nicoloco.claude-beacon.plist
 ```
 
-On **Windows**, drop a shortcut to `pythonw beacon.py` in
-`shell:startup`, or register it with Task Scheduler at logon.
+On **Windows**, the [tray helper](#windows-tray-helper) has this watcher built
+in. Or drop a shortcut to `pythonw beacon.py` in `shell:startup`, or register
+it with Task Scheduler at logon.
 
 ### 4. (Optional) Spotify now-playing mode
 
@@ -263,6 +271,134 @@ Then `/switch spotify`, `/switch usage`, `/switch toggle` — or plain
 `/switch` to be asked which one you want. (Claude Code discovers new commands
 at session start, so restart it once after copying.)
 
+## Raspberry Pi edition
+
+[pi/claude_display.py](pi/claude_display.py) is the same display as a
+fullscreen app for a Raspberry Pi (built for a **Pi 2**, fine on anything
+newer) on an HDMI monitor or TV, or the official touchscreen. It has the same
+screens (usage with the thinking spinner; Spotify now playing, with album art)
+and speaks the same HTTP API on port 8080, so the hooks, `beacon.py`,
+`find_display.py` and `/switch` work unchanged. The layout follows the
+screen's shape: landscape screens get a wide layout with a clock, portrait
+ones the ESP32's stacked layout, and long bar panels their own (below).
+
+**Long bar screens** like the Waveshare 11.9" (320×1480) get two dedicated
+layouts. On its side, a **bar** shows two rows of long meters. Standing up, a
+**strip** stacks everything with a big clock at the bottom. The panel is
+portrait out of the box. To lay it on its side, either rotate it in
+**Screen Configuration → HDMI-A-1 → Orientation** on the desktop edition
+(this turns touch too), or set `rotate = 90` in config.ini (works on Lite too;
+taps anywhere switch screens, so touch doesn't need turning). Preview it on
+any PC with `--demo --windowed 1480x320`.
+
+```
++--------------------------------------------------------------+
+| [Clawd] Claude Code                                10:28 PM  |
+|         usage monitor                            Tue Sep 22  |
+|--------------------------------------------------------------|
+|                    5-HOUR                              33%   |
+|    ( spinner )     resets 12:41 AM  ·  in 2h 13m             |
+|                    [##########                          ]    |
+|    working...      WEEKLY                              86%   |
+|                    resets Sat 2:28 AM  ·  in 3d 4h           |
+|                    [##################################  ]    |
+| usage ok                  claude-display.local  192.168.1.42 |
++--------------------------------------------------------------+
+```
+
+**You need:** a Pi 2 or newer, a screen, and a network connection. The Pi 2
+has no Wi-Fi, so use Ethernet or a USB Wi-Fi dongle. Use **Raspberry Pi OS
+Bullseye or newer, 32-bit**. Bullseye only packages pygame 1.9, so on
+Bullseye the installer gets pygame 2 from pip. **Lite** is the better fit for
+a Pi 2: the app draws straight to the screen with no desktop, so it boots
+faster and leaves more RAM free. The desktop edition works too; tested on a
+Pi 2 with the Bullseye desktop and the Waveshare 11.9" bar.
+
+**Power:** a Pi 2 plus a USB-powered touchscreen and Wi-Fi dongle easily
+exceeds a phone charger. If the desktop shows "Low voltage warning" (or
+`vcgencmd get_throttled` isn't `0x0`), use a proper 5V 2.5A supply and power
+the screen from its own Power port.
+
+1. Flash the OS with Raspberry Pi Imager. In its settings, set the hostname
+   to `claude-display`, your user, Wi-Fi (for a dongle), SSH, and **your time
+   zone** (reset times use the Pi's clock).
+2. On the Pi, or over SSH:
+
+   ```sh
+   sudo apt install -y git
+   git clone https://github.com/nicoloco321/code-usage.git
+   cd code-usage
+   bash pi/install.sh
+   ```
+
+   The installer:
+   - installs pygame and creates `~/.config/claude-display/config.ini`
+   - walks you through `device_login.py` (paste the code as usual) and,
+     optionally, the Spotify login
+   - offers to rename the Pi to `claude-display`, so `claude-display.local`
+     resolves
+   - turns off screen blanking
+   - makes the display start fullscreen on boot: a `claude-display` systemd
+     service on Lite, or an autostart entry plus desktop auto-login on the
+     desktop edition
+
+   It's safe to re-run.
+3. Reboot if it asks you to. From then on the display comes up by itself.
+
+**Using it:**
+
+- Tap the screen (or click, or press Space) to switch screens. Ctrl+Q quits.
+- Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
+  `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
+  `rotate` for a monitor mounted on its side. Apply changes with
+  `sudo systemctl restart claude-display`. Logs:
+  `journalctl -u claude-display -f`.
+- Re-mint a login any time with
+  `python3 server/device_login.py --config ~/.config/claude-display/config.ini`
+  (`spotify_login.py` takes `--config` too).
+- Rotated tokens and the chosen screen persist in
+  `~/.local/state/claude-display/state.json`, the Pi's equivalent of the
+  ESP32's NVS.
+- **Spotify login over SSH:** Spotify redirects to `127.0.0.1:8898`, so
+  connect with `ssh -L 8898:127.0.0.1:8898 you@claude-display.local`, run the
+  login in that session, and open its link on your computer.
+- **Try it anywhere, no logins needed:**
+  `python3 pi/claude_display.py --demo --windowed 800x480` (on a PC,
+  `pip install pygame` first).
+
+## Windows tray helper
+
+[windows/claude_tray.py](windows/claude_tray.py) puts the display in the
+Windows notification area, next to the clock:
+
+- **Clawd with a 5-hour meter** under him (green / yellow / red), or the
+  5-hour % itself if you prefer. Hover for both numbers; right-click for reset
+  times.
+- Clawd **walks** while Claude is working, on any of your machines.
+- **Left-click** flips the display between the usage and Spotify screens. The
+  menu has both.
+- **Send this PC's Claude activity** is the `beacon.py` watcher, built in.
+  It's on automatically unless `~/.claude/settings.json` already has the
+  display hooks, which do the same job more precisely.
+- **Start with Windows.**
+
+It reads everything from the display's `GET /usage`, so the PC needs no
+Anthropic login and adds no load on the rate-limited usage API. It works with
+the Pi app, and with the ESP32 once it's flashed with this firmware. Older
+firmware still gets screen switching and beacons, and the menu tells you to
+re-flash for the numbers.
+
+```powershell
+py -m pip install -r windows\requirements.txt
+pythonw windows\claude_tray.py --host 192.168.1.42
+```
+
+`--host` is the display's IP or name, shown on its status line or by
+`find_display.py`. You only need it the first time: it's saved to
+`%APPDATA%\claude-display\tray.json`, and **Display address…** in the menu
+changes it later. Windows often resolves `claude-display.local` on its own,
+but the IP always works. Then tick **Start with Windows**.
+
 ## Customizing
 
 - **Mascot** — pixel grid in [mascot.h](firmware/src/mascot.h); edit the
@@ -304,3 +440,7 @@ at session start, so restart it once after copying.)
 | `/mode/spotify` answers 409 / "spotify not set up" | Spotify isn't configured: run `python3 server/spotify_login.py`, paste both `#define`s into config.h, reflash |
 | "spotify auth failed" | Refresh token revoked or wrong client id — re-run `spotify_login.py`. A persistent 403 usually means your account isn't added to the Spotify app (Dashboard → your app → User Management) |
 | "nothing playing" but music is on | Spotify only reports an *active* device; start playback from any Spotify app and it appears within one poll (~5 s) |
+| Pi: blank screen, service keeps restarting | `journalctl -u claude-display -e`. "could not open the screen" on Lite means no KMS driver: `/boot/firmware/config.txt` needs `dtoverlay=vc4-kms-v3d` (the default). Re-run `bash pi/install.sh` to fix group access |
+| Pi: picture has black borders or is cut off | Turn off overscan (`sudo raspi-config` → Display Options), or force a mode with `size = WxH` in config.ini |
+| Tray icon is grey / "Display not reachable" | Set the right address with **Display address…** in the tray menu (the IP from the display's status line always works) |
+| Tray says "Re-flash the display firmware" | The ESP32 predates `GET /usage`; flash this version. Switching screens and beacons work either way |

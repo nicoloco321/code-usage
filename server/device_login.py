@@ -12,11 +12,15 @@ device refreshing this token never disturbs your normal login. The device turns
 the refresh token into short-lived access tokens on its own.
 
     python3 device_login.py
+    python3 device_login.py --config ~/.config/claude-display/config.ini   # Raspberry Pi app
 
 Then open the printed URL, approve, and paste the code it shows you back here.
+With --config the token goes straight into the Raspberry Pi app's config.ini
+(pi/config.example.ini) instead of being printed for config.h.
 No third-party dependencies.
 """
 
+import argparse
 import base64
 import hashlib
 import json
@@ -81,7 +85,45 @@ def b64url(raw):
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
+def save_to_config(path, section, values):
+    """Set `key = value` under [section] of an INI file (the Raspberry Pi app's
+    config.ini), leaving its comments and everything else as they are."""
+    path = os.path.expanduser(path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    pending, out, current = dict(values), [], None
+    for line in lines:
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if current == section:  # leaving our section: add any keys it lacked
+                out.extend(f"{k} = {v}" for k, v in pending.items())
+                pending.clear()
+            current = s[1:-1].strip()
+        elif current == section and "=" in s and s[0] not in "#;":
+            key = s.split("=", 1)[0].strip()
+            if key in pending:
+                line = f"{key} = {pending.pop(key)}"
+        out.append(line)
+    if pending:
+        if current != section:
+            out += ([""] if out else []) + [f"[{section}]"]
+        out.extend(f"{k} = {v}" for k, v in pending.items())
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+
+
 def main():
+    ap = argparse.ArgumentParser(description="Mint a usage-reading login for the display.")
+    ap.add_argument("--config", metavar="PATH",
+                    help="save the token into this Raspberry Pi config.ini instead of "
+                         "printing a #define for config.h")
+    args = ap.parse_args()
+
     verifier  = b64url(os.urandom(32))
     challenge = b64url(hashlib.sha256(verifier.encode()).digest())
     state     = b64url(os.urandom(32))
@@ -153,6 +195,12 @@ def main():
     if not refresh:
         print("\nNo refresh token returned - cannot continue.", file=sys.stderr)
         sys.exit(1)
+
+    if args.config:
+        save_to_config(args.config, "anthropic", {"refresh_token": refresh})
+        print(f"\nSaved to [anthropic] refresh_token in {args.config}.")
+        print("Restart the display to use it: sudo systemctl restart claude-display (or reboot)")
+        return
 
     print("\nPaste this line into firmware/src/config.h (replacing the existing one):\n")
     print(f'    #define DEVICE_REFRESH_TOKEN "{refresh}"\n')

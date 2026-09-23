@@ -112,6 +112,8 @@ struct Usage {
     float weekPct = -1;
     char  fiveReset[24] = "";
     char  weekReset[24] = "";
+    char  fiveIso[40] = "";   // raw resets_at, for GET /usage
+    char  weekIso[40] = "";
 };
 
 static Usage cur;
@@ -675,6 +677,8 @@ static int usageRequest(Usage &u, int &retryAfter) {
     u.weekPct = doc["seven_day"]["utilization"] | -1.0f;
     fmtReset(doc["five_hour"]["resets_at"] | "", u.fiveReset, sizeof(u.fiveReset));
     fmtReset(doc["seven_day"]["resets_at"] | "", u.weekReset, sizeof(u.weekReset));
+    strlcpy(u.fiveIso, doc["five_hour"]["resets_at"] | "", sizeof(u.fiveIso));
+    strlcpy(u.weekIso, doc["seven_day"]["resets_at"] | "", sizeof(u.weekIso));
     u.valid = true;
     return 200;
 }
@@ -861,7 +865,8 @@ static void handleRoot() {
     beacon.send(200, "text/plain",
                 "Claude Code usage display. POST /thinking/on while working, "
                 "/thinking/off when done. POST /mode/usage, /mode/spotify or "
-                "/mode/toggle to switch screens; GET /mode to ask.\n");
+                "/mode/toggle to switch screens; GET /mode to ask; GET /usage "
+                "for JSON.\n");
 }
 
 // ---- screen mode switching (used by the /switch Claude Code command) ----
@@ -899,6 +904,32 @@ static void handleModeToggle() {
 // backstop: if a sender dies mid-turn and never sends /thinking/off, fall idle.
 static bool beaconActive(unsigned long now) {
     return lastBeacon != 0 && (now - lastBeacon) < BEACON_TTL_MS;
+}
+
+// GET /usage -> what's on screen, as JSON. The Windows tray helper
+// (windows/claude_tray.py) reads this, so it needs no Anthropic login of its
+// own and adds no load on the rate-limited usage endpoint.
+static void handleUsageJson() {
+    JsonDocument doc;
+    const struct { const char *key; float pct; const char *iso; const char *fmt; } wins[] = {
+        {"five_hour", cur.fivePct, cur.fiveIso, cur.fiveReset},
+        {"seven_day", cur.weekPct, cur.weekIso, cur.weekReset},
+    };
+    for (const auto &w : wins) {
+        JsonObject o = doc[w.key].to<JsonObject>();
+        if (cur.valid && w.pct >= 0) o["pct"] = roundf(w.pct * 10) / 10;
+        else o["pct"] = nullptr;
+        o["resets_at"] = w.iso;
+        o["resets"] = w.fmt;
+    }
+    doc["valid"] = cur.valid;
+    doc["thinking"] = beaconActive(millis());
+    doc["mode"] = modeName(g_mode);
+    if (lastOkFetch) doc["age_s"] = (millis() - lastOkFetch) / 1000;
+    else doc["age_s"] = nullptr;
+    String out;
+    serializeJson(doc, out);
+    beacon.send(200, "application/json", out);
 }
 
 // ---------------------------------------------------------------- spotify tick
@@ -1016,6 +1047,7 @@ void setup() {
         beacon.on("/mode/usage", handleModeUsage);
         beacon.on("/mode/spotify", handleModeSpotify);
         beacon.on("/mode/toggle", handleModeToggle);
+        beacon.on("/usage", HTTP_GET, handleUsageJson);
         beacon.on("/", handleRoot);
         beacon.begin();
 

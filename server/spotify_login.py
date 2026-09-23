@@ -1,4 +1,4 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 """Mint a Spotify refresh token for the display's "now playing" mode.
 
 The display can switch between Claude usage and a Spotify now-playing screen
@@ -19,9 +19,11 @@ One-time Spotify app setup (free, any account):
 
        python3 spotify_login.py
        python3 spotify_login.py --client-id <id>   # or paste it when prompted
+       python3 spotify_login.py --config ~/.config/claude-display/config.ini   # Raspberry Pi app
 
 Approve access in the browser; this prints the two #define lines to paste into
-firmware/src/config.h. No third-party dependencies.
+firmware/src/config.h - or, with --config, saves them into the Raspberry Pi
+app's config.ini. No third-party dependencies.
 """
 
 import argparse
@@ -86,6 +88,38 @@ def b64url(raw):
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
+def save_to_config(path, section, values):
+    """Set `key = value` under [section] of an INI file (the Raspberry Pi app's
+    config.ini), leaving its comments and everything else as they are."""
+    path = os.path.expanduser(path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    pending, out, current = dict(values), [], None
+    for line in lines:
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if current == section:  # leaving our section: add any keys it lacked
+                out.extend(f"{k} = {v}" for k, v in pending.items())
+                pending.clear()
+            current = s[1:-1].strip()
+        elif current == section and "=" in s and s[0] not in "#;":
+            key = s.split("=", 1)[0].strip()
+            if key in pending:
+                line = f"{key} = {pending.pop(key)}"
+        out.append(line)
+    if pending:
+        if current != section:
+            out += ([""] if out else []) + [f"[{section}]"]
+        out.extend(f"{k} = {v}" for k, v in pending.items())
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+
+
 class _Callback(http.server.BaseHTTPRequestHandler):
     """Catches Spotify's redirect back to 127.0.0.1 and stashes the code."""
     result = None
@@ -124,6 +158,9 @@ def wait_for_code():
 def main():
     ap = argparse.ArgumentParser(description="Mint a Spotify refresh token for the display.")
     ap.add_argument("--client-id", help="Client ID from your Spotify app's dashboard page")
+    ap.add_argument("--config", metavar="PATH",
+                    help="save both values into this Raspberry Pi config.ini instead of "
+                         "printing #defines for config.h")
     args = ap.parse_args()
 
     client_id = args.client_id or input(
@@ -206,6 +243,12 @@ def main():
     if not refresh:
         print("\nNo refresh token returned - cannot continue.", file=sys.stderr)
         sys.exit(1)
+
+    if args.config:
+        save_to_config(args.config, "spotify", {"client_id": client_id, "refresh_token": refresh})
+        print(f"\nSaved client_id and refresh_token under [spotify] in {args.config}.")
+        print("Restart the display to use it: sudo systemctl restart claude-display (or reboot)")
+        return
 
     print("\nPaste these lines into firmware/src/config.h (replacing the empty ones):\n")
     print(f'    #define SPOTIFY_CLIENT_ID     "{client_id}"')
