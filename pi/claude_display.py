@@ -106,7 +106,9 @@ BAMBU_LOGO = [
     [(236, 214), (442, 294), (442, 574), (236, 574)],
 ]
 
-SPIN_FRAME_MS = 90  # spinner step, same pace as the firmware
+SPIN_FRAME_MS = 50  # spinner step: 20 fps
+SPIN_FRAMES = 32    # one sweep around the spark: 1.6 s
+COL_ORANGE_HI = (246, 178, 150)  # the crest of the spark and the text shimmer
 
 # Pixel-art Clawd on his native 12x8 grid, same as firmware/src/mascot.h
 # (1 = body, 2 = eye).
@@ -163,7 +165,7 @@ class Config:
                 return default
 
         self.refresh_token = s("anthropic", "refresh_token")
-        self.usage_poll = max(30.0, num("anthropic", "poll_seconds", 90))
+        self.usage_poll = max(60.0, num("anthropic", "poll_seconds", 180))
         self.sp_client_id = s("spotify", "client_id")
         self.sp_refresh_token = s("spotify", "refresh_token")
         self.sp_poll = max(1.0, num("spotify", "poll_seconds", 5))
@@ -404,6 +406,7 @@ class Model:
 
         self.usage = None          # {"five"/"week": (pct or None, reset datetime, iso)}
         self.usage_ok_at = 0.0     # monotonic time of the last good fetch
+        self.backoff_until = 0.0   # rate limited: no usage calls before this
         self.usage_status = None   # (text, colour); None = nothing yet
         self.usage_version = 0
 
@@ -416,6 +419,7 @@ class Model:
 
         self.printer = None        # Bambu "print" report, merged update by update
         self.printer_status = None
+        self.remote_sessions = {}  # sender -> (monotonic time, [session summaries])
 
         self.last_beacon = 0.0     # monotonic time of the last "thinking" ping, 0 = off
         self.flash_msg = None      # (text, colour, until): short-lived status override
@@ -454,6 +458,10 @@ class Model:
             self.spotify_wake.set()
         elif mode == "bambu":
             self.bambu_wake.set()
+        else:  # back on the usage screen: refresh numbers gone stale off-screen
+            now = time.monotonic()
+            if now >= self.backoff_until and now - self.usage_ok_at > self.cfg.usage_poll:
+                self.usage_wake.set()
         return True
 
     def next_mode(self):
@@ -509,6 +517,30 @@ class Model:
         with self.lock:
             self.printer_status = (text, color)
 
+    def set_sessions(self, sender, sessions):
+        """Claude Code sessions reported by one machine's hooks (display_hook.py)."""
+        def clean(s):
+            text = lambda v, n=120: str(v or "")[:n]
+            agents = s.get("agents") if isinstance(s.get("agents"), list) else []
+            return {"project": text(s.get("project"), 40), "state": text(s.get("state"), 10),
+                    "activity": text(s.get("activity")), "waiting": text(s.get("waiting")),
+                    "elapsed": s.get("elapsed") if isinstance(s.get("elapsed"), (int, float)) else 0,
+                    "agents": [{"label": text(a.get("label"), 80), "activity": text(a.get("activity"))}
+                               for a in agents[:6] if isinstance(a, dict)]}
+        with self.lock:
+            self.remote_sessions[sender] = (time.monotonic(),
+                                            [clean(s) for s in sessions[:8] if isinstance(s, dict)])
+
+    def sessions_now(self, now):
+        """Every machine's working / waiting sessions."""
+        out = []
+        for at, sessions in self.remote_sessions.values():
+            if now - at < self.cfg.beacon_ttl:  # a machine that went quiet drops off
+                out += [dict(s, elapsed=s["elapsed"] + (now - at)) for s in sessions
+                        if s["state"] in ("working", "waiting")]
+        # waiting on you first; otherwise the hooks' order, most recently active first
+        return sorted(out, key=lambda s: s["state"] != "waiting")
+
     def snapshot(self):
         now = time.monotonic()
         with self.lock:
@@ -518,6 +550,7 @@ class Model:
                 usage_status=self.usage_status, np=self.np, np_at=self.np_at,
                 np_version=self.np_version, sp_status=self.sp_status, art=self.art,
                 printer=self.printer, printer_status=self.printer_status,
+                sessions=self.sessions_now(now),
                 printer_name=self.cfg.bambu_name or "3D printer",
                 thinking=self.thinking(now), flash=flash and flash[:2],
                 host=self.host, ip=self.ip, mono=now)
@@ -576,9 +609,16 @@ def fetch_usage(login):
     return code, retry, usage
 
 
+OFF_SCREEN_SLOWDOWN = 3  # poll this much less often while another screen is up
+
+
 def usage_worker(model, login):
     while True:
         delay = model.cfg.usage_poll
+        if model.mode != "usage":
+            # Nobody's looking at the bars, so spend fewer calls on them;
+            # switching back to the usage screen refreshes stale numbers.
+            delay *= OFF_SCREEN_SLOWDOWN
         if not login.configured:
             model.set_usage_status("no login - run device_login.py --config", COL_YELLOW)
             model.usage_wake.wait(3600)
@@ -599,6 +639,7 @@ def usage_worker(model, login):
             # valid token still gets it when hammered. Back off past the
             # cooldown (default 10 min without Retry-After) so it can expire.
             delay = (retry or 600) + 30
+            model.backoff_until = time.monotonic() + delay
             model.set_usage_status(f"rate limited, retry in {int(delay)}s", COL_YELLOW)
         elif not model.usage_ok_at or time.monotonic() - model.usage_ok_at > 90:
             model.set_usage_status("network down - retrying" if code == -1
@@ -1069,22 +1110,34 @@ class BeaconHandler(BaseHTTPRequestHandler):
     server_version = "claude-display"
 
     def do_GET(self):
+        self.body = b""
         self._route()
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(min(length, 65536))  # drain it so the client isn't reset
+        self.body = self.rfile.read(min(length, 65536)) if length else b""
         self._route()
+
+    def _take_sessions(self):
+        """display_hook.py sends its session summary along with each beacon."""
+        try:
+            data = json.loads(self.body) if self.body else None
+        except ValueError:
+            return
+        if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+            self.model.set_sessions(str(data.get("host") or self.client_address[0]),
+                                    data["sessions"])
 
     def _route(self):
         m = self.model
         path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
         if path in ("/thinking", "/thinking/on"):
             m.beacon_on()
+            self._take_sessions()
             self._send(200, "on\n")
         elif path == "/thinking/off":
             m.beacon_off()
+            self._take_sessions()
             self._send(200, "off\n")
         elif path == "/mode":
             self._send(200, m.mode + "\n")
@@ -1160,6 +1213,9 @@ class Renderer:
         self.ox = (self.W - bw * self.s) / 2
         self.oy = (self.H - bh * self.s) / 2
         self.art_px = self.n(self.ART_SIZE[self.layout])  # so we fetch sharp enough art
+        self.anim = 0.0      # 0 = usage bars full width, 1 = session panel open
+        self.anim_at = 0.0
+        self.spin_cache = {}  # (frame, px) -> the spark, drawn once
         self.font_paths = fonts
         self.fonts = {}
         self.text_cache = {}
@@ -1265,11 +1321,21 @@ class Renderer:
                     surf.fill(COL_ORANGE if v == 1 else COL_EYE,
                               self.rect(x + c * cell, y + r * cell, cell, cell))
 
-    def bar(self, surf, rect, frac, color, radius):
-        """A rounded track with the left `frac` of it filled."""
+    def bar(self, surf, rect, frac, color, radius, fast=False):
+        """A rounded track with the left `frac` of it filled. `fast` skips the
+        anti-aliasing - mid-animation every frame has a new width, and building
+        a supersampled bar per frame is too slow on a Pi 2."""
         w, h = rect.size
         fill = 0 if frac is None else int(round(w * max(0.0, min(1.0, frac))))
         r = self.n(radius)
+        if fast:
+            pygame.draw.rect(surf, COL_CARD, rect, border_radius=r)
+            if fill:
+                clip = surf.get_clip()
+                surf.set_clip(pygame.Rect(rect.x, rect.y, fill, h).clip(clip))
+                pygame.draw.rect(surf, color, rect, border_radius=r)
+                surf.set_clip(clip)
+            return
 
         def draw(big, k):
             pygame.draw.rect(big, COL_CARD, big.get_rect(), border_radius=r * k)
@@ -1280,26 +1346,78 @@ class Renderer:
 
         surf.blit(self._ss(("bar", fill, color, r), w, h, draw), rect.topleft)
 
-    def spinner(self, surf, cx, cy, size, angle, color):
-        """The firmware's starburst: 8 rays in a 60px box, scaled to `size`."""
+    def spinner(self, surf, cx, cy, size, frame):
+        """Claude's spark: 12 teardrop rays, long and short alternating, fat end
+        out. While working (frame >= 0) a crest sweeps around it - the rays it
+        passes stretch, fatten and brighten; idle, it's a still grey spark.
+        Every frame is drawn once and cached, so animating costs a blit."""
         px = self.n(size)
-
-        def draw(big, k):
-            c, u = px * k / 2, px * k / 60.0
-            for i in range(8):
-                a = math.radians(angle + i * 45)
-                ca, sa = math.cos(a), math.sin(a)
-                p1 = (c + ca * 7 * u, c + sa * 7 * u)
-                p2 = (c + ca * 25 * u, c + sa * 25 * u)
-                nx, ny = -sa * 1.5 * u, ca * 1.5 * u  # half of the 3px width
-                pygame.draw.polygon(big, color, [(p1[0] + nx, p1[1] + ny), (p2[0] + nx, p2[1] + ny),
-                                                 (p2[0] - nx, p2[1] - ny), (p1[0] - nx, p1[1] - ny)])
-                pygame.draw.circle(big, color, p1, 1.5 * u)
-                pygame.draw.circle(big, color, p2, 1.5 * u)
-            pygame.draw.circle(big, color, (c, c), 3 * u)
-
-        img = self._ss(("spin", round(angle % 45, 2), color), px, px, draw)
+        key = ("spark", frame, px)
+        img = self.spin_cache.get(key)
+        if img is None:
+            img = self.spin_cache[key] = self._ss(key, px, px, lambda big, k: self._spark(big, frame))
+            self.shape_cache.pop((key, px, px), None)  # keep it out of the general cache
         surf.blit(img, (self.x(cx) - px // 2, self.y(cy) - px // 2))
+
+    @staticmethod
+    def _spark(big, frame):
+        c = big.get_width() / 2
+        R = c * 0.97
+        active = frame >= 0
+        for i in range(12):
+            reach = 1.0 if i % 2 == 0 else 0.76
+            if active:
+                d = (i / 12 - frame / SPIN_FRAMES) % 1.0
+                wave = (0.5 + 0.5 * math.cos(2 * math.pi * d)) ** 2  # 1 at the crest
+                length = R * reach * (0.6 + 0.4 * wave)
+                width = R * (0.15 + 0.07 * wave)
+                t = 0.7 * wave
+                color = tuple(round(a + (b - a) * t) for a, b in zip(COL_ORANGE, COL_ORANGE_HI))
+            else:
+                length, width, color = R * reach * 0.82, R * 0.16, COL_CARD
+            a = 2 * math.pi * i / 12 - math.pi / 2
+            ca, sa = math.cos(a), math.sin(a)
+
+            def at(u, v):
+                return c + u * ca - v * sa, c + u * sa + v * ca
+
+            r0, end = R * 0.12, length - width / 2  # thin near the middle, round fat tip
+            pygame.draw.polygon(big, color, [at(r0, width * 0.16), at(end, width / 2),
+                                             at(end, -width / 2), at(r0, -width * 0.16)])
+            pygame.draw.circle(big, color, at(end, 0), width / 2)
+        pygame.draw.circle(big, COL_ORANGE if active else COL_CARD, (c, c), R * 0.15)
+
+    def warm_spinner(self):
+        """Draw every spark frame up front, so the first sweep doesn't stutter."""
+        dummy = pygame.Surface((1, 1))
+        for mode in ("usage", "spotify"):
+            cx, cy, size = self.spinner_geometry(mode)
+            for frame in range(-1, SPIN_FRAMES):
+                self.spinner(dummy, cx, cy, size, frame)
+
+    def _shimmer(self, surf, s, x, baseline, size, align, phase):
+        """A soft light band sweeping across the text, like Claude Code's."""
+        f = self.font(size)
+        key = (s, id(f), "hi")
+        hi = self.text_cache.get(key)
+        if hi is None:
+            hi = self.text_cache[key] = f.render(s, True, COL_ORANGE_HI)
+        w, h = hi.get_size()
+        band = max(8, int(h * 2))
+        mask = self.shape_cache.get(("shimmer", band, h))
+        if mask is None:
+            mask = pygame.Surface((band, h), pygame.SRCALPHA)
+            for col in range(band):
+                alpha = round(255 * math.sin(math.pi * (col + 0.5) / band) ** 2)
+                pygame.draw.line(mask, (255, 255, 255, alpha), (col, 0), (col, h - 1))
+            self.shape_cache[("shimmer", band, h)] = mask
+        left = self.x(x) - (w // 2 if align == "c" else w if align == "r" else 0)
+        top = self.y(baseline) - f.get_ascent()
+        pos = int(-band + (w + band) * phase)
+        piece = pygame.Surface((band, h), pygame.SRCALPHA)
+        piece.blit(hi, (-pos, 0))
+        piece.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        surf.blit(piece, (left + pos, top))
 
     @staticmethod
     def _logo(big, cx, cy, radius, color, bg):
@@ -1380,7 +1498,14 @@ class Renderer:
         redraw the whole screen only when this does."""
         key = (snap.mode, snap.flash, snap.host, snap.ip, now.strftime("%Y%m%d%H%M"))
         if snap.mode == "usage":
-            return key + (snap.usage_version, snap.usage_status, snap.thinking)
+            panel = ()
+            if self.anim > 0:  # the session panel's text, minute by minute
+                panel = tuple((s["project"], s["state"], s["activity"], s["waiting"],
+                               int(s["elapsed"] // 60),
+                               tuple((a["label"], a["activity"]) for a in s["agents"]))
+                              for s in snap.sessions)
+            sliding = "sliding" if 0 < self.anim < 1 else self.anim
+            return key + (snap.usage_version, snap.usage_status, snap.thinking, sliding, panel)
         if snap.mode == "bambu":
             # only what's drawn, so fan speeds and wifi strength don't cause redraws
             v = printer_view(snap.printer, now)
@@ -1434,6 +1559,97 @@ class Renderer:
     SPINNER = {"landscape": (162, 246, 150), "portrait": (90, 108, 60),
                "bar": (70, 206, 104), "strip": (160, 410, 190)}
 
+    # -- the session panel: while Claude works (or waits on you) the usage bars
+    # slide to the right end and shrink, opening the middle of the screen.
+    ANIM_SECS = 0.75
+    PANEL_LAYOUTS = ("bar", "landscape")
+
+    def session_open(self, snap):
+        return (snap.mode == "usage" and self.layout in self.PANEL_LAYOUTS
+                and (snap.thinking or bool(snap.sessions)))
+
+    def advance(self, snap):
+        """Step the open / close slide toward where it should be; True while it moves."""
+        target = 1.0 if self.session_open(snap) else 0.0
+        dt = min(0.05, snap.mono - self.anim_at) if self.anim_at else 0.0
+        self.anim_at = snap.mono
+        if self.anim == target:
+            return False
+        step = dt / self.ANIM_SECS
+        self.anim = min(target, self.anim + step) if target > self.anim else max(target, self.anim - step)
+        return True
+
+    @property
+    def eased(self):
+        t = self.anim  # smootherstep: zero speed and acceleration at both ends
+        return t * t * t * (t * (t * 6 - 15) + 10)
+
+    SLIDE_REGION = {"bar": (350, 28, 1130, 232), "landscape": (298, 110, 502, 292)}
+
+    def draw_slide(self, surf, snap, now):
+        """Mid-slide frame: repaint only the moving region, return its rect."""
+        rect = self.rect(*self.SLIDE_REGION[self.layout])
+        surf.fill(COL_BG, rect)
+        getattr(self, f"_slide_{self.layout}")(surf, snap, now)
+        return rect
+
+    def width(self, s, size, bold=False):
+        """Width of s in design units."""
+        return self.font(size, bold).size(s)[0] / self.s
+
+    def _session_panel(self, surf, snap, x, y, w, h, k=1.0, visible=None):
+        """What each Claude Code session is up to, laid out in the box
+        (x, y, w, h) but only shown up to `visible` wide (the slide uncovers
+        it); k scales the text for smaller layouts."""
+        visible = w if visible is None else visible
+        if visible < 4:
+            return
+        clip = surf.get_clip()
+        surf.set_clip(self.rect(x, y - 8, visible, h + 16).clip(clip))
+        try:
+            sessions = snap.sessions
+            if not sessions:  # a beacon without details (curl hooks, beacon.py)
+                self.text(surf, "Claude is working", x, y + 26 * k, 26 * k, COL_TEXT, bold=True)
+                self.text(surf, self.fit("session details come from the Claude Code hooks "
+                                         "(display_hook.py)", w, 18 * k), x, y + 58 * k,
+                          18 * k, COL_DIM)
+                return
+            single = len(sessions) == 1
+            shown = sessions[:1 if single else 2]
+            cy = y
+            for s in shown:
+                waiting = s["state"] == "waiting"
+                mins = int(s["elapsed"] // 60)
+                state = "needs you" if waiting else "working" + (f" {fmt_minutes(mins)}" if mins else "")
+                if not single and s["agents"]:
+                    n = len(s["agents"])
+                    state += f"  ·  {n} agent{'s' if n > 1 else ''}"
+                title = self.fit(s["project"] or "Claude", w * 0.55, 26 * k, bold=True)
+                self.text(surf, title, x, cy + 26 * k, 26 * k, COL_TEXT, bold=True)
+                self.text(surf, self.fit(f"  ·  {state}", w - self.width(title, 26 * k, True),
+                                         22 * k),
+                          x + self.width(title, 26 * k, True), cy + 26 * k, 22 * k,
+                          COL_YELLOW if waiting else COL_ORANGE)
+                line = s["waiting"] if waiting else s["activity"]
+                self.text(surf, self.fit(line, w, 21 * k), x, cy + 58 * k, 21 * k,
+                          COL_YELLOW if waiting else COL_SUB)
+                cy += 58 * k
+                if single:
+                    for a in s["agents"][:3]:
+                        cy += 27 * k
+                        text = "› " + a["label"] + (f"  —  {a['activity']}" if a["activity"] else "")
+                        self.text(surf, self.fit(text, w, 18 * k), x, cy, 18 * k, COL_DIM)
+                    if len(s["agents"]) > 3:
+                        cy += 27 * k
+                        self.text(surf, f"+{len(s['agents']) - 3} more agents", x, cy, 18 * k, COL_DIM)
+                cy += 40 * k
+            if len(sessions) > len(shown):
+                rest = len(sessions) - len(shown)
+                self.text(surf, f"+{rest} more session{'s' if rest > 1 else ''} working",
+                          x, cy - 8 * k, 18 * k, COL_DIM)
+        finally:
+            surf.set_clip(clip)
+
     @staticmethod
     def working_note(snap):
         """Does the status line show "Claude is working" (every screen but usage)?"""
@@ -1443,7 +1659,7 @@ class Renderer:
         """The spinner's animation step, or -1 when nothing is spinning."""
         if not snap.thinking or (snap.mode != "usage" and not self.working_note(snap)):
             return -1
-        return int(snap.mono * 1000 / SPIN_FRAME_MS) % 48
+        return int(snap.mono * 1000 / SPIN_FRAME_MS) % SPIN_FRAMES
 
     def spinner_geometry(self, mode):
         if mode == "usage":
@@ -1459,10 +1675,33 @@ class Renderer:
         px = self.n(size)
         rect = pygame.Rect(self.x(cx) - px // 2, self.y(cy) - px // 2, px, px)
         surf.fill(COL_BG, rect)
-        frame = self.spin_frame(snap)
-        self.spinner(surf, cx, cy, size, max(frame, 0) * 7.5,
-                     COL_ORANGE if frame >= 0 else COL_CARD)
+        self.spinner(surf, cx, cy, size, self.spin_frame(snap))
         return rect
+
+    # the usage screen's activity word under / beside the spinner: (x, baseline, size, align)
+    WORD = {"landscape": (162, 362, 26, "c"), "portrait": (90, 158, 15, "c"),
+            "bar": (132, 216, 28, "l"), "strip": (160, 556, 32, "c")}
+
+    def draw_activity(self, surf, snap):
+        """The spinner plus, on the usage screen, its word ("working..." with a
+        shimmer running through it). Returns the rects it painted, so animation
+        frames push just those."""
+        rects = [self.draw_spinner(surf, snap)]
+        if snap.mode != "usage":
+            return rects
+        x, base, size, align = self.WORD[self.layout]
+        f = self.font(size)
+        widest = max(f.size(w)[0] for w in ("working...", "needs you", "idle")) + 2
+        left = self.x(x) - (widest // 2 if align == "c" else 0)
+        rect = pygame.Rect(left, self.y(base) - f.get_ascent(), widest, f.get_height())
+        surf.fill(COL_BG, rect)
+        word, color = self.activity_word(snap)
+        self.text(surf, word, x, base, size, color, align=align)
+        frame = self.spin_frame(snap)
+        if frame >= 0:
+            self._shimmer(surf, word, x, base, size, align, frame / SPIN_FRAMES)
+        rects.append(rect)
+        return rects
 
     def _header_landscape(self, surf, now, brand, subtitle=None):
         if brand == "spotify":
@@ -1482,12 +1721,18 @@ class Renderer:
 
     def _usage_landscape(self, surf, snap, now):
         self._header_landscape(surf, now, "usage")
-        active = snap.thinking
-        self.draw_spinner(surf, snap)
-        self.text(surf, "working..." if active else "idle", 162, 362, 26,
-                  COL_ORANGE if active else COL_DIM, align="c")
+        self.draw_activity(surf, snap)
+        self._slide_landscape(surf, snap, now)
 
-        x0, x1 = 332, 768
+    def _slide_landscape(self, surf, snap, now):
+        """The moving part (see _slide_bar): the bars column and session panel."""
+        e = self.eased
+        x0, x1 = 332 + 208 * e, 768
+        if e > 0.02:
+            self._session_panel(surf, snap, 306, 130, 540 - 24 - 306, 280, k=0.72,
+                                visible=x0 - 24 - 306)
+            surf.fill(COL_CARD, self.rect(x0 - 12, 128, 2, 256))
+        moving = 0 < self.anim < 1
         for i, (label, key) in enumerate((("5-HOUR", "five"), ("WEEKLY", "week"))):
             top = 132 + i * 150
             pct, when, _ = snap.usage[key] if snap.usage else (None, None, "")
@@ -1495,19 +1740,16 @@ class Renderer:
             self.text(surf, "--" if pct is None else f"{round(pct)}%", x1, top + 30, 44,
                       COL_TEXT, bold=True, align="r")
             if when:
-                self.text(surf, f"resets {fmt_reset(when, now)}  \u00b7  {fmt_until(when, now)}",
+                self.text(surf, self.reset_text(when, now, x1 - x0, 17, short=self.anim > 0),
                           x0, top + 50, 17, COL_DIM)
             self.bar(surf, self.rect(x0, top + 62, x1 - x0, 40),
-                     None if pct is None else pct / 100, bar_color(pct), 12)
+                     None if pct is None else pct / 100, bar_color(pct), 12, fast=moving)
 
     def _usage_portrait(self, surf, snap, now):
         self.mascot(surf, 12, 17, 4)
         self.text(surf, "Claude Code", 72, 30, 16, COL_ORANGE, bold=True)
         self.text(surf, "usage monitor", 72, 47, 11, COL_DIM)
-        active = snap.thinking
-        self.draw_spinner(surf, snap)
-        self.text(surf, "working..." if active else "idle", 90, 158, 15,
-                  COL_ORANGE if active else COL_DIM, align="c")
+        self.draw_activity(surf, snap)
         surf.fill(COL_CARD, self.rect(12, 168, 156, 1))
 
         for i, (label, key) in enumerate((("5-HOUR", "five"), ("WEEKLY", "week"))):
@@ -1578,26 +1820,52 @@ class Renderer:
     def _clock_bar(self, surf, now):
         self.text(surf, clock_str(now), 1452, 300, 22, COL_TEXT, bold=True, align="r")
 
+    @staticmethod
+    def activity_word(snap):
+        if snap.thinking:
+            return "working...", COL_ORANGE
+        if any(s["state"] == "waiting" for s in snap.sessions):
+            return "needs you", COL_YELLOW
+        return "idle", COL_DIM
+
+    def reset_text(self, when, now, room, size, short=False):
+        """The reset line, shortened to fit `room` design units - or always
+        short, so it doesn't flip between forms mid-slide."""
+        full = f"resets {fmt_reset(when, now)}  ·  {fmt_until(when, now)}"
+        for text in ((fmt_until(when, now),) if short else (full, fmt_until(when, now))):
+            if self.width(text, size) <= room:
+                return text
+        return ""
+
     def _usage_bar(self, surf, snap, now):
         self.mascot(surf, 28, 42, 7)
         self.text(surf, "Claude Code", 124, 74, 30, COL_ORANGE, bold=True)
         self.text(surf, "usage monitor", 124, 99, 17, COL_DIM)
-        active = snap.thinking
-        self.draw_spinner(surf, snap)
-        self.text(surf, "working..." if active else "idle", 132, 216, 28,
-                  COL_ORANGE if active else COL_DIM)
+        self.draw_activity(surf, snap)
         surf.fill(COL_CARD, self.rect(346, 40, 2, 196))
+        self._slide_bar(surf, snap, now)
 
-        x0, xb, x1 = 380, 1268, 1452  # label / bar start, bar end, % right edge
+    def _slide_bar(self, surf, snap, now):
+        """The moving part. While Claude works the bars slide right and shrink
+        toward the end of the screen, uncovering the session panel in the
+        middle; they slide back when it's done. The panel is laid out at its
+        full width and revealed, so its text never reflows mid-slide."""
+        e = self.eased
+        x0, xb, x1 = 380 + 620 * e, 1268, 1452  # label / bar start, bar end, % right edge
+        if e > 0.02:
+            self._session_panel(surf, snap, 380, 40, 1000 - 36 - 380, 200, visible=x0 - 36 - 380)
+            surf.fill(COL_CARD, self.rect(x0 - 18, 40, 2, 196))
+        moving = 0 < self.anim < 1
         for i, (label, key) in enumerate((("5-HOUR", "five"), ("WEEKLY", "week"))):
             top = 40 + i * 112
             pct, when, _ = snap.usage[key] if snap.usage else (None, None, "")
             self.text(surf, label, x0, top + 24, 22, COL_DIM, bold=True)
             if when:
-                self.text(surf, f"resets {fmt_reset(when, now)}  ·  {fmt_until(when, now)}",
+                room = xb - x0 - self.width(label, 22, True) - 24
+                self.text(surf, self.reset_text(when, now, room, 20, short=self.anim > 0),
                           xb, top + 24, 20, COL_DIM, align="r")
             self.bar(surf, self.rect(x0, top + 36, xb - x0, 46),
-                     None if pct is None else pct / 100, bar_color(pct), 14)
+                     None if pct is None else pct / 100, bar_color(pct), 14, fast=moving)
             self.text(surf, "--" if pct is None else f"{round(pct)}%", x1, top + 79, 54,
                       COL_TEXT, bold=True, align="r")
         self._clock_bar(surf, now)
@@ -1635,10 +1903,7 @@ class Renderer:
         self.mascot(surf, 82, 70, 13)
         self.text(surf, "Claude Code", 160, 232, 34, COL_ORANGE, bold=True, align="c")
         self.text(surf, "usage monitor", 160, 264, 20, COL_DIM, align="c")
-        active = snap.thinking
-        self.draw_spinner(surf, snap)
-        self.text(surf, "working..." if active else "idle", 160, 556, 32,
-                  COL_ORANGE if active else COL_DIM, align="c")
+        self.draw_activity(surf, snap)
         surf.fill(COL_CARD, self.rect(24, 600, 272, 2))
 
         for i, (label, key) in enumerate((("5-HOUR", "five"), ("WEEKLY", "week"))):
@@ -1909,16 +2174,22 @@ def main():
         if rotate else screen
     renderer = Renderer(canvas.get_size(), find_fonts())
     model.art_px = renderer.art_px
+    renderer.warm_spinner()  # draw the spark's frames now, not mid-animation
     log(f"screen {sw}x{sh}, rotate {rotate}, {renderer.layout} layout")
 
-    def present(rect=None):
-        """Push the canvas - or just `rect` of it - to the screen."""
+    def present(*rects):
+        """Push the canvas - or just these rects of it - to the screen."""
         if rotate:
-            src = canvas.subsurface(rect) if rect else canvas
-            rect = rotate_rect(rect, rotate, *canvas.get_size()) if rect else None
-            screen.blit(pygame.transform.rotate(src, -rotate), rect.topleft if rect else (0, 0))
-        if rect:
-            pygame.display.update(rect)
+            if not rects:
+                screen.blit(pygame.transform.rotate(canvas, -rotate), (0, 0))
+            turned = []
+            for rect in rects:
+                dest = rotate_rect(rect, rotate, *canvas.get_size())
+                screen.blit(pygame.transform.rotate(canvas.subsurface(rect), -rotate), dest.topleft)
+                turned.append(dest)
+            rects = turned
+        if rects:
+            pygame.display.update(list(rects))
         else:
             pygame.display.flip()
 
@@ -1945,16 +2216,21 @@ def main():
 
             snap = model.snapshot()
             now = datetime.datetime.now().astimezone()
+            moving = renderer.advance(snap)  # the session panel's slide
             key = renderer.scene_key(snap, now)
             frame = renderer.spin_frame(snap)
             if key != last_key:
                 last_key, last_frame = key, frame
                 renderer.draw(canvas, snap, now)
                 present()
-            elif frame != last_frame:  # only the spinner moved
-                last_frame = frame
-                present(renderer.draw_spinner(canvas, snap))
-            clock.tick(30 if frame >= 0 else 10)  # 30 Hz only while a spinner turns
+            else:  # repaint and push only what moved
+                rects = [renderer.draw_slide(canvas, snap, now)] if moving else []
+                if frame != last_frame:
+                    last_frame = frame
+                    rects += renderer.draw_activity(canvas, snap)
+                if rects:
+                    present(*rects)
+            clock.tick(60 if moving else 30 if frame >= 0 else 10)
     finally:
         pygame.quit()
 

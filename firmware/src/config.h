@@ -33,7 +33,7 @@
 // practice, so keep this generous. The numbers move slowly and the LED reacts
 // instantly via beacons regardless, so this only paces the bars. On a 429/403
 // the device auto-backs-off, so an occasional trip self-heals.
-#define USAGE_POLL_MS 90000   // 90 seconds
+#define USAGE_POLL_MS 180000  // 3 minutes
 
 // ---- Spotify "now playing" mode (optional) ----
 // The display can also show what Spotify is playing. Switch screens with the

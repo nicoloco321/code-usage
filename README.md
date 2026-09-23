@@ -362,6 +362,17 @@ the screen from its own Power port.
 **Using it:**
 
 - Tap the screen (or click, or press Space) to switch screens. Ctrl+Q quits.
+- **Session panel.** While Claude works, or waits on you, the usage
+  screen's bars slide to the right end of the screen and shrink, opening the
+  middle for what's going on. It shows each session's project and how long
+  it's been working, what Claude is doing right now ("Running: Compile the
+  firmware", "Editing main.cpp"), any subagents and what they're doing, and a
+  yellow "needs you" with the reason when a permission prompt or question is
+  waiting. When Claude is done the bars slide back. The details come from the
+  [Claude Code hooks](#option-a--claude-code-hooks-recommended), which send
+  them along with each beacon (the ESP32 ignores them). Beacons from
+  `beacon.py` or the old curl hooks just show "Claude is working". This is on
+  the bar and landscape layouts.
 - The Pi has no status LED, so while Claude works the Spotify and printer
   screens' status line shows a small spinner and "Claude is working...".
 - **3D printer screen (Bambu Lab).** A third screen follows a print on a

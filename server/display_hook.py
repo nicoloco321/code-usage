@@ -40,8 +40,10 @@ import contextlib
 import json
 import os
 import shutil
+import socket
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 if os.name == "nt":
@@ -68,6 +70,8 @@ TOOL_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
 # These keep a working session alive but never wake an idle one: they can
 # land after Stop (a subagent or helper finishing, a /compact you ran).
 ALIVE_EVENTS = {"SubagentStop", "PreCompact", "PostCompact"}
+AGENT_TOOLS = {"Task", "Agent"}  # tools that start a subagent
+AGENT_STALE_SECS = 300    # an agent we haven't heard from this long is gone
 HISTORY = 60              # recent events kept for --status
 WAIT_NOTES = {"permission_prompt", "elicitation_dialog", "elicitation_url_dialog",
               "agent_needs_input"}
@@ -81,11 +85,24 @@ INTERRUPTED = "[Request interrupted by user"
 
 # ---------------------------------------------------------------- state file
 
+def _retry(fn, secs=5):
+    """Windows sometimes refuses a file for a moment (antivirus, the Store
+    Python's file redirection) - try again rather than lose the event."""
+    deadline = time.monotonic() + secs
+    while True:
+        try:
+            return fn()
+        except PermissionError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.02)
+
+
 @contextlib.contextmanager
 def locked():
     """Serialize hook processes: async hooks can run concurrently."""
     os.makedirs(STATE_DIR, exist_ok=True)
-    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = _retry(lambda: os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600))
     try:
         if os.name == "nt":
             import msvcrt
@@ -112,18 +129,24 @@ def locked():
 
 
 def load():
-    try:
+    """The saved state. Only a missing or garbled file means a fresh start -
+    a file we can't read right now raises, so it never gets saved over."""
+    def read():
         with open(STATE_PATH, encoding="utf-8") as f:
-            st = json.load(f)
-    except (OSError, ValueError):
+            return json.load(f)
+    try:
+        st = _retry(read)
+    except (FileNotFoundError, ValueError):
         st = {}
     st.setdefault("sessions", {})
     return st
 
 
 def save(st):
-    with open(STATE_PATH, "w", encoding="utf-8") as f:  # only ever called under locked()
-        json.dump(st, f, indent=1)
+    def write():
+        with open(STATE_PATH, "w", encoding="utf-8") as f:  # only ever called under locked()
+            json.dump(st, f, indent=1)
+    _retry(write)
 
 
 # ---------------------------------------------------------------- session logic
@@ -131,6 +154,55 @@ def save(st):
 def set_state(s, state, now):
     if s["state"] != state:
         s["state"], s["changed"] = state, now
+
+
+def describe_tool(name, inp):
+    """A tool call in a few words for the display: "Editing main.cpp"."""
+    inp = inp if isinstance(inp, dict) else {}
+
+    def base(path):
+        return os.path.basename(str(path or "").rstrip("/\\")) or "a file"
+
+    if name == "Bash":
+        text = str(inp.get("description") or inp.get("command") or "a command")
+        return "Running: " + text.strip().splitlines()[0][:90] if text.strip() else "Running a command"
+    if name in ("Edit", "MultiEdit", "NotebookEdit"):
+        return f"Editing {base(inp.get('file_path') or inp.get('notebook_path'))}"
+    if name == "Write":
+        return f"Writing {base(inp.get('file_path'))}"
+    if name == "Read":
+        return f"Reading {base(inp.get('file_path'))}"
+    if name in ("Grep", "Glob"):
+        return f"Searching for {str(inp.get('pattern') or '')[:60]}".rstrip()
+    if name == "WebFetch":
+        host = urllib.parse.urlsplit(str(inp.get("url") or "")).hostname
+        return f"Reading {host}" if host else "Reading a web page"
+    if name == "WebSearch":
+        return f"Searching the web: {str(inp.get('query') or '')[:60]}"
+    if name in AGENT_TOOLS:
+        return f"Starting an agent: {str(inp.get('description') or '')[:60]}".rstrip(": ")
+    if name == "TodoWrite":
+        return "Updating the plan"
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        return f"Using {parts[-1]} ({parts[1]})" if len(parts) > 2 else f"Using {name}"
+    return f"Using {name}"
+
+
+def agent_event(s, ev, now, activity):
+    """A subagent's own event: keep its entry (and what it's doing) fresh."""
+    agents = s.setdefault("agents", {})
+    aid, atype = ev["agent_id"], ev.get("agent_type") or "agent"
+    entry = next((a for a in agents.values() if a.get("agent_id") == aid), None)
+    if entry is None:  # the agent a launch is waiting for, or one we missed starting
+        entry = next((a for a in agents.values()
+                      if not a.get("agent_id") and a.get("type") == atype), None)
+        if entry is None:
+            entry = agents.setdefault(aid, {"label": atype, "type": atype})
+        entry["agent_id"] = aid
+    entry["seen"] = now
+    if activity:
+        entry["activity"] = activity
 
 
 def apply_event(st, ev, now):
@@ -141,25 +213,36 @@ def apply_event(st, ev, now):
     s["seen"] = now
     if ev.get("transcript_path"):
         s["transcript"] = ev["transcript_path"]
+    if ev.get("cwd"):
+        s["project"] = os.path.basename(str(ev["cwd"]).rstrip("/\\"))
     note = ev.get("notification_type") or ""
     st["last"] = {"event": name + (f":{note}" if note else ""), "session": sid[:8], "at": now}
+    agents = s.setdefault("agents", {})
+    if name == "SubagentStop" and ev.get("agent_id"):
+        for key in [k for k, a in agents.items() if a.get("agent_id") == ev["agent_id"]]:
+            del agents[key]
 
     if name in STOP_EVENTS or note == "idle_prompt":
         set_state(s, IDLE, now)
-        s["tools"] = {}
+        s.update(tools={}, agents={}, activity="", waiting="")
         if name == "SessionEnd":
             del st["sessions"][sid]
     elif name == "Notification" and note in WAIT_NOTES:
         if s["state"] == WORKING:
             set_state(s, WAITING, now)
+            s["waiting"] = ev.get("message") or "Claude needs your input"
     elif name == "UserPromptSubmit":
         set_state(s, WORKING, now)
+        s.update(turn=now, activity="Thinking...", waiting="", agents={})
     elif note in RESUME_NOTES:
         if s["state"] == WAITING:
             set_state(s, WORKING, now)
+            s["waiting"] = ""
     elif name in TOOL_EVENTS:
         if s["state"] != WORKING and now - s["changed"] < GRACE_SECS:
             return  # a straggler from just before the stop/wait - ignore it
+        if s["state"] == IDLE:
+            s["turn"] = now  # woken without a prompt, e.g. by a finished background task
         tool = ev.get("tool_use_id")
         done = s.setdefault("done", [])
         # A quick tool's Post hook can run before its Pre hook, so remember
@@ -170,9 +253,42 @@ def apply_event(st, ev, now):
             s["tools"].pop(tool, None)
             done.append(tool)
             del done[:-50]
+        tool_name, tool_input = ev.get("tool_name") or "", ev.get("tool_input")
+        if ev.get("agent_id"):  # a subagent working - main activity stays as it is
+            agent_event(s, ev, now, describe_tool(tool_name, tool_input) if name == "PreToolUse" else "")
+        elif name == "PreToolUse":
+            s["activity"] = describe_tool(tool_name, tool_input)
+            if tool_name in AGENT_TOOLS and tool:
+                inp = tool_input if isinstance(tool_input, dict) else {}
+                atype = inp.get("subagent_type") or "agent"
+                desc = str(inp.get("description") or "")
+                agents[tool] = {"label": f"{atype}: {desc}" if desc else atype,
+                                "type": atype, "seen": now}
+        else:  # the main agent's tool finished - back to thinking about the result
+            s["activity"] = "Thinking..."
+            if tool in agents and not agents[tool].get("agent_id"):
+                del agents[tool]  # a foreground agent finished
+        s["waiting"] = ""
         set_state(s, WORKING, now)
     # ALIVE_EVENTS and anything else: "seen" is refreshed above, which keeps a
     # working session from timing out, but they never wake an idle one.
+
+
+def summary(st, now):
+    """What the display's session panel shows: this machine's sessions that
+    are working or waiting on you."""
+    out = []
+    for sid, s in sorted(st["sessions"].items(), key=lambda kv: -kv[1]["seen"]):
+        if not session_working(s, now) and s["state"] != WAITING:
+            continue
+        agents = [{"label": a.get("label", "agent"), "activity": a.get("activity", "")}
+                  for a in (s.get("agents") or {}).values()
+                  if now - a.get("seen", now) < AGENT_STALE_SECS]
+        out.append({"id": sid[:8], "project": s.get("project", ""), "state": s["state"],
+                    "elapsed": round(now - s.get("turn", s["changed"])),
+                    "activity": s.get("activity", ""), "waiting": s.get("waiting", ""),
+                    "agents": agents[:4]})
+    return {"host": socket.gethostname(), "sessions": out}
 
 
 def record(st, now, text):
@@ -214,12 +330,15 @@ def split_host(host, port=None):
 
 
 def send(st, host, port, on, now):
-    """POST /thinking/on or /off; records the result in the state and
-    returns a word for the history."""
+    """POST /thinking/on or /off, carrying the session summary as JSON (the Pi
+    app shows it; the ESP32 just ignores the body). Records the result in the
+    state and returns a word for the history."""
     word = "on" if on else "off"
     url = f"http://{host}:{port}/thinking/{word}"
+    body = json.dumps(summary(st, now)).encode()
     try:
-        _opener.open(urllib.request.Request(url, data=b"", method="POST"),
+        _opener.open(urllib.request.Request(url, data=body, method="POST",
+                                            headers={"Content-Type": "application/json"}),
                      timeout=SEND_TIMEOUT).read()
         st["sent"], st["sent_at"], st["fail_at"] = word, now, 0
         st.pop("error", None)
@@ -415,6 +534,9 @@ def print_status():
         tools = f", {len(s['tools'])} tool(s) running" if s["tools"] else ""
         print(f"  {sid[:8]}  {s['state']:<8} for {now - s['changed']:.0f}s, "
               f"last event {now - s['seen']:.0f}s ago{tools}")
+        for line in [s.get("project"), s.get("waiting") or s.get("activity")] +                 [f"agent {a.get('label')}: {a.get('activity', '')}" for a in (s.get("agents") or {}).values()]:
+            if line:
+                print(f"            {line}")
     if st.get("history"):
         print("recent:")
         for at, text in st["history"][-20:]:
