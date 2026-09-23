@@ -108,6 +108,12 @@ EOF
     || echo "Spotify setup didn't finish - run it again later: python3 server/spotify_login.py --config $CONF"
 fi
 
+if [ -z "$(conf_get bambu access_code)" ] && interactive \
+   && ask "Set up the optional Bambu Lab 3D printer screen now?" n; then
+  python3 "$APP" --setup-bambu --config "$CONF" \
+    || echo "Printer setup didn't finish - run it again later: python3 pi/claude_display.py --setup-bambu"
+fi
+
 NEED_REBOOT=0
 if [ "$(hostname)" != "$WANT_HOSTNAME" ] \
    && ask "Rename this Pi to '$WANT_HOSTNAME' so it answers at $WANT_HOSTNAME.local?" y; then

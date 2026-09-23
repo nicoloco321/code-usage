@@ -9,8 +9,9 @@ official touchscreen:
     OAuth usage API with a dedicated login (server/device_login.py)
   - a spinner while Claude is working, driven by the same HTTP beacons
     (POST /thinking/on, /thinking/off) from Claude Code hooks or beacon.py
-  - an optional Spotify now-playing screen (POST /mode/spotify, /mode/usage,
-    /mode/toggle - or just tap the screen)
+  - an optional Spotify now-playing screen, and an optional 3D printer screen
+    with a Bambu Lab print's progress (POST /mode/spotify, /mode/bambu,
+    /mode/usage, /mode/toggle - or just tap the screen)
 
 It speaks the firmware's HTTP API on the same port, so the hooks, beacon.py,
 find_display.py and the /switch command work unchanged - point them at the Pi.
@@ -20,6 +21,7 @@ reads that).
     python3 pi/claude_display.py                      # fullscreen
     python3 pi/claude_display.py --windowed 800x480   # in a window, for testing
     python3 pi/claude_display.py --demo               # fake data, no logins needed
+    python3 pi/claude_display.py --setup-bambu        # add your Bambu Lab printer
 
 Settings live in ~/.config/claude-display/config.ini (see config.example.ini);
 pi/install.sh sets everything up to start fullscreen on boot. Needs pygame 2
@@ -40,6 +42,7 @@ import re
 import signal
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -72,8 +75,9 @@ SPOTIFY_NOW_URL = ("https://api.spotify.com/v1/me/player/currently-playing"
                    "?additional_types=episode")
 
 ROOT_TEXT = ("Claude Code usage display (Raspberry Pi). POST /thinking/on while "
-             "working, /thinking/off when done. POST /mode/usage, /mode/spotify or "
-             "/mode/toggle to switch screens; GET /mode to ask; GET /usage for JSON.\n")
+             "working, /thinking/off when done. POST /mode/usage, /mode/spotify, "
+             "/mode/bambu or /mode/toggle to switch screens; GET /mode to ask; "
+             "GET /usage for JSON.\n")
 
 # ---- palette: the firmware's RGB565 colours, in full RGB ----
 COL_BG = (18, 18, 18)
@@ -86,7 +90,21 @@ COL_GREEN = (57, 186, 82)
 COL_YELLOW = (222, 162, 66)
 COL_RED = (230, 81, 74)
 COL_SPOTIFY = (29, 185, 84)
+COL_BAMBU = (35, 165, 67)     # Bambu Lab green
 COL_EYE = (0, 0, 0)
+
+# The screens, in the order a tap or /mode/toggle cycles through them.
+MODES = ("usage", "spotify", "bambu")
+
+# The Bambu Lab mark: two columns, each cut by a slanted gap - four panels,
+# in units of a 442 x 574 box.
+BAMBU_LOGO_SIZE = (442, 574)
+BAMBU_LOGO = [
+    [(0, 0), (205, 0), (205, 280), (0, 360)],
+    [(0, 393), (205, 313), (205, 574), (0, 574)],
+    [(236, 0), (442, 0), (442, 261), (236, 181)],
+    [(236, 214), (442, 294), (442, 574), (236, 574)],
+]
 
 SPIN_FRAME_MS = 90  # spinner step, same pace as the firmware
 
@@ -153,6 +171,14 @@ class Config:
         self.beacon_ttl = num("server", "beacon_ttl_seconds", 300)
         self.size = parse_size(s("screen", "size"))
         self.rotate = int(num("screen", "rotate", 0)) % 360
+        self.bambu_host = s("bambu", "host")
+        self.bambu_serial = s("bambu", "serial")
+        self.bambu_code = s("bambu", "access_code")
+        self.bambu_name = s("bambu", "name")
+
+    @property
+    def bambu_ready(self):
+        return bool(self.bambu_host and self.bambu_serial and self.bambu_code)
 
 
 class StateFile:
@@ -369,10 +395,12 @@ def local_ip():
 class Model:
     """Everything on screen, shared by the workers, the HTTP server and the renderer."""
 
-    def __init__(self, cfg, state, spotify_ready):
-        self.cfg, self.state, self.spotify_ready = cfg, state, spotify_ready
+    def __init__(self, cfg, state, spotify_ready, bambu_ready=False):
+        self.cfg, self.state = cfg, state
+        self.ready = {"usage": True, "spotify": spotify_ready, "bambu": bambu_ready}
         self.lock = threading.Lock()
-        self.mode = "spotify" if state.get("mode") == "spotify" and spotify_ready else "usage"
+        saved = state.get("mode")
+        self.mode = saved if self.ready.get(saved) else "usage"
 
         self.usage = None          # {"five"/"week": (pct or None, reset datetime, iso)}
         self.usage_ok_at = 0.0     # monotonic time of the last good fetch
@@ -386,12 +414,16 @@ class Model:
         self.art = None            # (url, image bytes) of the latest album art
         self.art_px = 300          # art size on screen, so we fetch a sharp enough variant
 
+        self.printer = None        # Bambu "print" report, merged update by update
+        self.printer_status = None
+
         self.last_beacon = 0.0     # monotonic time of the last "thinking" ping, 0 = off
         self.flash_msg = None      # (text, colour, until): short-lived status override
         self.host = socket.gethostname().split(".")[0]
         self.ip = ""
         self.usage_wake = threading.Event()
         self.spotify_wake = threading.Event()
+        self.bambu_wake = threading.Event()
 
     # -- beacons: "thinking" is sticky between on and off; the TTL is a backstop
     def thinking(self, now=None):
@@ -406,8 +438,8 @@ class Model:
 
     # -- screen mode (persisted, like the firmware's NVS "mode")
     def set_mode(self, mode):
-        """Switch screens. False if Spotify was asked for but isn't set up."""
-        if mode == "spotify" and not self.spotify_ready:
+        """Switch screens. False if that screen isn't set up."""
+        if not self.ready.get(mode):
             return False
         with self.lock:
             if mode == self.mode:
@@ -415,14 +447,26 @@ class Model:
             self.mode = mode
             if mode == "spotify" and self.np is None:
                 self.sp_status = ("fetching spotify...", COL_DIM)
+            if mode == "bambu" and self.printer is None:
+                self.printer_status = ("connecting to the printer...", COL_DIM)
         self.state.put("mode", mode)
         if mode == "spotify":
             self.spotify_wake.set()
+        elif mode == "bambu":
+            self.bambu_wake.set()
         return True
 
+    def next_mode(self):
+        """The screen after this one, skipping any that aren't set up."""
+        i = MODES.index(self.mode)
+        return next((m for m in MODES[i + 1:] + MODES[:i] if self.ready[m]), self.mode)
+
     def toggle_mode(self):
-        if not self.set_mode("spotify" if self.mode == "usage" else "usage"):
-            self.flash("spotify not set up - see config.ini", COL_YELLOW)
+        nxt = self.next_mode()
+        if nxt == self.mode:
+            self.flash("no other screens set up - see config.ini", COL_YELLOW)
+        else:
+            self.set_mode(nxt)
 
     def flash(self, text, color, secs=4):
         with self.lock:
@@ -455,6 +499,16 @@ class Model:
         with self.lock:
             self.art = (url, data)
 
+    def update_printer(self, report):
+        """Merge one Bambu report - P1/A1 printers only send what changed."""
+        with self.lock:
+            self.printer = {**(self.printer or {}), **report}
+            self.printer_status = ("printer ok", COL_GREEN)
+
+    def set_printer_status(self, text, color):
+        with self.lock:
+            self.printer_status = (text, color)
+
     def snapshot(self):
         now = time.monotonic()
         with self.lock:
@@ -463,6 +517,8 @@ class Model:
                 mode=self.mode, usage=self.usage, usage_version=self.usage_version,
                 usage_status=self.usage_status, np=self.np, np_at=self.np_at,
                 np_version=self.np_version, sp_status=self.sp_status, art=self.art,
+                printer=self.printer, printer_status=self.printer_status,
+                printer_name=self.cfg.bambu_name or "3D printer",
                 thinking=self.thinking(now), flash=flash and flash[:2],
                 host=self.host, ip=self.ip, mono=now)
 
@@ -646,6 +702,316 @@ def spotify_worker(model, login):
         model.spotify_wake.clear()
 
 
+# ---------------------------------------------------------------- bambu lab printer
+#
+# Bambu printers publish their status over MQTT on the LAN (TLS, port 8883,
+# user "bblp", password = the access code on the printer's screen). The
+# printer answers to its serial number: we subscribe to device/<serial>/report
+# and ask once for a full status ("pushall"); after that P1 / A1 printers only
+# send what changed.
+
+class MQTTRefused(Exception):
+    """The printer turned down the login - a wrong access code."""
+
+
+def _mqtt_str(text):
+    data = text.encode()
+    return struct.pack("!H", len(data)) + data
+
+
+def _mqtt_len(n):
+    out = bytearray()
+    while True:
+        n, byte = divmod(n, 128)
+        out.append(byte | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+class MiniMQTT:
+    """Just enough MQTT 3.1.1 to follow one topic: log in, subscribe, publish a
+    request, read messages. The printer's certificate is self-signed, so it's
+    not verified (it's on your LAN, like the ESP32's own HTTPS)."""
+
+    def __init__(self, host, port, username, password, tls=True, keepalive=60):
+        self.addr, self.user, self.password = (host, port), username, password
+        self.tls, self.keepalive = tls, keepalive
+        self.sock = None
+        self.packet_id = 0
+
+    def connect(self, timeout=10):
+        sock = socket.create_connection(self.addr, timeout=timeout)
+        if self.tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(sock, server_hostname=self.addr[0])
+        self.sock = sock
+        flags = 0x02 | (0x80 if self.user else 0) | (0x40 if self.password else 0)
+        body = (_mqtt_str("MQTT") + bytes([4, flags]) + struct.pack("!H", self.keepalive)
+                + _mqtt_str(f"claude-display-{os.getpid()}"))
+        if self.user:
+            body += _mqtt_str(self.user)
+        if self.password:
+            body += _mqtt_str(self.password)
+        self._send(0x10, body)
+        kind, body = self._packet(timeout)
+        if kind >> 4 != 2 or len(body) < 2:
+            raise ConnectionError("the printer didn't answer the MQTT login")
+        if body[1]:
+            raise MQTTRefused(body[1])
+
+    def subscribe(self, topic):
+        self.packet_id = self.packet_id % 65535 + 1
+        self._send(0x82, struct.pack("!H", self.packet_id) + _mqtt_str(topic) + b"\x00")
+
+    def publish(self, topic, payload):
+        self._send(0x30, _mqtt_str(topic) + payload)
+
+    def ping(self):
+        self._send(0xC0, b"")
+
+    def read(self, timeout):
+        """The next message as (topic, payload); ("", b"") for control packets
+        (acks, pings); None if nothing arrived in time."""
+        try:
+            kind, body = self._packet(timeout)
+        except socket.timeout:
+            return None
+        if kind >> 4 != 3:
+            return "", b""
+        n = struct.unpack("!H", body[:2])[0]
+        topic, pos = body[2:2 + n].decode("utf-8", "replace"), 2 + n
+        qos = (kind >> 1) & 3
+        if qos:
+            if qos == 1:
+                self._send(0x40, body[pos:pos + 2])  # PUBACK
+            pos += 2
+        return topic, body[pos:]
+
+    def close(self):
+        if self.sock:
+            try:
+                self._send(0xE0, b"")  # DISCONNECT
+            except OSError:
+                pass
+            self.sock.close()
+            self.sock = None
+
+    def _send(self, kind, body):
+        self.sock.sendall(bytes([kind]) + _mqtt_len(len(body)) + body)
+
+    def _packet(self, timeout):
+        """One whole packet. Waits up to `timeout` for it to start (raising
+        socket.timeout); once it has, reads the rest without giving up early."""
+        self.sock.settimeout(timeout)
+        kind = self._recv(1)[0]
+        self.sock.settimeout(15)
+        length, shift = 0, 0
+        while True:
+            byte = self._recv(1)[0]
+            length |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                break
+            shift += 7
+        return kind, self._recv(length)
+
+    def _recv(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("the printer closed the connection")
+            buf += chunk
+        return bytes(buf)
+
+
+def bambu_client(cfg):
+    return MiniMQTT(cfg.bambu_host, 8883, "bblp", cfg.bambu_code)
+
+
+PUSHALL = json.dumps({"pushing": {"sequence_id": "0", "command": "pushall",
+                                  "version": 1, "push_target": 1}}).encode()
+
+
+def bambu_worker(model):
+    """While the printer screen is up, stay connected and merge its reports."""
+    cfg = model.cfg
+    while True:
+        if model.mode != "bambu":  # sleep until someone switches to the printer
+            model.bambu_wake.wait()
+            model.bambu_wake.clear()
+            continue
+        client, delay = bambu_client(cfg), 10
+        try:
+            client.connect()
+            client.subscribe(f"device/{cfg.bambu_serial}/report")
+            client.publish(f"device/{cfg.bambu_serial}/request", PUSHALL)
+            last_heard = last_ping = time.monotonic()
+            while model.mode == "bambu":
+                msg = client.read(timeout=1.0)
+                now = time.monotonic()
+                if msg is not None:
+                    last_heard = now
+                    if msg[1]:
+                        try:
+                            report = json.loads(msg[1]).get("print")
+                        except (ValueError, AttributeError):
+                            report = None
+                        if isinstance(report, dict):
+                            model.update_printer(report)
+                if now - last_heard > 90:
+                    raise ConnectionError("the printer went quiet")
+                if now - last_ping > 30:
+                    client.ping()
+                    last_ping = now
+            delay = 0  # left the printer screen
+        except MQTTRefused as e:
+            log(f"printer refused the login (MQTT code {e})")
+            model.set_printer_status("printer refused the access code - run --setup-bambu", COL_RED)
+            delay = 60
+        except (OSError, ConnectionError) as e:
+            log(f"printer connection: {e}")
+            model.set_printer_status("printer unreachable - retrying", COL_RED)
+        finally:
+            client.close()
+        if delay:
+            model.bambu_wake.wait(delay)
+            model.bambu_wake.clear()
+
+
+BAMBU_STATES = {  # gcode_state -> (what the screen says, colour)
+    "RUNNING": ("printing", COL_BAMBU), "PREPARE": ("preparing", COL_TEXT),
+    "SLICING": ("slicing", COL_TEXT), "PAUSE": ("paused", COL_YELLOW),
+    "FINISH": ("finished", COL_BAMBU), "FAILED": ("failed", COL_RED),
+    "IDLE": ("idle", COL_DIM),
+}
+
+
+def fmt_minutes(mins):
+    mins = int(mins)
+    return f"{mins // 60}h {mins % 60}m" if mins >= 60 else f"{mins}m"
+
+
+def printer_view(p, now):
+    """What the printer screen shows, from the merged report."""
+    p = p or {}
+    state = str(p.get("gcode_state") or "").upper()
+    word, color = BAMBU_STATES.get(state, (state.lower() or "idle", COL_DIM))
+    job = str(p.get("subtask_name") or os.path.basename(str(p.get("gcode_file") or "")))
+    for ext in (".gcode.3mf", ".3mf", ".gcode"):
+        if job.lower().endswith(ext):
+            job = job[:-len(ext)]
+    pct = p.get("mc_percent")
+    pct = max(0, min(100, int(pct))) if isinstance(pct, (int, float)) else None
+    if state == "FINISH":
+        pct = 100
+    left = eta = ""
+    rem = p.get("mc_remaining_time")
+    if state in ("RUNNING", "PAUSE", "PREPARE") and isinstance(rem, (int, float)) and rem > 0:
+        left = f"{fmt_minutes(rem)} left"
+        if state != "PAUSE":  # a paused print's finish time slides - don't promise one
+            eta = f"done {fmt_reset(now + datetime.timedelta(minutes=rem), now)}"
+    layer, total = p.get("layer_num"), p.get("total_layer_num")
+    layers = f"layer {layer} / {total}" if total else ""
+
+    def temp(name, now_key, target_key):
+        t, target = p.get(now_key), p.get(target_key)
+        if not isinstance(t, (int, float)):
+            return ""
+        heating = isinstance(target, (int, float)) and target > 0 and abs(target - t) >= 3
+        return f"{name} {round(t)}°" + (f" / {round(target)}°" if heating else "")
+
+    temps = "  ·  ".join(x for x in (temp("nozzle", "nozzle_temper", "nozzle_target_temper"),
+                                          temp("bed", "bed_temper", "bed_target_temper")) if x)
+    bar = {"PAUSE": COL_YELLOW, "FAILED": COL_RED}.get(state, COL_BAMBU)
+    return SimpleNamespace(state=state, word=word, color=color, bar=bar, job=job, pct=pct,
+                           left=left, eta=eta, layers=layers, temps=temps,
+                           has_job=state in ("RUNNING", "PAUSE", "PREPARE", "FINISH", "FAILED"))
+
+
+def find_bambu(seconds=8):
+    """Bambu printers announce themselves on UDP 2021 (SSDP-style); listen."""
+    found = {}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("", 2021))
+    s.settimeout(0.5)
+    end = time.monotonic() + seconds
+    try:
+        while time.monotonic() < end:
+            try:
+                data, addr = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            head = {}
+            for line in data.decode("utf-8", "replace").splitlines():
+                key, _, value = line.partition(":")
+                if value:
+                    head[key.strip().lower()] = value.strip()
+            serial = head.get("usn")
+            if serial and serial not in found:
+                found[serial] = {"serial": serial, "host": head.get("location") or addr[0],
+                                 "name": head.get("devname.bambu.com", ""),
+                                 "model": head.get("devmodel.bambu.com", "")}
+    finally:
+        s.close()
+    return list(found.values())
+
+
+def setup_bambu(config_path):
+    """--setup-bambu: find the printer, ask for its access code, test, save."""
+    import getpass
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "server"))
+    from device_login import save_to_config
+
+    print("Looking for Bambu Lab printers on the network (8 s)...")
+    printers = find_bambu()
+    for i, pr in enumerate(printers, 1):
+        print(f"  {i}. {pr['name'] or 'printer'} ({pr['model']}) at {pr['host']}")
+    if printers:
+        pick = input(f"Which one? [1-{len(printers)}, default 1] ").strip() or "1"
+        printer = printers[int(pick) - 1]
+    else:
+        print("None heard - enter it by hand (IP and serial are on the printer's screen).")
+        printer = {"host": input("Printer IP: ").strip(), "serial": input("Serial number: ").strip(),
+                   "name": input("A name for it (optional): ").strip()}
+    code = getpass.getpass("Access code (on the printer's screen: Settings > WLAN, "
+                           "or Network on an X1): ").strip()
+
+    cfg = SimpleNamespace(bambu_host=printer["host"], bambu_code=code)
+    client = bambu_client(cfg)
+    try:
+        client.connect()
+        client.subscribe(f"device/{printer['serial']}/report")
+        client.publish(f"device/{printer['serial']}/request", PUSHALL)
+        report, end = None, time.monotonic() + 15
+        while report is None and time.monotonic() < end:
+            msg = client.read(timeout=1.0)
+            if msg and msg[1]:
+                report = json.loads(msg[1]).get("print")
+        if report:
+            v = printer_view(report, datetime.datetime.now().astimezone())
+            print(f"Connected - the printer is {v.word}"
+                  + (f", {v.job} at {v.pct}%" if v.has_job and v.pct is not None else "") + ".")
+        else:
+            print("Connected, but no status arrived yet - saving anyway.")
+    except MQTTRefused:
+        sys.exit("The printer rejected that access code. Check it on the printer's "
+                 "screen and try again (newer firmware may also need LAN-only mode with "
+                 "Developer Mode turned on).")
+    except (OSError, ConnectionError) as e:
+        print(f"Couldn't reach the printer ({e}) - saving anyway; check it's on and on this network.")
+    finally:
+        client.close()
+
+    save_to_config(config_path, "bambu", {"host": printer["host"], "serial": printer["serial"],
+                                          "access_code": code, "name": printer.get("name", "")})
+    print(f"Saved to [bambu] in {config_path}.")
+    print("Restart the display to pick it up (sudo systemctl restart claude-display, or "
+          "reboot), then tap the screen to reach the printer screen.")
+
+
 # ---------------------------------------------------------------- demo data
 
 def demo_art():
@@ -661,13 +1027,21 @@ def demo_art():
 
 
 def demo_worker(model):
-    """--demo: moving numbers, a thinking spinner every other 8s and a fake song."""
+    """--demo: moving numbers, a thinking spinner every other 8s, a fake song
+    and a fake print."""
     art = demo_art()
     model.set_art("demo:art", art)
     start = time.time()
     while True:
         t = time.time()
         now = datetime.datetime.now().astimezone()
+        done = ((t - start) / 600) % 1.0  # a 10-minute "print" on loop
+        model.update_printer({
+            "gcode_state": "RUNNING", "subtask_name": "Articulated Dragon.3mf",
+            "mc_percent": int(done * 100), "mc_remaining_time": int((1 - done) * 154),
+            "layer_num": int(done * 212), "total_layer_num": 212,
+            "nozzle_temper": 219.6, "nozzle_target_temper": 220.0,
+            "bed_temper": 55.1, "bed_target_temper": 55.0})
         model.set_usage({
             "five": (50 + 45 * math.sin(t / 30), now + datetime.timedelta(hours=2, minutes=13), ""),
             "week": (40 + 20 * math.sin(t / 90), now + datetime.timedelta(days=3, hours=4), ""),
@@ -714,15 +1088,18 @@ class BeaconHandler(BaseHTTPRequestHandler):
             self._send(200, "off\n")
         elif path == "/mode":
             self._send(200, m.mode + "\n")
-        elif path in ("/mode/usage", "/mode/spotify", "/mode/toggle"):
-            want = path.rsplit("/", 1)[1]
+        elif path.startswith("/mode/") and path[6:] in MODES + ("toggle",):
+            want = path[6:]
             if want == "toggle":
-                want = "spotify" if m.mode == "usage" else "usage"
+                want = m.next_mode()
             if m.set_mode(want):
                 self._send(200, want + "\n")
-            else:
+            elif want == "spotify":
                 self._send(409, "spotify not configured - run server/spotify_login.py "
                                 "--config ~/.config/claude-display/config.ini\n")
+            else:
+                self._send(409, "printer not configured - run "
+                                "python3 pi/claude_display.py --setup-bambu\n")
         elif path == "/usage":
             self._send(200, json.dumps(m.usage_json()) + "\n", "application/json")
         elif path == "/":
@@ -940,6 +1317,18 @@ class Renderer:
                                                  COL_SPOTIFY, COL_BG))
         surf.blit(img, (self.x(cx) - d // 2, self.y(cy) - d // 2))
 
+    def bambu_logo(self, surf, x, y, h):
+        """The Bambu Lab mark, h design units tall, top-left at (x, y)."""
+        lw, lh = BAMBU_LOGO_SIZE
+        wpx, hpx = self.n(h * lw / lh), self.n(h)
+
+        def draw(big, k):
+            sx, sy = wpx * k / lw, hpx * k / lh
+            for poly in BAMBU_LOGO:
+                pygame.draw.polygon(big, COL_BAMBU, [(px * sx, py * sy) for px, py in poly])
+
+        surf.blit(self._ss(("bambu",), wpx, hpx, draw), (self.x(x), self.y(y)))
+
     def art_placeholder(self, surf, rect):
         def draw(big, k):
             pygame.draw.rect(big, COL_CARD, big.get_rect(), border_radius=int(rect.w * k * 0.04))
@@ -992,6 +1381,11 @@ class Renderer:
         key = (snap.mode, snap.flash, snap.host, snap.ip, now.strftime("%Y%m%d%H%M"))
         if snap.mode == "usage":
             return key + (snap.usage_version, snap.usage_status, snap.thinking)
+        if snap.mode == "bambu":
+            # only what's drawn, so fan speeds and wifi strength don't cause redraws
+            v = printer_view(snap.printer, now)
+            return key + (snap.printer is None, v.word, v.job, v.pct, v.left, v.eta, v.layers,
+                          v.temps, snap.printer_status, snap.thinking)
         playing = snap.np is not None and snap.np.get("has_track")
         return key + (snap.np_version, snap.sp_status, snap.art and snap.art[0], snap.thinking,
                       self.progress_ms(snap) // 1000 if playing else -1)
@@ -1007,10 +1401,11 @@ class Renderer:
 
     def _status(self, surf, snap):
         addr = f"{snap.host}.local  {snap.ip}".rstrip()
-        status = snap.flash or (snap.sp_status if snap.mode == "spotify" else snap.usage_status)
-        if self.spotify_note(snap):
-            # The Spotify screen has no big spinner, so Claude working shows up
-            # here instead - the Pi's stand-in for the ESP32's breathing LED.
+        status = snap.flash or {"usage": snap.usage_status, "spotify": snap.sp_status,
+                                "bambu": snap.printer_status}[snap.mode]
+        if self.working_note(snap):
+            # Only the usage screen has the big spinner, so on the others Claude
+            # working shows up here - the Pi's stand-in for the ESP32's LED.
             x, base, size = self.STATUS[self.layout]
             self.draw_spinner(surf, snap)
             self.text(surf, "Claude is working...", x + size * 2.05, base, size, COL_ORANGE)
@@ -1040,13 +1435,13 @@ class Renderer:
                "bar": (70, 206, 104), "strip": (160, 410, 190)}
 
     @staticmethod
-    def spotify_note(snap):
-        """Does the Spotify screen's status line show "Claude is working"?"""
-        return snap.mode == "spotify" and snap.thinking and not snap.flash
+    def working_note(snap):
+        """Does the status line show "Claude is working" (every screen but usage)?"""
+        return snap.mode != "usage" and snap.thinking and not snap.flash
 
     def spin_frame(self, snap):
         """The spinner's animation step, or -1 when nothing is spinning."""
-        if not snap.thinking or (snap.mode == "spotify" and not self.spotify_note(snap)):
+        if not snap.thinking or (snap.mode != "usage" and not self.working_note(snap)):
             return -1
         return int(snap.mono * 1000 / SPIN_FRAME_MS) % 48
 
@@ -1069,20 +1464,24 @@ class Renderer:
                      COL_ORANGE if frame >= 0 else COL_CARD)
         return rect
 
-    def _header_landscape(self, surf, now, spotify):
-        if spotify:
+    def _header_landscape(self, surf, now, brand, subtitle=None):
+        if brand == "spotify":
             self.spotify_logo(surf, 58, 52, 26)
+            title, color, sub = "Spotify", COL_SPOTIFY, "now playing"
+        elif brand == "bambu":
+            self.bambu_logo(surf, 38, 24, 58)
+            title, color, sub = "Bambu Lab", COL_BAMBU, subtitle
         else:
             self.mascot(surf, 32, 28, 6)
-        self.text(surf, "Spotify" if spotify else "Claude Code", 119, 56, 30,
-                  COL_SPOTIFY if spotify else COL_ORANGE, bold=True)
-        self.text(surf, "now playing" if spotify else "usage monitor", 119, 82, 17, COL_DIM)
+            title, color, sub = "Claude Code", COL_ORANGE, "usage monitor"
+        self.text(surf, title, 119, 56, 30, color, bold=True)
+        self.text(surf, self.fit(sub, 420, 17), 119, 82, 17, COL_DIM)
         self.text(surf, clock_str(now), 768, 58, 30, COL_TEXT, align="r")
         self.text(surf, f"{now.strftime('%a %b')} {now.day}", 768, 82, 17, COL_DIM, align="r")
         surf.fill(COL_CARD, self.rect(32, 104, 736, 2))
 
     def _usage_landscape(self, surf, snap, now):
-        self._header_landscape(surf, now, spotify=False)
+        self._header_landscape(surf, now, "usage")
         active = snap.thinking
         self.draw_spinner(surf, snap)
         self.text(surf, "working..." if active else "idle", 162, 362, 26,
@@ -1123,7 +1522,7 @@ class Renderer:
                      None if pct is None else pct / 100, bar_color(pct), 6)
 
     def _spotify_landscape(self, surf, snap, now):
-        self._header_landscape(surf, now, spotify=True)
+        self._header_landscape(surf, now, "spotify")
         np = snap.np
         if not np or not np["has_track"]:
             self.text(surf, "nothing playing" if np else "loading...", 400, 290, 28,
@@ -1284,6 +1683,126 @@ class Renderer:
         self.play_state(surf, 160, 756, 24, np["playing"])
 
 
+    # -- the Bambu Lab printer screen
+    @staticmethod
+    def printer_word(snap, v):
+        return ("connecting...", COL_DIM) if snap.printer is None else (v.word, v.color)
+
+    @staticmethod
+    def no_job_text(snap):
+        return "waiting for the printer..." if snap.printer is None else "no print running"
+
+    def _bambu_bar(self, surf, snap, now):
+        v = printer_view(snap.printer, now)
+        self.bambu_logo(surf, 30, 38, 66)
+        self.text(surf, "Bambu Lab", 98, 74, 30, COL_BAMBU, bold=True)
+        self.text(surf, self.fit(snap.printer_name, 236, 17), 98, 99, 17, COL_DIM)
+        word, color = self.printer_word(snap, v)
+        self.text(surf, word, 28, 206, 30, color)
+        if v.temps:
+            self.text(surf, self.fit(v.temps, 310, 19), 28, 244, 19, COL_DIM)
+        surf.fill(COL_CARD, self.rect(346, 40, 2, 196))
+
+        x0, xb, x1 = 380, 1268, 1452  # text / bar start, bar end, % right edge
+        if v.has_job:
+            self.text(surf, self.fit(v.job or "print", xb - x0, 30, bold=True), x0, 72, 30,
+                      COL_TEXT, bold=True)
+            self.bar(surf, self.rect(x0, 92, xb - x0, 62),
+                     None if v.pct is None else v.pct / 100, v.bar, 16)
+            self.text(surf, "--" if v.pct is None else f"{v.pct}%", x1, 148, 60, COL_TEXT,
+                      bold=True, align="r")
+            if v.layers:
+                self.text(surf, v.layers, x0, 206, 22, COL_DIM)
+            right = "  ·  ".join(x for x in (v.left, v.eta) if x)
+            if right:
+                self.text(surf, right, xb, 206, 22, COL_DIM, align="r")
+        else:
+            self.text(surf, self.no_job_text(snap), x0, 150, 34, COL_DIM)
+        self._clock_bar(surf, now)
+
+    def _bambu_landscape(self, surf, snap, now):
+        self._header_landscape(surf, now, "bambu", snap.printer_name)
+        v = printer_view(snap.printer, now)
+        if not v.has_job:
+            self.text(surf, self.no_job_text(snap), 400, 270, 28, COL_DIM, align="c")
+            if v.temps:
+                self.text(surf, v.temps, 400, 312, 18, COL_DIM, align="c")
+            return
+        x0, x1 = 32, 768
+        word, color = self.printer_word(snap, v)
+        self.text(surf, self.fit(v.job or "print", 560, 32, bold=True), x0, 190, 32, COL_TEXT,
+                  bold=True)
+        self.text(surf, "--" if v.pct is None else f"{v.pct}%", x1, 194, 56, COL_TEXT,
+                  bold=True, align="r")
+        self.text(surf, word, x0, 228, 22, color)
+        if v.temps:
+            self.text(surf, v.temps, x1, 228, 18, COL_DIM, align="r")
+        self.bar(surf, self.rect(x0, 252, x1 - x0, 52),
+                 None if v.pct is None else v.pct / 100, v.bar, 14)
+        if v.layers:
+            self.text(surf, v.layers, x0, 342, 20, COL_DIM)
+        right = "  ·  ".join(x for x in (v.left, v.eta) if x)
+        if right:
+            self.text(surf, right, x1, 342, 20, COL_DIM, align="r")
+
+    def _bambu_portrait(self, surf, snap, now):
+        self.bambu_logo(surf, 23, 12, 40)
+        self.text(surf, "Bambu Lab", 72, 30, 16, COL_BAMBU, bold=True)
+        self.text(surf, self.fit(snap.printer_name, 96, 11), 72, 47, 11, COL_DIM)
+        surf.fill(COL_CARD, self.rect(12, 62, 156, 1))
+        v = printer_view(snap.printer, now)
+        if not v.has_job:
+            self.text(surf, self.no_job_text(snap), 90, 170, 13, COL_DIM, align="c")
+            if v.temps:
+                self.text(surf, self.fit(v.temps, 156, 10), 90, 190, 10, COL_DIM, align="c")
+            return
+        word, color = self.printer_word(snap, v)
+        l1, l2 = self.wrap2(v.job or "print", 156, 15, bold=True)
+        y = 84
+        self.text(surf, l1, 12, y, 15, COL_TEXT, bold=True)
+        if l2:
+            y += 19
+            self.text(surf, l2, 12, y, 15, COL_TEXT, bold=True)
+        self.text(surf, word, 12, y + 21, 13, color)
+        self.text(surf, "--" if v.pct is None else f"{v.pct}%", 90, 188, 40, COL_TEXT,
+                  bold=True, align="c")
+        self.bar(surf, self.rect(12, 204, 156, 20),
+                 None if v.pct is None else v.pct / 100, v.bar, 6)
+        if v.layers:
+            self.text(surf, v.layers, 12, 244, 10, COL_DIM)
+        if v.left:
+            self.text(surf, v.left, 168, 244, 10, COL_DIM, align="r")
+        if v.eta:
+            self.text(surf, v.eta, 12, 262, 10, COL_DIM)
+        if v.temps:
+            self.text(surf, self.fit(v.temps, 156, 10), 12, 280, 10, COL_DIM)
+
+    def _bambu_strip(self, surf, snap, now):
+        self.bambu_logo(surf, 113, 60, 122)
+        self.text(surf, "Bambu Lab", 160, 232, 34, COL_BAMBU, bold=True, align="c")
+        self.text(surf, self.fit(snap.printer_name, 272, 20), 160, 264, 20, COL_DIM, align="c")
+        v = printer_view(snap.printer, now)
+        word, color = self.printer_word(snap, v)
+        self.text(surf, word, 160, 340, 30, color, align="c")
+        if v.temps:
+            self.text(surf, self.fit(v.temps, 272, 20), 160, 378, 20, COL_DIM, align="c")
+        surf.fill(COL_CARD, self.rect(24, 420, 272, 2))
+        if v.has_job:
+            l1, l2 = self.wrap2(v.job or "print", 272, 28, bold=True)
+            self.text(surf, l1, 24, 486, 28, COL_TEXT, bold=True)
+            if l2:
+                self.text(surf, l2, 24, 522, 28, COL_TEXT, bold=True)
+            self.text(surf, "--" if v.pct is None else f"{v.pct}%", 160, 700, 96, COL_TEXT,
+                      bold=True, align="c")
+            self.bar(surf, self.rect(24, 736, 272, 56),
+                     None if v.pct is None else v.pct / 100, v.bar, 16)
+            for i, line in enumerate(x for x in (v.layers, v.left, v.eta) if x):
+                self.text(surf, line, 160, 842 + i * 34, 21, COL_DIM, align="c")
+        else:
+            self.text(surf, self.no_job_text(snap), 160, 560, 24, COL_DIM, align="c")
+        self._clock_strip(surf, now)
+
+
 # ---------------------------------------------------------------- main
 
 def forever(fn, *args):
@@ -1331,8 +1850,13 @@ def main():
     ap.add_argument("--windowed", metavar="WxH", help="run in a window, e.g. 800x480 or 480x800")
     ap.add_argument("--demo", action="store_true", help="fake data - no logins or network needed")
     ap.add_argument("--port", type=int, help="HTTP port (overrides config.ini)")
+    ap.add_argument("--setup-bambu", action="store_true",
+                    help="find your Bambu Lab printer, ask for its access code, save it")
     args = ap.parse_args()
 
+    if args.setup_bambu:
+        setup_bambu(args.config)
+        return
     if pygame.version.vernum[0] < 2:
         sys.exit(f"needs pygame 2 (found {pygame.version.ver}) - pi/install.sh installs "
                  "it (on Bullseye: python3 -m pip install --user pygame)")
@@ -1343,7 +1867,9 @@ def main():
         cfg.port = args.port
     state = StateFile(STATE_PATH)
     spotify_ready = args.demo or bool(cfg.sp_client_id and cfg.sp_refresh_token)
-    model = Model(cfg, state, spotify_ready)
+    if args.demo and not cfg.bambu_name:
+        cfg.bambu_name = "demo P1S"
+    model = Model(cfg, state, spotify_ready, bambu_ready=args.demo or cfg.bambu_ready)
     model.ip = local_ip()
 
     BeaconHandler.model = model
@@ -1367,6 +1893,8 @@ def main():
             forever(spotify_worker, model,
                     OAuthLogin("spotify", cfg.sp_refresh_token, state,
                                spotify_exchange(cfg.sp_client_id), 3600))
+        if cfg.bambu_ready:
+            forever(bambu_worker, model)
 
     try:
         screen = open_screen(args, cfg)
@@ -1426,7 +1954,7 @@ def main():
             elif frame != last_frame:  # only the spinner moved
                 last_frame = frame
                 present(renderer.draw_spinner(canvas, snap))
-            clock.tick(30 if snap.thinking and snap.mode == "usage" else 10)
+            clock.tick(30 if frame >= 0 else 10)  # 30 Hz only while a spinner turns
     finally:
         pygame.quit()
 

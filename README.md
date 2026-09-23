@@ -362,8 +362,26 @@ the screen from its own Power port.
 **Using it:**
 
 - Tap the screen (or click, or press Space) to switch screens. Ctrl+Q quits.
-- The Pi has no status LED, so while Claude works the Spotify screen's status
-  line shows a small spinner and "Claude is working...".
+- The Pi has no status LED, so while Claude works the Spotify and printer
+  screens' status line shows a small spinner and "Claude is working...".
+- **3D printer screen (Bambu Lab).** A third screen follows a print on a
+  Bambu Lab printer on your network: print name, a progress bar with the
+  percentage, layer count, time left and when it'll finish, and
+  nozzle/bed temperatures. Paused prints turn the bar yellow, failed ones red.
+  Set it up on the Pi with:
+
+  ```sh
+  python3 pi/claude_display.py --setup-bambu
+  ```
+
+  It finds the printer on the network (Bambu printers announce themselves),
+  asks for its **access code** (on the printer's screen under Settings →
+  WLAN, or Network on an X1), checks it can log in, and saves it to
+  config.ini. Restart the display, then tap through to the new screen, or use
+  `POST /mode/bambu`. The display reads the printer's local status feed
+  (MQTT over TLS on port 8883) directly: no Bambu cloud login, and only
+  while the printer screen is showing. If the printer refuses a correct code,
+  newer firmware may need **LAN Only Mode** with **Developer Mode** turned on.
 - Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
   `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
   `rotate` for a monitor mounted on its side. Apply changes with
@@ -391,8 +409,8 @@ Windows notification area, next to the clock:
   5-hour % itself if you prefer. Hover for both numbers; right-click for reset
   times.
 - Clawd **walks** while Claude is working, on any of your machines.
-- **Left-click** flips the display between the usage and Spotify screens. The
-  menu has both.
+- **Left-click** cycles the display through its screens (usage, Spotify,
+  3D printer); the menu lists them all.
 - **Track Claude with hooks (exact)** installs or removes the
   [Claude Code hooks](#option-a--claude-code-hooks-recommended). While they're
   installed, the tray runs their watcher: it catches Esc interrupts and keeps
