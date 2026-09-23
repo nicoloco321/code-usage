@@ -338,7 +338,7 @@ static void drawBars() {
 
 static void drawStaticUI() {
     tft.fillScreen(COL_BG);
-    drawMascot(tft, BAR_X, 12, 4, COL_ORANGE, TFT_BLACK);  // 13x10 grid -> 52x40
+    drawMascot(tft, BAR_X, 16, 4, COL_ORANGE, TFT_BLACK);  // 12x8 grid -> 48x32
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(COL_ORANGE, COL_BG);
     tft.drawString("Claude Code", 68, 18, 2);

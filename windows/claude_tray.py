@@ -9,18 +9,20 @@ helper - that sits next to the clock and:
   - walks Clawd while Claude is working, on any of your machines
   - switches the display between its usage and Spotify screens (left-click
     the icon, or pick one from the menu)
-  - beacons this PC's Claude Code activity to the display, like
-    server/beacon.py - off by default once you've set up the Claude Code
-    hooks, which do the same job more precisely
+  - tells the display exactly when Claude Code is working on this PC: one
+    click installs the Claude Code hooks (server/display_hook.py), and the
+    tray adds what hooks can't see - Esc interrupts and very long tool runs.
+    Without hooks it falls back to guessing from transcript writes, like
+    server/beacon.py
   - can start itself with Windows
 
 Everything comes from the display itself (GET /usage), so there's no Anthropic
 login on this PC and no extra load on the rate-limited usage API. Works with
 the ESP32 display (re-flash it for the usage readout) and the Raspberry Pi app.
 
-    py -m pip install -r windows\\requirements.txt
-    pythonw windows\\claude_tray.py                       # no console window
-    pythonw windows\\claude_tray.py --host 192.168.1.42   # first run: where the display is
+    py -3 -m pip install -r windows\\requirements.txt
+    pyw -3 windows\\claude_tray.py                        # no console window
+    pyw -3 windows\\claude_tray.py --host 192.168.1.42    # first run: where the display is
 
 Settings live in %APPDATA%\\claude-display\\tray.json (errors go to tray.log
 next to it). Right-click the icon for everything else.
@@ -46,9 +48,18 @@ try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:  # pythonw has no console, so say it in a dialog
     ctypes.windll.user32.MessageBoxW(
-        None, "The tray helper needs two packages. Install them with:\n\n"
-              "py -m pip install pystray pillow", "Claude display", 0x10)
+        None, f"The tray helper needs two packages in this Python "
+              f"({sys.version.split()[0]}). Install them with:\n\n"
+              f"py -{sys.version_info.major}.{sys.version_info.minor} -m pip install pystray pillow",
+        "Claude display", 0x10)
     sys.exit(1)
+
+# The Claude Code hooks' logic lives next to the other helpers in server/.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "server"))
+try:
+    import display_hook
+except ImportError:
+    display_hook = None
 
 APP_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "claude-display")
 SETTINGS_PATH = os.path.join(APP_DIR, "tray.json")
@@ -58,7 +69,7 @@ RUN_VALUE = "ClaudeDisplayTray"
 DEFAULTS = {
     "host": "claude-display.local",
     "port": 8080,
-    "beacon": None,     # None = automatic: on unless Claude Code hooks already beacon
+    "beacon": True,     # without hooks: guess activity from transcript writes
     "icon": "mascot",   # or "percent"
 }
 
@@ -81,21 +92,19 @@ GRAY = (140, 140, 140, 255)
 TRACK = (80, 80, 80, 255)
 DARK = (18, 18, 18, 255)
 
-# Clawd, same grid as firmware/src/mascot.h (1 = body, 2 = eye). While Claude
-# works he walks: alternate pairs of legs lift on each frame.
+# Clawd on his native 12x8 grid, same as firmware/src/mascot.h (1 = body,
+# 2 = eye). While Claude works he walks: alternate legs lift on each frame.
 MASCOT = [
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [1, 1, 1, 1, 2, 2, 1, 2, 2, 1, 1, 1, 1],
-    [1, 1, 1, 1, 2, 2, 1, 2, 2, 1, 1, 1, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0],
-    [0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0],
+    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+    [0, 0, 1, 2, 1, 1, 1, 1, 2, 1, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+    [0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0],
+    [0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0],
 ]
-LIFTED_LEGS = {0: (), 1: (3, 7), 2: (5, 9)}  # walk frame -> leg columns off the ground
+LIFTED_LEGS = {0: (), 1: (2, 7), 2: (4, 9)}  # walk frame -> leg columns off the ground
 
 log = logging.getLogger("claude-tray")
 
@@ -139,22 +148,24 @@ def recently_active():
     return False
 
 
-_hooks_cache = (0.0, False)
+_hooks = {"checked": 0.0, "ours": None, "curl": False}
 
 
-def hooks_configured():
-    """True if ~/.claude/settings.json already beacons the display via hooks
-    (see server/claude-hooks.example.json) - then our own beacon is redundant."""
-    global _hooks_cache
-    checked, found = _hooks_cache
-    if time.monotonic() - checked > 30:
+def hooks_status(refresh=False):
+    """What ~/.claude/settings.json does for the display: "ours" is the
+    host:port our hooks (server/display_hook.py) report to, or None; "curl"
+    means the older curl hooks from claude-hooks.example.json."""
+    if refresh or time.monotonic() - _hooks["checked"] > 5:
         try:
             with open(os.path.join(CLAUDE_DIR, "settings.json"), encoding="utf-8") as f:
-                found = "/thinking/on" in f.read()
+                text = f.read()
         except OSError:
-            found = False
-        _hooks_cache = (time.monotonic(), found)
-    return found
+            text = ""
+        ours = None
+        if display_hook and display_hook.MARKER in text:
+            ours = display_hook.installed()
+        _hooks.update(checked=time.monotonic(), ours=ours, curl="/thinking/on" in text)
+    return _hooks
 
 
 def startup_command():
@@ -268,9 +279,9 @@ def draw_icon(style, pct, online, frame):
     lifted = LIFTED_LEGS[frame]
     for r, row in enumerate(MASCOT):
         for c, v in enumerate(row):
-            if not v or (r == 9 and c in lifted):
+            if not v or (r == 7 and c in lifted):
                 continue
-            x, y = 4 + c * 4, r * 4
+            x, y = 8 + c * 4, 8 + r * 4  # 48x32, centred above the meter
             d.rectangle([x, y, x + 3, y + 3], fill=body if v == 1 else DARK)
     if online and pct is not None:  # 5-hour meter under Clawd
         d.rounded_rectangle([0, 48, 63, 59], radius=4, fill=TRACK)
@@ -292,7 +303,8 @@ class TrayApp:
         self.legacy = False     # it answers, but its firmware predates GET /usage
         self.failures = OFFLINE_AFTER
         self.ip = None          # settings["host"] resolved once (mDNS is slow)
-        self.beaconing = False  # we've told the display this PC is busy
+        self.beaconing = False  # transcript beacon: we've told the display this PC is busy
+        self.local_working = False  # hooks say Claude is working on this PC
         self.next_beacon = 0.0
         self.tick = 0
         self.icon_key = self.menu_key = None
@@ -367,8 +379,7 @@ class TrayApp:
 
     # -- this PC's activity -> beacons
     def beacon_enabled(self):
-        choice = self.settings.get("beacon")
-        return (not hooks_configured()) if choice is None else bool(choice)
+        return self.settings.get("beacon") is not False
 
     def send_beacon(self, on):
         try:
@@ -382,7 +393,20 @@ class TrayApp:
     def beacon_tick(self, now):
         if now < self.next_beacon:
             return
-        if self.beacon_enabled() and recently_active():
+        hooks = hooks_status()
+        if hooks["ours"] is not None:
+            # The hooks report every event themselves; the watcher adds Esc
+            # interrupts and keep-alives for long tool runs.
+            host, port = display_hook.split_host(hooks["ours"] or self.settings["host"],
+                                                 None if hooks["ours"] else self.settings["port"])
+            working = display_hook.watch_once(host, port)
+            if working != self.local_working:
+                self.local_working = working
+                self.poll_soon.set()
+            self.next_beacon = now + IDLE_CHECK_SECS
+            return
+        self.local_working = False
+        if not hooks["curl"] and self.beacon_enabled() and recently_active():
             self.send_beacon(True)
             self.next_beacon = now + PING_EVERY_SECS
         else:
@@ -392,7 +416,7 @@ class TrayApp:
 
     # -- what we show
     def thinking(self):
-        return self.online and bool(self.data and self.data.get("thinking"))
+        return self.local_working or (self.online and bool(self.data and self.data.get("thinking")))
 
     def five_pct(self):
         if self.online and self.data and self.data.get("valid"):
@@ -440,6 +464,7 @@ class TrayApp:
             tooltip = self.tooltip()
             menu_key = (self.status_line(), self.usage_line("seven_day"), walking, self.online,
                         self.mode, self.beacon_enabled(), self.settings["icon"],
+                        hooks_status()["ours"], hooks_status()["curl"],
                         self.settings["host"], startup_enabled())
         self.tick += 1
         if icon_key != self.icon_key:
@@ -483,8 +508,12 @@ class TrayApp:
             Item("Spotify screen", self.on_mode("spotify"), radio=True,
                  checked=lambda _: self.mode == "spotify", enabled=lambda _: self.online),
             Menu.SEPARATOR,
-            Item("Send this PC's Claude activity", self.on_beacon,
-                 checked=lambda _: self.beacon_enabled()),
+            Item("Track Claude with hooks (exact)", self.on_hooks,
+                 checked=lambda _: hooks_status()["ours"] is not None,
+                 enabled=lambda _: display_hook is not None),
+            Item("Guess activity from transcripts", self.on_beacon,
+                 checked=lambda _: self.beacon_enabled(),
+                 visible=lambda _: hooks_status()["ours"] is None and not hooks_status()["curl"]),
             Item("Show 5-hour % in icon", self.on_icon_style,
                  checked=lambda _: self.settings["icon"] == "percent"),
             Item("Start with Windows", self.on_startup, checked=lambda _: startup_enabled()),
@@ -506,6 +535,21 @@ class TrayApp:
         self.settings["beacon"] = not self.beacon_enabled()
         save_settings(self.settings)
         self.next_beacon = 0.0  # apply now (sends "off" if we were beaconing)
+
+    def on_hooks(self):
+        def go():
+            try:
+                if hooks_status(refresh=True)["ours"] is not None:
+                    display_hook.uninstall()
+                    self.notify("Removed the Claude Code hooks.")
+                else:
+                    display_hook.install(self.settings["host"], self.settings["port"])
+                    self.notify("Claude Code hooks installed - the display now follows "
+                                "Claude exactly.")
+            except (OSError, ValueError) as e:
+                self.notify(f"Couldn't update ~/.claude/settings.json: {e}")
+            hooks_status(refresh=True)
+        threading.Thread(target=go, daemon=True).start()
 
     def on_icon_style(self):
         self.settings["icon"] = "mascot" if self.settings["icon"] == "percent" else "percent"
@@ -546,6 +590,8 @@ class TrayApp:
             if host:
                 self.settings.update(host=host, port=port)
                 save_settings(self.settings)
+                if hooks_status(refresh=True)["ours"] is not None:
+                    display_hook.install(host, port)  # point the hooks at it too
                 self.ip = None
                 self.failures = OFFLINE_AFTER - 1  # one miss now means offline
                 self.poll_soon.set()

@@ -161,35 +161,49 @@ beacon needs zero config but lags a little.
 
 #### Option A — Claude Code hooks (recommended)
 
-Claude Code fires lifecycle [hooks](https://docs.claude.com/en/docs/claude-code/hooks)
-you can hang a command on. We use three: `UserPromptSubmit` → **on**, `Stop` →
-**off**, and `PreToolUse` → **on** (a keep-alive for long turns). Merge
-[`server/claude-hooks.example.json`](server/claude-hooks.example.json) into your
-`~/.claude/settings.json` (user-level, so it applies to every project), replacing
-`claude-display.local` with the device's IP if mDNS doesn't resolve. Each hook is
-just:
+Claude Code fires lifecycle [hooks](https://docs.claude.com/en/docs/claude-code/hooks),
+and [`server/display_hook.py`](server/display_hook.py) turns them into beacons.
+One command installs it into `~/.claude/settings.json` (user-level, so every
+project gets it), and Claude Code picks it up immediately:
 
 ```sh
-curl -sf -m 1 -X POST http://claude-display.local:8080/thinking/on  >/dev/null 2>&1 || true
-curl -sf -m 1 -X POST http://claude-display.local:8080/thinking/off >/dev/null 2>&1 || true
+python3 server/display_hook.py --install --host 192.168.1.42    # macOS / Linux
+py -3 server\display_hook.py --install --host 192.168.1.42      # Windows
 ```
 
-The LED turns on the moment you hit enter and off the moment Claude stops — no
-trailing delay. (`-m 1` keeps a hook from ever blocking Claude Code; the device's
-5-min `BEACON_TTL_MS` is just a backstop if a `Stop` hook is ever missed.)
+It tracks each Claude Code session on the machine as **working**, **waiting**
+or **idle**:
+- **Working:** you submit a prompt, or a tool runs.
+- **Waiting:** a permission prompt or question is up. The display goes idle,
+  since Claude is waiting on you.
+- **Idle:** Claude finishes, errors out, or the session ends.
 
-> **Use the device's IP, not `claude-display.local`, in hooks.** With the 1s
-> `curl` timeout, `.local` mDNS names often don't resolve in time (macOS `ping`
-> resolves them, but `curl` frequently can't), so the hook silently no-ops. Get
-> the IP from the device's status line, or run
-> [`python3 server/find_display.py`](server/find_display.py) — it resolves the
-> device and prints the IP plus the exact hook commands ready to paste.
->
-> Then **pin that IP** so it doesn't change out from under the hooks: add a
-> **DHCP reservation** for the device in your router (map the display's MAC
-> address to a fixed IP). Otherwise a new lease can reassign the address and the
-> hooks quietly stop working. Hooks also load at **session start**, so restart
-> Claude Code after editing `settings.json`.
+The display shows "working" while *any* session is. The hooks run async, so
+they never slow Claude down. Because async hooks can land out of order, a
+beacon arriving within a moment of a stop counts as a straggler, not new work.
+`--status` shows what it sees; `--uninstall` removes it. It also replaces the
+older curl hooks in
+[`claude-hooks.example.json`](server/claude-hooks.example.json).
+
+Hooks can't see two things:
+- **Esc interrupts:** Claude Code fires no hook for them.
+- **Tools running longer than the display's 5-minute backstop.**
+
+A watcher covers both. The [Windows tray helper](#windows-tray-helper) runs it
+automatically; elsewhere, run `display_hook.py --watch` alongside Claude Code.
+Without it, an interrupted turn stays "working" until the 5-minute backstop
+(`BEACON_TTL_MS`) clears it.
+
+> **Name or IP?** `--host claude-display.local` is the most robust choice when
+> it resolves quickly on your machine: it keeps working if the display's IP
+> changes, for example when you move it from Ethernet to Wi-Fi. Windows 10/11
+> resolves it natively. Check with
+> [`python3 server/find_display.py`](server/find_display.py), which also
+> prints the IP and the install command ready to paste. If the name doesn't
+> resolve, use the IP, and **pin it** with a **DHCP reservation** in your router
+> (map the display's MAC address to a fixed IP), so a new lease can't move it
+> out from under the hooks. (The old curl hooks need the IP either way: with a
+> 1s timeout, curl often can't resolve `.local` names in time.)
 
 #### Option B — the beacon watcher (no config)
 
@@ -348,6 +362,8 @@ the screen from its own Power port.
 **Using it:**
 
 - Tap the screen (or click, or press Space) to switch screens. Ctrl+Q quits.
+- The Pi has no status LED, so while Claude works the Spotify screen's status
+  line shows a small spinner and "Claude is working...".
 - Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
   `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
   `rotate` for a monitor mounted on its side. Apply changes with
@@ -377,9 +393,11 @@ Windows notification area, next to the clock:
 - Clawd **walks** while Claude is working, on any of your machines.
 - **Left-click** flips the display between the usage and Spotify screens. The
   menu has both.
-- **Send this PC's Claude activity** is the `beacon.py` watcher, built in.
-  It's on automatically unless `~/.claude/settings.json` already has the
-  display hooks, which do the same job more precisely.
+- **Track Claude with hooks (exact)** installs or removes the
+  [Claude Code hooks](#option-a--claude-code-hooks-recommended). While they're
+  installed, the tray runs their watcher: it catches Esc interrupts and keeps
+  the display awake through long tool runs. Without hooks, **Guess activity
+  from transcripts** falls back to the `beacon.py` approach.
 - **Start with Windows.**
 
 It reads everything from the display's `GET /usage`, so the PC needs no
@@ -389,15 +407,24 @@ firmware still gets screen switching and beacons, and the menu tells you to
 re-flash for the numbers.
 
 ```powershell
-py -m pip install -r windows\requirements.txt
-pythonw windows\claude_tray.py --host 192.168.1.42
+py -3 -m pip install -r windows\requirements.txt
+pyw -3 windows\claude_tray.py --host 192.168.1.42
 ```
 
 `--host` is the display's IP or name, shown on its status line or by
 `find_display.py`. You only need it the first time: it's saved to
 `%APPDATA%\claude-display\tray.json`, and **Display address…** in the menu
-changes it later. Windows often resolves `claude-display.local` on its own,
-but the IP always works. Then tick **Start with Windows**.
+changes it later (and re-points the hooks). Windows often resolves
+`claude-display.local` on its own, but the IP always works. Then tick
+**Track Claude with hooks** and **Start with Windows**.
+
+> Use `py -3` / `pyw -3` rather than `python` / `pythonw` if you have more than
+> one Python: the bare names can start a different install than the one you
+> gave the packages to. With the **Microsoft Store** Python, Windows keeps
+> `tray.json` (and the hooks' state file) in the app's private folder,
+> `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.3.x_…\LocalCache\Roaming\claude-display`,
+> rather than `%APPDATA%`. The hooks pin the same Python as the tray, so they
+> share it.
 
 ## Customizing
 

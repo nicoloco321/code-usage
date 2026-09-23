@@ -77,10 +77,9 @@ def main():
     print(f"  curl -m 2 -X POST http://{ip}:{args.port}/thinking/on    # -> working")
     print(f"  curl -m 2 -X POST http://{ip}:{args.port}/thinking/off   # -> idle")
 
-    print("\n--- hook commands for ~/.claude/settings.json (use the IP) ---")
-    base = f"curl -sf -m 1 -X POST http://{ip}:{args.port}"
-    print(f"  UserPromptSubmit, PreToolUse:  {base}/thinking/on  >/dev/null 2>&1 || true")
-    print(f"  Stop:                          {base}/thinking/off >/dev/null 2>&1 || true")
+    print("\n--- install the Claude Code hooks (uses the IP) ---")
+    print(f"  python3 server/display_hook.py --install --host {ip}:{args.port}   # macOS / Linux")
+    print(f"  py -3 server\\display_hook.py --install --host {ip}:{args.port}     # Windows")
 
     print("\nTip: add a DHCP reservation in your router so this IP stays put.")
 

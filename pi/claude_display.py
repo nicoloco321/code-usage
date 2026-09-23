@@ -90,18 +90,17 @@ COL_EYE = (0, 0, 0)
 
 SPIN_FRAME_MS = 90  # spinner step, same pace as the firmware
 
-# Pixel-art Clawd, same grid as firmware/src/mascot.h (1 = body, 2 = eye).
+# Pixel-art Clawd on his native 12x8 grid, same as firmware/src/mascot.h
+# (1 = body, 2 = eye).
 MASCOT = [
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [1, 1, 1, 1, 2, 2, 1, 2, 2, 1, 1, 1, 1],
-    [1, 1, 1, 1, 2, 2, 1, 2, 2, 1, 1, 1, 1],
-    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
-    [0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0],
-    [0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0],
+    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+    [0, 0, 1, 2, 1, 1, 1, 1, 2, 1, 0, 0],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+    [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+    [0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0],
+    [0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0],
 ]
 
 # Regular / bold font pairs to try, first match wins. DejaVu ships with
@@ -994,7 +993,7 @@ class Renderer:
         if snap.mode == "usage":
             return key + (snap.usage_version, snap.usage_status, snap.thinking)
         playing = snap.np is not None and snap.np.get("has_track")
-        return key + (snap.np_version, snap.sp_status, snap.art and snap.art[0],
+        return key + (snap.np_version, snap.sp_status, snap.art and snap.art[0], snap.thinking,
                       self.progress_ms(snap) // 1000 if playing else -1)
 
     def draw(self, surf, snap, now):
@@ -1002,9 +1001,20 @@ class Renderer:
         getattr(self, f"_{snap.mode}_{self.layout}")(surf, snap, now)
         self._status(surf, snap)
 
+    # where the status line starts: (x, baseline, text size)
+    STATUS = {"landscape": (32, 454, 16), "portrait": (12, 315, 10),
+              "bar": (28, 300, 19), "strip": (24, 1414, 18)}
+
     def _status(self, surf, snap):
         addr = f"{snap.host}.local  {snap.ip}".rstrip()
         status = snap.flash or (snap.sp_status if snap.mode == "spotify" else snap.usage_status)
+        if self.spotify_note(snap):
+            # The Spotify screen has no big spinner, so Claude working shows up
+            # here instead - the Pi's stand-in for the ESP32's breathing LED.
+            x, base, size = self.STATUS[self.layout]
+            self.draw_spinner(surf, snap)
+            self.text(surf, "Claude is working...", x + size * 2.05, base, size, COL_ORANGE)
+            status = ("", COL_DIM)
         if self.layout == "portrait":
             if status is None:
                 text, color = addr, COL_DIM  # what the firmware shows at boot
@@ -1025,20 +1035,32 @@ class Renderer:
             self.text(surf, text, 32, 454, 16, color)
             self.text(surf, addr, 768, 454, 16, COL_DIM, align="r")
 
-    # (cx, cy, size) of the spinner in each layout's design units
+    # (cx, cy, size) of the usage screen's spinner in each layout's design units
     SPINNER = {"landscape": (162, 246, 150), "portrait": (90, 108, 60),
                "bar": (70, 206, 104), "strip": (160, 410, 190)}
 
     @staticmethod
-    def spin_frame(snap):
-        """The spinner's animation step, or -1 while idle."""
-        return int(snap.mono * 1000 / SPIN_FRAME_MS) % 48 if snap.thinking else -1
+    def spotify_note(snap):
+        """Does the Spotify screen's status line show "Claude is working"?"""
+        return snap.mode == "spotify" and snap.thinking and not snap.flash
+
+    def spin_frame(self, snap):
+        """The spinner's animation step, or -1 when nothing is spinning."""
+        if not snap.thinking or (snap.mode == "spotify" and not self.spotify_note(snap)):
+            return -1
+        return int(snap.mono * 1000 / SPIN_FRAME_MS) % 48
+
+    def spinner_geometry(self, mode):
+        if mode == "usage":
+            return self.SPINNER[self.layout]
+        x, base, size = self.STATUS[self.layout]  # the small one in the status line
+        return x + size * 0.8, base - size * 0.36, size * 1.6
 
     def draw_spinner(self, surf, snap):
         """Draw just the spinner and return the rect it covers. Animation frames
         repaint and push only this square instead of the whole screen - on a
         Pi 2 under X, full-screen frames cost more CPU than everything else."""
-        cx, cy, size = self.SPINNER[self.layout]
+        cx, cy, size = self.spinner_geometry(snap.mode)
         px = self.n(size)
         rect = pygame.Rect(self.x(cx) - px // 2, self.y(cy) - px // 2, px, px)
         surf.fill(COL_BG, rect)
@@ -1051,7 +1073,7 @@ class Renderer:
         if spotify:
             self.spotify_logo(surf, 58, 52, 26)
         else:
-            self.mascot(surf, 32, 27, 5)
+            self.mascot(surf, 32, 28, 6)
         self.text(surf, "Spotify" if spotify else "Claude Code", 119, 56, 30,
                   COL_SPOTIFY if spotify else COL_ORANGE, bold=True)
         self.text(surf, "now playing" if spotify else "usage monitor", 119, 82, 17, COL_DIM)
@@ -1080,7 +1102,7 @@ class Renderer:
                      None if pct is None else pct / 100, bar_color(pct), 12)
 
     def _usage_portrait(self, surf, snap, now):
-        self.mascot(surf, 12, 12, 4)
+        self.mascot(surf, 12, 17, 4)
         self.text(surf, "Claude Code", 72, 30, 16, COL_ORANGE, bold=True)
         self.text(surf, "usage monitor", 72, 47, 11, COL_DIM)
         active = snap.thinking
@@ -1158,7 +1180,7 @@ class Renderer:
         self.text(surf, clock_str(now), 1452, 300, 22, COL_TEXT, bold=True, align="r")
 
     def _usage_bar(self, surf, snap, now):
-        self.mascot(surf, 28, 40, 6)
+        self.mascot(surf, 28, 42, 7)
         self.text(surf, "Claude Code", 124, 74, 30, COL_ORANGE, bold=True)
         self.text(surf, "usage monitor", 124, 99, 17, COL_DIM)
         active = snap.thinking
@@ -1211,7 +1233,7 @@ class Renderer:
         self.text(surf, f"{now.strftime('%a %b')} {now.day}", 160, 1302, 22, COL_DIM, align="c")
 
     def _usage_strip(self, surf, snap, now):
-        self.mascot(surf, 82, 56, 12)
+        self.mascot(surf, 82, 70, 13)
         self.text(surf, "Claude Code", 160, 232, 34, COL_ORANGE, bold=True, align="c")
         self.text(surf, "usage monitor", 160, 264, 20, COL_DIM, align="c")
         active = snap.thinking
@@ -1396,7 +1418,7 @@ def main():
             snap = model.snapshot()
             now = datetime.datetime.now().astimezone()
             key = renderer.scene_key(snap, now)
-            frame = renderer.spin_frame(snap) if snap.mode == "usage" else -1
+            frame = renderer.spin_frame(snap)
             if key != last_key:
                 last_key, last_frame = key, frame
                 renderer.draw(canvas, snap, now)
