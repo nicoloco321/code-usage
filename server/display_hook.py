@@ -19,11 +19,14 @@ claude-hooks.example.json. Claude Code picks the change up right away.
 Each session is working, waiting (a permission prompt or question is up) or
 idle:
   UserPromptSubmit                             -> working
-  PreToolUse, PostToolUse, SubagentStop, ...   -> working
+  PreToolUse, PostToolUse(Failure)             -> working
   Notification: permission prompt / question   -> waiting
   Stop, StopFailure, SessionEnd, idle prompt   -> idle
-Async hooks can land out of order, so activity that arrives within a moment
-of a stop is treated as a straggler from before it, not as new work.
+SubagentStop and compaction only keep a working session alive: the desktop
+app's own helper agent finishes a couple of seconds after every Stop, and must
+not switch the display back on. Async hooks can also land out of order, so a
+tool event that arrives within a moment of a stop is treated as a straggler
+from before it, not as new work.
 
 Hooks can't see two things: an Esc interrupt (Stop doesn't fire) and a tool
 running longer than the display's 5-minute backstop. watch() covers both; the
@@ -59,8 +62,13 @@ FORGET_SECS = 86400       # drop idle sessions after a day
 
 WORKING, WAITING, IDLE = "working", "waiting", "idle"
 STOP_EVENTS = {"Stop", "StopFailure", "SessionEnd"}
-ACTIVITY_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStop",
-                   "PreCompact", "PostCompact"}
+# Tool calls are the only events that prove Claude itself is working again -
+# e.g. after being re-invoked by a finished background task, with no prompt.
+TOOL_EVENTS = {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
+# These keep a working session alive but never wake an idle one: they can
+# land after Stop (a subagent or helper finishing, a /compact you ran).
+ALIVE_EVENTS = {"SubagentStop", "PreCompact", "PostCompact"}
+HISTORY = 60              # recent events kept for --status
 WAIT_NOTES = {"permission_prompt", "elicitation_dialog", "elicitation_url_dialog",
               "agent_needs_input"}
 RESUME_NOTES = {"elicitation_response", "elicitation_complete"}  # you answered
@@ -146,7 +154,10 @@ def apply_event(st, ev, now):
             set_state(s, WAITING, now)
     elif name == "UserPromptSubmit":
         set_state(s, WORKING, now)
-    elif name in ACTIVITY_EVENTS or note in RESUME_NOTES:
+    elif note in RESUME_NOTES:
+        if s["state"] == WAITING:
+            set_state(s, WORKING, now)
+    elif name in TOOL_EVENTS:
         if s["state"] != WORKING and now - s["changed"] < GRACE_SECS:
             return  # a straggler from just before the stop/wait - ignore it
         tool = ev.get("tool_use_id")
@@ -160,6 +171,15 @@ def apply_event(st, ev, now):
             done.append(tool)
             del done[:-50]
         set_state(s, WORKING, now)
+    # ALIVE_EVENTS and anything else: "seen" is refreshed above, which keeps a
+    # working session from timing out, but they never wake an idle one.
+
+
+def record(st, now, text):
+    """Keep a short history of what happened, for --status."""
+    history = st.setdefault("history", [])
+    history.append([now, text])
+    del history[:-HISTORY]
 
 
 def session_working(s, now):
@@ -194,15 +214,19 @@ def split_host(host, port=None):
 
 
 def send(st, host, port, on, now):
-    """POST /thinking/on or /off; records the result in the state."""
-    url = f"http://{host}:{port}/thinking/{'on' if on else 'off'}"
+    """POST /thinking/on or /off; records the result in the state and
+    returns a word for the history."""
+    word = "on" if on else "off"
+    url = f"http://{host}:{port}/thinking/{word}"
     try:
         _opener.open(urllib.request.Request(url, data=b"", method="POST"),
                      timeout=SEND_TIMEOUT).read()
-        st["sent"], st["sent_at"], st["fail_at"] = ("on" if on else "off"), now, 0
+        st["sent"], st["sent_at"], st["fail_at"] = word, now, 0
         st.pop("error", None)
+        return word
     except OSError as e:
         st["fail_at"], st["error"] = now, str(e)[:200]
+        return f"{word} FAILED ({str(e)[:60]})"
 
 
 def handle(ev, host, port):
@@ -216,10 +240,14 @@ def handle(ev, host, port):
         stopping = ev.get("hook_event_name") in STOP_EVENTS
         # "on" goes out on every event (it doubles as a keep-alive); "off" only
         # when it changes, or on a stop in case the last one got lost.
+        sent = ""
         if on or st.get("sent") != "off" or stopping:
             offline = now - st.get("fail_at", 0) < OFFLINE_SECS
-            if not offline or stopping:
-                send(st, host, port, on, now)
+            sent = send(st, host, port, on, now) if not offline or stopping else "skipped (offline)"
+        session = st["sessions"].get(ev.get("session_id") or "?")
+        record(st, now, f"{st['last']['event']} {st['last']['session']} -> "
+                        f"{session['state'] if session else 'ended'}"
+                        + (f", sent {sent}" if sent else ""))
         save(st)
 
 
@@ -263,16 +291,17 @@ def watch_once(host, port):
     now = time.time()
     with locked():
         st = load()
-        for s in st["sessions"].values():
+        for sid, s in st["sessions"].items():
             if s["state"] != IDLE and s.get("transcript") and interrupted(s["transcript"]):
                 set_state(s, IDLE, now)
                 s["tools"] = {}
-                st["last"] = {"event": "interrupted (Esc)", "session": "", "at": now}
+                st["last"] = {"event": "interrupted (Esc)", "session": sid[:8], "at": now}
+                record(st, now, f"watcher: Esc interrupt in {sid[:8]} -> idle")
         on = any_working(st, now)
         if on and (st.get("sent") != "on" or now - st.get("sent_at", 0) > KEEPALIVE_SECS):
-            send(st, host, port, True, now)
+            record(st, now, f"watcher: keep-alive, sent {send(st, host, port, True, now)}")
         elif not on and st.get("sent") != "off":
-            send(st, host, port, False, now)
+            record(st, now, f"watcher: nothing working, sent {send(st, host, port, False, now)}")
         save(st)
     return on
 
@@ -386,6 +415,10 @@ def print_status():
         tools = f", {len(s['tools'])} tool(s) running" if s["tools"] else ""
         print(f"  {sid[:8]}  {s['state']:<8} for {now - s['changed']:.0f}s, "
               f"last event {now - s['seen']:.0f}s ago{tools}")
+    if st.get("history"):
+        print("recent:")
+        for at, text in st["history"][-20:]:
+            print(f"  {time.strftime('%H:%M:%S', time.localtime(at))}  {text}")
 
 
 def main():
