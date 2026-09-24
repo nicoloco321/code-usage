@@ -454,6 +454,32 @@ the screen from its own Power port.
 
   It only polls while the planes screen is showing: every 10 s for positions,
   with the rest looked up once per plane and cached.
+- **Formula 1.** A fifth screen follows the F1 weekend, with no setup:
+  - **Left:** this week's (or the next) track, drawn the way F1 draws it.
+    While a session is on, the cars move round it in team colours, with the
+    top three labelled.
+  - **Middle, live:** the session and flag (green, yellow, SC, VSC, red,
+    chequered), the time left or the lap count, the latest race control
+    message, the fastest lap and the weather.
+  - **Middle, between sessions:** the circuit's name in big letters, the
+    next session with a countdown, the track's length, corners and pit-stop
+    time cost, last year's winner and the championship leader.
+  - **Right:** the running order while live. After a session, that day's
+    results. On other days, the weekend's schedule in your time zone.
+
+  Live data comes from F1's own timing feed, as the official app uses. It's
+  free without a login except for the cars' GPS positions, so the map
+  places each car from the ~25 timing loops per lap it passes and moves it
+  on at its lap pace. Checked against the real GPS, the dots land about
+  30 m (half a second) from the car. Where the loops sit on each track is
+  learned once from F1's archive of an earlier session there.
+  - **Schedule and results:** [OpenF1](https://openf1.org), free outside
+    live sessions.
+  - **Track maps:** [MultiViewer](https://multiviewer.app).
+  - **Standings and past winners:** [Jolpica](https://jolpi.ca).
+
+  The screen only fetches while it's showing. Turn it off with
+  `enabled = no` under `[f1]` in config.ini.
 - Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
   `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
   `rotate` for a monitor mounted on its side. Apply changes with
@@ -482,7 +508,7 @@ Windows notification area, next to the clock:
   times.
 - Clawd **walks** while Claude is working, on any of your machines.
 - **Left-click** cycles the display through its screens (usage, Spotify,
-  3D printer, planes overhead); the menu lists them all.
+  3D printer, planes overhead, F1); the menu lists them all.
 - **Track Claude with hooks (exact)** installs or removes the
   [Claude Code hooks](#option-a--claude-code-hooks-recommended). While they're
   installed, the tray runs their watcher: it catches Esc interrupts and keeps

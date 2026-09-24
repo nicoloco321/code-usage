@@ -10,8 +10,9 @@ official touchscreen:
   - a spinner while Claude is working, driven by the same HTTP beacons
     (POST /thinking/on, /thinking/off) from Claude Code hooks or beacon.py
   - optional screens for Spotify's now playing, a Bambu Lab print's
-    progress, and the planes flying overhead (POST /mode/spotify,
-    /mode/bambu, /mode/planes, /mode/usage, /mode/toggle - or tap the screen)
+    progress, the planes flying overhead, and Formula 1 (POST /mode/spotify,
+    /mode/bambu, /mode/planes, /mode/f1, /mode/usage, /mode/toggle - or tap
+    the screen)
 
 It speaks the firmware's HTTP API on the same port, so the hooks, beacon.py,
 find_display.py and the /switch command work unchanged - point them at the Pi.
@@ -32,6 +33,8 @@ Keys: tap / click / space switches screens, Ctrl+Q quits (Esc too, windowed).
 """
 
 import argparse
+import base64
+import bisect
 import configparser
 import csv
 import datetime
@@ -81,7 +84,7 @@ SPOTIFY_NOW_URL = ("https://api.spotify.com/v1/me/player/currently-playing"
 
 ROOT_TEXT = ("Claude Code usage display (Raspberry Pi). POST /thinking/on while "
              "working, /thinking/off when done. POST /mode/usage, /mode/spotify, "
-             "/mode/bambu, /mode/planes or /mode/toggle to switch screens; GET /mode to ask; "
+             "/mode/bambu, /mode/planes, /mode/f1 or /mode/toggle to switch screens; GET /mode to ask; "
              "GET /usage for JSON.\n")
 
 # ---- palette: the firmware's RGB565 colours, in full RGB ----
@@ -99,7 +102,7 @@ COL_BAMBU = (35, 165, 67)     # Bambu Lab green
 COL_EYE = (0, 0, 0)
 
 # The screens, in the order a tap or /mode/toggle cycles through them.
-MODES = ("usage", "spotify", "bambu", "planes")
+MODES = ("usage", "spotify", "bambu", "planes", "f1")
 
 # The Spotify mark's three strokes, measured off the logo, in units of the
 # circle's radius from its centre: (start, bend, end, width at start, at end).
@@ -195,6 +198,7 @@ class Config:
         self.planes_radius = max(2.0, min(60.0, num("planes", "radius_nm", 15)))
         self.planes_poll = max(5.0, num("planes", "poll_seconds", 10))
         self.planes_liveries = os.path.expanduser(s("planes", "liveries") or LIVERY_DIR)
+        self.f1_enabled = s("f1", "enabled").lower() not in ("no", "false", "off", "0")
 
     @property
     def planes_ready(self):
@@ -419,10 +423,11 @@ def local_ip():
 class Model:
     """Everything on screen, shared by the workers, the HTTP server and the renderer."""
 
-    def __init__(self, cfg, state, spotify_ready, bambu_ready=False, planes_ready=False):
+    def __init__(self, cfg, state, spotify_ready, bambu_ready=False, planes_ready=False,
+                 f1_ready=False):
         self.cfg, self.state = cfg, state
         self.ready = {"usage": True, "spotify": spotify_ready, "bambu": bambu_ready,
-                      "planes": planes_ready}
+                      "planes": planes_ready, "f1": f1_ready}
         self.lock = threading.Lock()
         saved = state.get("mode")
         self.mode = saved if self.ready.get(saved) else "usage"
@@ -444,6 +449,8 @@ class Model:
         self.printer_status = None
         self.sky = None            # planes overhead: see planes_worker
         self.planes_status = None
+        self.f1 = None             # the F1 screen: see f1_worker
+        self.f1_status = None
         self.remote_sessions = {}  # sender -> (monotonic time, [session summaries])
 
         self.last_beacon = 0.0     # monotonic time of the last "thinking" ping, 0 = off
@@ -454,6 +461,7 @@ class Model:
         self.spotify_wake = threading.Event()
         self.bambu_wake = threading.Event()
         self.planes_wake = threading.Event()
+        self.f1_wake = threading.Event()
 
     # -- beacons: "thinking" is sticky between on and off; the TTL is a backstop
     def thinking(self, now=None):
@@ -481,6 +489,8 @@ class Model:
                 self.printer_status = ("connecting to the printer...", COL_DIM)
             if mode == "planes" and self.sky is None:
                 self.planes_status = ("looking for planes...", COL_DIM)
+            if mode == "f1" and self.f1 is None:
+                self.f1_status = ("loading the F1 season...", COL_DIM)
         self.state.put("mode", mode)
         if mode == "spotify":
             self.spotify_wake.set()
@@ -488,6 +498,8 @@ class Model:
             self.bambu_wake.set()
         elif mode == "planes":
             self.planes_wake.set()
+        elif mode == "f1":
+            self.f1_wake.set()
         else:  # back on the usage screen: refresh numbers gone stale off-screen
             now = time.monotonic()
             if now >= self.backoff_until and now - self.usage_ok_at > self.cfg.usage_poll:
@@ -555,6 +567,16 @@ class Model:
                                   f"{sky['radius']:.0f} nm  ·  data: {sky.get('source') or '?'}",
                                   COL_GREEN)
 
+    def set_f1(self, view):
+        with self.lock:
+            self.f1 = view
+            self.f1_status = (("F1 live timing" if view.get("phase") == "live"
+                               else "F1 schedule from OpenF1"), COL_GREEN)
+
+    def set_f1_status(self, text, color):
+        with self.lock:
+            self.f1_status = (text, color)
+
     def drop_plane_photo(self):
         with self.lock:
             if self.sky and self.sky.get("photo"):
@@ -600,6 +622,7 @@ class Model:
                 sessions=self.sessions_now(now),
                 printer_name=self.cfg.bambu_name or "3D printer",
                 sky=self.sky, planes_status=self.planes_status,
+                f1=self.f1, f1_status=self.f1_status,
                 thinking=self.thinking(now), flash=flash and flash[:2],
                 host=self.host, ip=self.ip, mono=now)
 
@@ -1844,6 +1867,771 @@ def qr_matrix(data):
     return grid
 
 
+# ---------------------------------------------------------------- formula 1
+#
+# The weekend's schedule and results come from OpenF1 (free outside a live
+# session - their live data is paid), the track from MultiViewer (the outline
+# in F1's own coordinates, with the time along a real lap for every point),
+# standings and past winners from Jolpica (the Ergast successor). During a
+# session the display listens to F1's own live timing feed, as the official
+# app does. It's free without a login - all but the cars' GPS positions, so
+# the map places each car from the mini-sector timing loops it has just
+# crossed, and moves it on at its lap pace in between.
+
+F1_OPENF1 = "https://api.openf1.org/v1/"
+F1_CIRCUIT_URL = "https://api.multiviewer.app/api/v1/circuits/{circuit}/{year}"
+F1_JOLPICA = "https://api.jolpi.ca/ergast/f1/"
+F1_LIVE_NEGOTIATE = "https://livetiming.formula1.com/signalrcore/negotiate?negotiateVersion=1"
+F1_LIVE_WS = "wss://livetiming.formula1.com/signalrcore?id={token}"
+F1_ARCHIVE = "https://livetiming.formula1.com/static/"
+F1_TOPICS = ["SessionInfo", "SessionStatus", "TrackStatus", "DriverList", "TimingData",
+             "RaceControlMessages", "LapCount", "ExtrapolatedClock", "WeatherData"]
+F1_LIVE_BEFORE, F1_LIVE_AFTER = 15 * 60, 30 * 60  # listen from 15 min before to 30 after
+F1_PIT_SEGMENT = 2064  # a mini-sector status meaning "in the pit lane"
+F1_FEED_LAG = 1.0      # s: loops reach the feed about a second after the car crossed them
+COL_F1 = (225, 6, 0)
+F1_FLAGS = {"1": ("GREEN FLAG", COL_GREEN), "2": ("YELLOW FLAG", COL_YELLOW),
+            "4": ("SAFETY CAR", COL_YELLOW), "5": ("RED FLAG", COL_RED),
+            "6": ("VIRTUAL SAFETY CAR", COL_YELLOW), "7": ("VSC ENDING", COL_YELLOW)}
+F1_SHORT = {"Practice 1": "FP1", "Practice 2": "FP2", "Practice 3": "FP3", "Qualifying": "QUALI",
+            "Sprint Qualifying": "SPRINT Q", "Sprint Shootout": "SHOOTOUT", "Sprint": "SPRINT",
+            "Race": "RACE"}
+
+
+def f1_json(url, name, max_age):
+    """GET JSON through the CACHE_DIR copy (fetched again after max_age; a
+    stale copy beats none - OpenF1 turns free requests away mid-session)."""
+    return json.loads(cached_download(url, name, max_age))
+
+
+def f1_events(year):
+    """The season's meetings, each with its sessions, in date order."""
+    meetings = f1_json(F1_OPENF1 + f"meetings?year={year}", f"f1_meetings_{year}.json", 6 * 3600)
+    sessions = f1_json(F1_OPENF1 + f"sessions?year={year}", f"f1_sessions_{year}.json", 6 * 3600)
+    by_meeting = {}
+    for s in sessions if isinstance(sessions, list) else []:
+        start, end = parse_iso(s.get("date_start") or ""), parse_iso(s.get("date_end") or "")
+        if isinstance(s, dict) and start and end and not s.get("is_cancelled"):
+            by_meeting.setdefault(s.get("meeting_key"), []).append(
+                {"key": s.get("session_key"), "name": s.get("session_name") or "",
+                 "type": s.get("session_type") or "", "start": start, "end": end})
+    events = []
+    for m in meetings if isinstance(meetings, list) else []:
+        sess = sorted(by_meeting.get(m.get("meeting_key"), []), key=lambda s: s["start"])
+        if isinstance(m, dict) and sess and not m.get("is_cancelled"):
+            events.append({"key": m.get("meeting_key"), "name": m.get("meeting_name") or "",
+                           "location": m.get("location") or "", "country": m.get("country_name") or "",
+                           "circuit_key": m.get("circuit_key"), "circuit": m.get("circuit_short_name") or "",
+                           "year": year, "sessions": sess, "start": sess[0]["start"], "end": sess[-1]["end"]})
+    return sorted(events, key=lambda e: e["start"])
+
+
+def f1_day_end(when, now):
+    """Midnight after `when`, local time: results stay up the rest of that day."""
+    local = when.astimezone(now.tzinfo)
+    return local.replace(hour=23, minute=59, second=59)
+
+
+def f1_weekend(events, now):
+    """The meeting to show: the one on now, else the next one."""
+    return next((e for e in events if now <= f1_day_end(e["end"], now)), None)
+
+
+def f1_live_session(event, now):
+    """The session whose live window (15 min before to 30 after) we're in."""
+    return next((s for s in event["sessions"]
+                 if s["start"] - datetime.timedelta(seconds=F1_LIVE_BEFORE) <= now
+                 <= s["end"] + datetime.timedelta(seconds=F1_LIVE_AFTER)), None)
+
+
+def f1_today_session(event, now):
+    """The latest session that finished today - its results go on the right."""
+    done = [s for s in event["sessions"]
+            if s["end"] <= now and s["end"].astimezone(now.tzinfo).date() == now.date()]
+    return done[-1] if done else None
+
+
+def f1_next_session(event, now):
+    return next((s for s in event["sessions"] if s["start"] > now), None)
+
+
+class TrackMap:
+    """MultiViewer's map of a circuit: the outline turned the way F1 draws
+    it, and where along a lap each point is."""
+
+    def __init__(self, data):
+        xs, ys = data.get("x") or [], data.get("y") or []
+        n = min(len(xs), len(ys))
+        if n < 10:
+            raise ValueError("no outline")
+        a = math.radians(float(data.get("rotation") or 0))
+        ca, sa = math.cos(a), math.sin(a)
+        self.pts = [(x * ca - y * sa, -(x * sa + y * ca)) for x, y in zip(xs[:n], ys[:n])]  # y down
+        dist = [0.0]
+        for (x0, y0), (x1, y1) in zip(self.pts, self.pts[1:]):
+            dist.append(dist[-1] + math.hypot(x1 - x0, y1 - y0))
+        self.length_km = (dist[-1] + math.dist(self.pts[-1], self.pts[0])) / 10000  # decimetres
+        ts = data.get("trackPositionTime") or []
+        if len(ts) >= n and ts[n - 1] > ts[0]:  # by time along the lap, like the timing loops
+            self.frac = [(t - ts[0]) / (ts[n - 1] - ts[0]) for t in ts[:n]]
+            self.lap_time = ts[n - 1] - ts[0]
+        else:
+            self.frac = [d / dist[-1] for d in dist]
+            self.lap_time = 90.0
+        self.corners = len(data.get("corners") or [])
+        try:
+            self.pit_loss = float((data.get("pitLoss") or {}).get("normal"))
+        except (TypeError, ValueError):
+            self.pit_loss = None
+        self.box = (min(p[0] for p in self.pts), min(p[1] for p in self.pts),
+                    max(p[0] for p in self.pts), max(p[1] for p in self.pts))
+
+    def at(self, frac):
+        """The point `frac` of the way round the lap."""
+        frac %= 1.0
+        i = max(1, min(len(self.frac) - 1, bisect.bisect_left(self.frac, frac)))
+        f0, f1 = self.frac[i - 1], self.frac[i]
+        k = 0.0 if f1 <= f0 else (frac - f0) / (f1 - f0)
+        (x0, y0), (x1, y1) = self.pts[i - 1], self.pts[i]
+        return x0 + (x1 - x0) * k, y0 + (y1 - y0) * k
+
+
+def f1_track(circuit_key, year):
+    """The TrackMap for a circuit (last year's if this year's isn't out yet)."""
+    for y in (year, year - 1):
+        try:
+            return TrackMap(f1_json(F1_CIRCUIT_URL.format(circuit=circuit_key, year=y),
+                                    f"f1_circuit_{circuit_key}_{y}.json", 30 * 86400))
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return None
+
+
+class MiniWebSocket:
+    """Just enough of RFC 6455 for a text-message client over TLS."""
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, url, headers=None, timeout=15):
+        u = urllib.parse.urlsplit(url)
+        raw = socket.create_connection((u.hostname, u.port or 443), timeout=timeout)
+        self.sock = SSL_CTX.wrap_socket(raw, server_hostname=u.hostname)
+        self.buf, self.parts = b"", []
+        key = base64.b64encode(os.urandom(16)).decode()
+        head = [f"GET {u.path}{'?' + u.query if u.query else ''} HTTP/1.1", f"Host: {u.hostname}",
+                "Upgrade: websocket", "Connection: Upgrade", f"Sec-WebSocket-Key: {key}",
+                "Sec-WebSocket-Version: 13", f"User-Agent: {PLANES_USER_AGENT}"]
+        head += [f"{k}: {v}" for k, v in (headers or {}).items()]
+        self.sock.sendall(("\r\n".join(head) + "\r\n\r\n").encode())
+        while b"\r\n\r\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("websocket closed during the handshake")
+            self.buf += chunk
+        reply, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        accept = base64.b64encode(hashlib.sha1((key + self.GUID).encode()).digest())
+        if b" 101 " not in reply.split(b"\r\n")[0] or accept not in reply:
+            raise ConnectionError("websocket refused: " + reply.split(b"\r\n")[0].decode(errors="replace"))
+
+    def send(self, data, opcode=1):
+        data = data.encode() if isinstance(data, str) else data
+        n = len(data)
+        head = bytes([0x80 | opcode])
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 65536:
+            head += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+        else:
+            head += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+        mask = os.urandom(4)
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv(self, timeout):
+        """The next text message; socket.timeout if none comes in time."""
+        self.sock.settimeout(timeout)
+        while True:
+            msg = self._take()
+            if msg is not None:
+                return msg
+            chunk = self.sock.recv(65536)  # a timeout here leaves the buffer intact
+            if not chunk:
+                raise ConnectionError("websocket closed")
+            self.buf += chunk
+
+    def _take(self):
+        """Whole frames off the buffer: a finished text message, or None."""
+        while True:
+            b = self.buf
+            if len(b) < 2:
+                return None
+            n, i = b[1] & 0x7F, 2
+            if n == 126:
+                if len(b) < 4:
+                    return None
+                n, i = int.from_bytes(b[2:4], "big"), 4
+            elif n == 127:
+                if len(b) < 10:
+                    return None
+                n, i = int.from_bytes(b[2:10], "big"), 10
+            mask = None
+            if b[1] & 0x80:
+                mask, i = b[i:i + 4], i + 4
+            if len(b) < i + n:
+                return None
+            data, self.buf = b[i:i + n], b[i + n:]
+            if mask:
+                data = bytes(c ^ mask[k % 4] for k, c in enumerate(data))
+            op = b[0] & 0x0F
+            if op == 8:
+                raise ConnectionError("websocket closed by the server")
+            if op == 9:
+                self.send(data, 10)
+            elif op in (0, 1, 2):
+                self.parts.append(data)
+                if b[0] & 0x80:
+                    text, self.parts = b"".join(self.parts).decode("utf-8"), []
+                    return text
+
+    def close(self):
+        try:
+            self.send(b"", 8)
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def f1_connect():
+    """Open F1's live timing feed and subscribe; returns the websocket."""
+    code, body, headers = http(F1_LIVE_NEGOTIATE, data=b"", headers={"User-Agent": PLANES_USER_AGENT})
+    if code != 200:
+        raise OSError(f"live timing negotiate: HTTP {code}")
+    token = json.loads(body)["connectionToken"]
+    cookies = "; ".join(c.split(";")[0] for c in (headers.get_all("Set-Cookie") or []))
+    ws = MiniWebSocket(F1_LIVE_WS.format(token=urllib.parse.quote(token)),
+                       {"Cookie": cookies} if cookies else None)
+    ws.send('{"protocol":"json","version":1}\x1e')
+    ws.recv(15)  # the hub's "{}" handshake reply
+    ws.send(json.dumps({"type": 1, "invocationId": "1", "target": "Subscribe",
+                        "arguments": [F1_TOPICS]}) + "\x1e")
+    return ws
+
+
+def f1_messages(ws, timeout):
+    """(topic, data, whole) for each update the feed sent within `timeout`
+    - whole=True for the full state that answers the Subscribe."""
+    try:
+        text = ws.recv(timeout)
+    except socket.timeout:
+        return []
+    out = []
+    for part in text.split("\x1e"):
+        if not part:
+            continue
+        m = json.loads(part)
+        if m.get("type") == 3 and isinstance(m.get("result"), dict):
+            out += [(topic, data, True) for topic, data in m["result"].items()]
+        elif m.get("type") == 1 and m.get("target") == "feed" and len(m.get("arguments") or []) >= 2:
+            out.append((m["arguments"][0], m["arguments"][1], False))
+        elif m.get("type") == 7:
+            raise ConnectionError("live timing closed the connection")
+    return out
+
+
+def deep_merge(target, patch):
+    """Apply one live timing update: dicts merge key by key, and a dict of
+    "index": value patches a list."""
+    if isinstance(patch, dict) and isinstance(target, dict):
+        for k, v in patch.items():
+            if k == "_deleted":
+                for gone in v if isinstance(v, list) else []:
+                    target.pop(str(gone), None)
+            elif isinstance(v, (dict, list)) and isinstance(target.get(k), (dict, list)):
+                target[k] = deep_merge(target[k], v)
+            else:
+                target[k] = v
+        return target
+    if isinstance(patch, dict) and isinstance(target, list):
+        for k, v in patch.items():
+            try:
+                i = int(k)
+            except ValueError:
+                continue
+            while len(target) <= i:
+                target.append({})
+            target[i] = deep_merge(target[i], v) if isinstance(v, (dict, list)) and \
+                isinstance(target[i], (dict, list)) else v
+        return target
+    return patch
+
+
+def f1_items(x):
+    """(key, value) pairs of a dict, or of a list by index - the feed uses both."""
+    if isinstance(x, dict):
+        return list(x.items())
+    return list(enumerate(x)) if isinstance(x, list) else []
+
+
+def lap_seconds(text):
+    """"1:43.347" -> 103.347; "" -> None."""
+    try:
+        parts = str(text).split(":")
+        return round(sum(float(p) * 60 ** i for i, p in enumerate(reversed(parts))), 3) if text else None
+    except ValueError:
+        return None
+
+
+class CarTracker:
+    """Where each car is around the lap, from the mini-sector timing loops
+    it crosses. Between loops it moves on at its lap pace, so the dots glide
+    round the map. The loops' places along the lap are learned from the laps
+    themselves (or from an earlier session's timing - see f1_calibrate)."""
+
+    def __init__(self, lap_time=90.0, fractions=None):
+        self.counts = ()          # loops per sector, e.g. (8, 10, 9); the last is the line
+        self.fractions = fractions  # lap fraction at each loop, if known in advance
+        self.ref_lap = lap_time
+        self.cars = {}            # number -> {"g", "t", "lap", "pit", "start", "seen"}
+        self.samples = {}         # loop -> fractions seen this session
+        self.best = None          # fastest full lap seen, to skip slow laps
+
+    def learn_counts(self, timing):
+        """Loops per sector: the highest one any update mentions (updates
+        only list the loops that changed; the full state lists them all)."""
+        counts = list(self.counts) or [0, 0, 0]
+        for _, line in f1_items((timing or {}).get("Lines")):
+            for si, sector in f1_items(line.get("Sectors") if isinstance(line, dict) else None):
+                for gi, _ in f1_items(sector.get("Segments") if isinstance(sector, dict) else None):
+                    if int(si) < 3:
+                        counts[int(si)] = max(counts[int(si)], int(gi) + 1)
+        if all(counts) and tuple(counts) != self.counts:
+            self.counts, self.samples = tuple(counts), {}
+            if self.fractions and len(self.fractions) != sum(counts):
+                self.fractions = None
+
+    def update(self, timing, t):
+        """Take a TimingData update that arrived at time t."""
+        self.learn_counts(timing)
+        for num, line in f1_items((timing or {}).get("Lines")):
+            if not isinstance(line, dict):
+                continue
+            car = self.cars.setdefault(str(num), {"g": None, "t": t, "lap": self.ref_lap,
+                                                  "pit": False, "start": None, "seen": {}})
+            if "InPit" in line:
+                car["pit"] = bool(line["InPit"])
+            if line.get("Retired") or line.get("Stopped"):
+                car["out"] = True
+            for si, sector in f1_items(line.get("Sectors")):
+                for gi, seg in f1_items((sector or {}).get("Segments") if isinstance(sector, dict) else None):
+                    status = (seg or {}).get("Status") if isinstance(seg, dict) else None
+                    if status:
+                        self.passed(car, int(si), int(gi), status, t)
+
+    def passed(self, car, sector, seg, status, t):
+        if sector >= len(self.counts) or seg >= self.counts[sector]:
+            return
+        n = sum(self.counts)
+        g = sum(self.counts[:sector]) + seg
+        car["pit"] = status == F1_PIT_SEGMENT  # a pit-lane loop, or back on track
+        if g == n - 1:  # the line: a lap done, another begun
+            if car["start"] is not None and not car["pit"]:
+                lap = t - car["start"]
+                if 0.5 * self.ref_lap < lap < 2.5 * self.ref_lap:
+                    car["lap"] = lap
+                    self.best = min(self.best or lap, lap)
+                    if lap < self.best * 1.1 and len(car["seen"]) > n // 2:  # a proper lap
+                        for k, at in car["seen"].items():
+                            s = self.samples.setdefault(k, [])
+                            s.append(at / lap)
+                            del s[:-15]
+            car["start"], car["seen"] = t, {}
+        elif car["start"] is not None:
+            car["seen"][g] = t - car["start"]
+        car["g"], car["t"] = g, t
+
+    def bounds(self):
+        """The lap fraction at each loop (the last one, the line, is 1.0)."""
+        n = sum(self.counts)
+        if self.fractions and len(self.fractions) == n:
+            return list(self.fractions)
+        out, prev = [], 0.0
+        for g in range(n - 1):
+            seen = sorted(self.samples.get(g, []))
+            f = seen[len(seen) // 2] if len(seen) >= 3 else (g + 1) / n
+            prev = max(prev + 0.002, min(f, 0.998))  # in order, and short of the line
+            out.append(prev)
+        return out + [1.0] if n else []
+
+    def snapshot(self):
+        """What the renderer needs to place the cars at any moment."""
+        return {"bounds": self.bounds(),
+                "cars": {k: {"g": c["g"], "t": c["t"], "lap": c["lap"], "pit": c["pit"],
+                             "out": c.get("out", False)}
+                         for k, c in self.cars.items() if c["g"] is not None}}
+
+
+def car_fractions(snap, now):
+    """number -> lap fraction for each car on track at time `now` (monotonic)."""
+    bounds = snap.get("bounds") or []
+    n, out = len(bounds), {}
+    for num, c in (snap.get("cars") or {}).items():
+        if c["pit"] or c["out"] or not n or c["g"] >= n:
+            continue
+        f0 = 0.0 if c["g"] == n - 1 else bounds[c["g"]]
+        f1 = bounds[0] if c["g"] == n - 1 else bounds[c["g"] + 1]
+        ran = max(0.0, now - c["t"] + F1_FEED_LAG)  # (checked against the cars' GPS: ~1 s behind)
+        out[num] = min(f0 + ran / max(20.0, c["lap"]), f1 - 0.002) % 1.0
+    return out
+
+
+def f1_calibrate(stream_text):
+    """The loops' lap fractions from a TimingData.jsonStream (F1's archive of
+    a session), or None if it has too few laps to tell."""
+    lines = []
+    for raw in stream_text.lstrip("﻿").splitlines():
+        if len(raw) > 12 and raw[12] == "{":
+            try:
+                h, m, s = raw[:12].split(":")
+                lines.append((int(h) * 3600 + int(m) * 60 + float(s), json.loads(raw[12:])))
+            except ValueError:
+                continue
+    counts = [0, 0, 0]
+    for _, data in lines:  # the most loops any sector ever lists
+        for _, line in f1_items(data.get("Lines")):
+            for si, sector in f1_items(line.get("Sectors") if isinstance(line, dict) else None):
+                for gi, _ in f1_items(sector.get("Segments") if isinstance(sector, dict) else None):
+                    if int(si) < 3:
+                        counts[int(si)] = max(counts[int(si)], int(gi) + 1)
+    if not all(counts):
+        return None
+    lap_guess = None
+    tracker = CarTracker()
+    tracker.counts = tuple(counts)
+    for t, data in lines:
+        if lap_guess is None:  # the pace, from the first lap times that turn up
+            times = [lap_seconds((line.get("LastLapTime") or {}).get("Value"))
+                     for _, line in f1_items(data.get("Lines")) if isinstance(line, dict)]
+            times = [x for x in times if x]
+            if times:
+                lap_guess = tracker.ref_lap = min(times)
+        tracker.update(data, t)
+    if sum(len(s) >= 3 for s in tracker.samples.values()) < sum(counts) * 0.8:
+        return None
+    return {"counts": counts, "fractions": tracker.bounds()}
+
+
+def f1_archive_path(event, year):
+    """F1's archive folder of the most recent finished session at this
+    circuit: earlier this weekend, else last year's race there."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    done = {s["key"] for s in event["sessions"] if s["end"] < now - datetime.timedelta(hours=1)}
+    for y in (year, year - 1):
+        index = json.loads(cached_download(F1_ARCHIVE + f"{y}/Index.json", f"f1_archive_{y}.json",
+                                           6 * 3600).decode("utf-8-sig"))
+        for m in reversed(index.get("Meetings") or []):
+            if (m.get("Circuit") or {}).get("Key") != event["circuit_key"]:
+                continue
+            sessions = [s for s in m.get("Sessions") or [] if s.get("Path")]
+            if y == year:
+                sessions = [s for s in sessions if s.get("Key") in done]
+            else:
+                sessions = [s for s in sessions if s.get("Type") == "Race"] or sessions
+            if sessions:
+                return sessions[-1]["Path"]
+    return None
+
+
+def f1_segment_fractions(event, year):
+    """Where each timing loop sits around this circuit: cached per circuit,
+    worked out once from F1's archive of a session there."""
+    path = os.path.join(CACHE_DIR, "f1_loops.json")
+    try:
+        with open(path) as f:
+            known = json.load(f)
+    except (OSError, ValueError):
+        known = {}
+    entry = known.get(str(event["circuit_key"]))
+    if entry and (entry.get("fractions") or time.time() - entry.get("tried", 0) < 86400):
+        return entry if entry.get("fractions") else None
+    known[str(event["circuit_key"])] = {"tried": time.time()}  # (saved below either way)
+    folder = f1_archive_path(event, year)
+    entry = None
+    if folder:
+        code, body, _ = http(F1_ARCHIVE + folder + "TimingData.jsonStream",
+                             headers={"User-Agent": PLANES_USER_AGENT}, timeout=60)
+        if code == 200:
+            entry = f1_calibrate(body.decode("utf-8-sig", errors="replace"))
+            if entry:
+                known[str(event["circuit_key"])] = entry
+        else:
+            log(f"f1 timing archive {folder}: HTTP {code}")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(known, f)
+    os.replace(path + ".tmp", path)
+    return entry
+
+
+def f1_team_color(hexcode):
+    try:
+        return tuple(int(hexcode[i:i + 2], 16) for i in (0, 2, 4))
+    except (TypeError, ValueError):
+        return COL_DIM
+
+
+def f1_results(session):
+    """OpenF1's classification of a finished session as display rows:
+    (position, TLA, team colour, time or gap text)."""
+    key = session["key"]
+    code, res = get_json(F1_OPENF1 + f"session_result?session_key={key}")
+    if code != 200 or not isinstance(res, list) or not res:
+        raise ValueError(f"no results yet (HTTP {code})")
+    code, drivers = get_json(F1_OPENF1 + f"drivers?session_key={key}")
+    who = {d.get("driver_number"): (d.get("name_acronym") or str(d.get("driver_number")),
+                                    f1_team_color(d.get("team_colour")))
+           for d in drivers if isinstance(d, dict)} if isinstance(drivers, list) else {}
+    race = session["type"] == "Race" or session["name"] in ("Race", "Sprint")
+    rows = []
+    for r in sorted((r for r in res if isinstance(r, dict) and r.get("position")),
+                    key=lambda r: r["position"]):
+        tla, color = who.get(r.get("driver_number"), (str(r.get("driver_number")), COL_DIM))
+        dur, gap = r.get("duration"), r.get("gap_to_leader")
+        if isinstance(dur, list):  # qualifying: Q1, Q2, Q3 - the last one they ran
+            done = [(d, g) for d, g in zip(dur, gap if isinstance(gap, list) else [None] * 3) if d]
+            dur, gap = done[-1] if done else (None, None)
+        if r.get("dnf") or r.get("dns") or r.get("dsq"):
+            text = "DSQ" if r.get("dsq") else "DNS" if r.get("dns") else "DNF"
+        elif r["position"] == 1:
+            text = fmt_race_time(dur) if race else fmt_lap(dur)
+        elif isinstance(gap, str):
+            text = gap  # "+1 LAP"
+        else:
+            text = f"+{gap:.3f}" if isinstance(gap, (int, float)) else ""
+        rows.append((r["position"], tla, color, text))
+    return rows
+
+
+def fmt_lap(sec):
+    if not isinstance(sec, (int, float)):
+        return ""
+    return f"{int(sec // 60)}:{sec % 60:06.3f}"
+
+
+def fmt_race_time(sec):
+    if not isinstance(sec, (int, float)):
+        return ""
+    h, rest = divmod(sec, 3600)
+    return f"{int(h)}:{int(rest // 60):02d}:{rest % 60:06.3f}" if h else fmt_lap(sec)
+
+
+def f1_facts(event):
+    """Things worth knowing about the weekend's circuit, from Jolpica: its
+    full name, the round, last year's winner, the championship leader."""
+    year = event["year"]
+    facts = {}
+    races = f1_json(F1_JOLPICA + f"{year}.json", f"f1_jolpica_{year}.json", 86400)
+    race_day = next((s["start"].date() for s in reversed(event["sessions"]) if s["type"] == "Race"), None)
+    for r in ((races.get("MRData") or {}).get("RaceTable") or {}).get("Races") or []:
+        if race_day and r.get("date") == race_day.isoformat():
+            circuit = r.get("Circuit") or {}
+            facts.update(circuit=circuit.get("circuitName") or "", circuit_id=circuit.get("circuitId"),
+                         round=r.get("round"))
+    if facts.get("circuit_id"):
+        try:
+            last = f1_json(F1_JOLPICA + f"{year - 1}/circuits/{facts['circuit_id']}/results/1.json",
+                           f"f1_winner_{facts['circuit_id']}_{year - 1}.json", 30 * 86400)
+            race = (((last.get("MRData") or {}).get("RaceTable") or {}).get("Races") or [None])[0]
+            d = ((race or {}).get("Results") or [{}])[0].get("Driver") or {}
+            if d:
+                facts["last_winner"] = (year - 1, f"{d.get('givenName', '')} {d.get('familyName', '')}".strip())
+        except (OSError, ValueError, AttributeError, IndexError):
+            pass
+    try:
+        st = f1_json(F1_JOLPICA + f"{year}/driverstandings.json", f"f1_standings_{year}.json", 6 * 3600)
+        lists = ((st.get("MRData") or {}).get("StandingsTable") or {}).get("StandingsLists") or []
+        top = (lists[0].get("DriverStandings") or [])[:3] if lists else []
+        facts["leaders"] = [((s.get("Driver") or {}).get("familyName") or "?", s.get("points")) for s in top]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return facts
+
+
+def f1_live_view(topics, cars, session):
+    """What the live screen shows, from the feed's merged topics."""
+    info = topics.get("SessionInfo") or {}
+    timing = topics.get("TimingData") or {}
+    drivers = topics.get("DriverList") or {}
+    race = (info.get("Type") or session["type"]) == "Race" or session["name"] in ("Race", "Sprint")
+    who = {}
+    for num, d in f1_items(drivers):
+        if isinstance(d, dict):
+            who[str(num)] = (d.get("Tla") or str(num), f1_team_color(d.get("TeamColour")))
+    tower, fastest = [], None
+    for num, line in f1_items(timing.get("Lines")):
+        if not isinstance(line, dict):
+            continue
+        try:
+            pos = int(line.get("Position") or 0)
+        except ValueError:
+            pos = 0
+        tla, color = who.get(str(num), (str(num), COL_DIM))
+        best = lap_seconds((line.get("BestLapTime") or {}).get("Value"))
+        if best and (fastest is None or best < fastest[1]):
+            fastest = (tla, best, color)
+        out, pit = line.get("Retired") or line.get("Stopped"), line.get("InPit")
+        if race:  # a race tower says where they are: in the pits, out, or the interval
+            gap = (line.get("IntervalToPositionAhead") or {}).get("Value") or line.get("GapToLeader") or ""
+            text = "OUT" if out else "PIT" if pit else "LEADER" if pos == 1 else str(gap)
+        else:  # practice and qualifying: the time stands, pits or not
+            text = fmt_lap(best) if pos == 1 else (line.get("TimeDiffToFastest") or "")
+            text = text or ("OUT" if out else "")
+        if pos:
+            tower.append((pos, tla, color, text, "out" if out else "pit" if pit else ""))
+    tower.sort()
+    status = F1_FLAGS.get(str((topics.get("TrackStatus") or {}).get("Status")), ("", COL_DIM))
+    msgs = [m for _, m in f1_items((topics.get("RaceControlMessages") or {}).get("Messages")) if isinstance(m, dict)]
+    clock = topics.get("ExtrapolatedClock") or {}
+    laps = topics.get("LapCount") or {}
+    w = topics.get("WeatherData") or {}
+    weather = []
+    if w.get("AirTemp"):
+        weather.append(f"air {float(w['AirTemp']):.0f}°")
+    if w.get("TrackTemp"):
+        weather.append(f"track {float(w['TrackTemp']):.0f}°")
+    if str(w.get("Rainfall") or "0") not in ("0", ""):
+        weather.append("rain")
+    return {"phase": "live", "session": session, "race": race,
+            "state": (topics.get("SessionStatus") or {}).get("Status") or info.get("SessionStatus") or "",
+            "flag": status, "tower": tower, "drivers": who,
+            "message": (msgs[-1].get("Message") or "") if msgs else "",
+            "fastest": fastest, "weather": "  ·  ".join(weather),
+            "laps": (laps.get("CurrentLap"), laps.get("TotalLaps")) if laps.get("TotalLaps") else None,
+            "clock": (clock.get("Remaining"), parse_iso(clock.get("Utc") or ""),
+                      bool(clock.get("Extrapolating"))) if clock.get("Remaining") else None,
+            "cars": cars if (topics.get("SessionStatus") or {}).get("Status") == "Started" else {}}
+
+
+def f1_clock_left(clock, now):
+    """Seconds left in the session, counting down from the feed's last word."""
+    remaining, at, running = clock
+    left = lap_seconds(remaining) or 0.0
+    if running and at:
+        left -= (now - at).total_seconds()
+    return max(0.0, left)
+
+
+def f1_worker(model):
+    """While the F1 screen is up: the weekend, and live timing when a session is on."""
+    track, track_key, facts, facts_at = None, None, {}, 0.0
+    results = {}   # session key -> rows (from the live feed at the end, then OpenF1)
+    while True:
+        if model.mode != "f1":
+            model.f1_wake.wait()
+            model.f1_wake.clear()
+            continue
+        now = datetime.datetime.now().astimezone()
+        try:
+            events = f1_events(now.year)
+            event = f1_weekend(events, now)
+            if event is None:  # season over: the first race of the next one
+                event = f1_weekend(f1_events(now.year + 1), now)
+        except Exception as e:
+            log(f"f1 schedule: {e}")
+            model.set_f1_status("F1 schedule unreachable - retrying", COL_RED)
+            model.f1_wake.wait(60)
+            model.f1_wake.clear()
+            continue
+        if event is None:
+            model.set_f1_status("no F1 schedule yet", COL_DIM)
+            model.f1_wake.wait(3600)
+            model.f1_wake.clear()
+            continue
+        if track_key != (event["circuit_key"], event["year"]):
+            track_key, facts, facts_at = (event["circuit_key"], event["year"]), {}, 0.0
+            track = f1_track(event["circuit_key"], event["year"])
+        if time.monotonic() - facts_at > 6 * 3600:
+            try:
+                facts = f1_facts(event)
+            except Exception as e:
+                log(f"f1 facts: {e}")
+            facts_at = time.monotonic()
+        base = {"event": event, "track": track, "facts": facts}
+        live = f1_live_session(event, now)
+        if live:
+            rows = f1_follow_live(model, event, live, track, base)
+            if rows:
+                results[live["key"]] = rows
+            continue
+        today = f1_today_session(event, now)
+        shown = None
+        if today:
+            if today["key"] not in results or results[today["key"]][0] == "live":
+                try:  # OpenF1 has it half an hour after the flag
+                    results[today["key"]] = ("openf1", f1_results(today))
+                except Exception as e:
+                    log(f"f1 results {today['name']}: {e}")
+            shown = results.get(today["key"])
+        model.set_f1(dict(base, phase="off", now=now, next=f1_next_session(event, now),
+                          results=(today, shown[1]) if shown else None))
+        # get ready for the map: where the timing loops sit on this track
+        try:
+            f1_segment_fractions(event, event["year"])
+        except Exception as e:
+            log(f"f1 timing loops: {e}")
+        model.f1_wake.wait(60)
+        model.f1_wake.clear()
+
+
+def f1_follow_live(model, event, session, track, base):
+    """Stay on F1's live timing while this session's window lasts; returns
+    the final running order as ("live", rows) for the results panel."""
+    loops = None
+    try:
+        loops = f1_segment_fractions(event, event["year"])
+    except Exception as e:
+        log(f"f1 timing loops: {e}")
+    tracker = CarTracker(track.lap_time if track else 90.0,
+                         loops and loops.get("fractions"))
+    topics, last = {}, None
+
+    def window_open():
+        now = datetime.datetime.now().astimezone()
+        return model.mode == "f1" and now <= session["end"] + datetime.timedelta(seconds=F1_LIVE_AFTER)
+
+    while window_open():
+        try:
+            ws = f1_connect()
+        except Exception as e:
+            log(f"f1 live timing: {e}")
+            model.set_f1_status("live timing unreachable - retrying", COL_RED)
+            model.f1_wake.wait(15)
+            model.f1_wake.clear()
+            continue
+        model.set_f1_status("F1 live timing", COL_GREEN)
+        published, pinged = 0.0, time.monotonic()
+        try:
+            while window_open():
+                for topic, data, whole in f1_messages(ws, 0.5):
+                    t = time.monotonic()
+                    if topic == "TimingData":
+                        tracker.update(data, t)
+                    if whole or topic not in topics or not isinstance(topics[topic], (dict, list)):
+                        topics[topic] = data
+                    else:
+                        deep_merge(topics[topic], data)
+                t = time.monotonic()
+                if t - pinged > 10:
+                    ws.send('{"type":6}\x1e')
+                    pinged = t
+                if t - published >= 0.5 and topics:
+                    last = f1_live_view(topics, tracker.snapshot(), session)
+                    model.set_f1(dict(base, **last))
+                    published = t
+        except Exception as e:
+            log(f"f1 live timing dropped: {e}")
+        finally:
+            ws.close()
+    return ("live", last["tower"]) if last and last["tower"] else None
+
+
 # ---------------------------------------------------------------- demo data
 
 def demo_art():
@@ -1899,6 +2687,56 @@ def demo_sky(model, t, start, photo, liveries=None):
         "photo": ("https://www.planespotters.net/", photo, "demo photo")})
 
 
+DEMO_GRID = [("VER", "3671C6"), ("NOR", "FF8000"), ("LEC", "E8002D"), ("PIA", "FF8000"),
+             ("RUS", "27F4D2"), ("HAM", "E8002D"), ("ANT", "27F4D2"), ("ALO", "229971"),
+             ("SAI", "64C4FF"), ("GAS", "0093CC"), ("ALB", "64C4FF"), ("HUL", "52E252"),
+             ("TSU", "3671C6"), ("OCO", "B6BABD"), ("STR", "229971"), ("BOR", "52E252"),
+             ("LAW", "6692FF"), ("HAD", "6692FF"), ("BEA", "B6BABD"), ("COL", "0093CC")]
+
+
+def demo_f1(t, start, track, event):
+    """--demo: a 20-car race on a made-up circuit, cars gliding round."""
+    n, mono = 24, time.monotonic()
+    bounds = [(g + 1) / n for g in range(n)]
+    cars, runs = {}, []
+    for i, (tla, _) in enumerate(DEMO_GRID):
+        lap = 88.0 + i * 0.35
+        run = (t - start) / lap + 0.9 - i * 0.012  # laps covered
+        f = run % 1.0
+        passed = int(f * n) - 1  # the last loop crossed; -1 = the line
+        g = n - 1 if passed < 0 else passed
+        f0 = 0.0 if g == n - 1 else bounds[g]
+        cars[str(i + 1)] = {"g": g, "t": mono - (f - f0) * lap - F1_FEED_LAG, "lap": lap,
+                            "pit": False, "out": False}
+        runs.append((run, i))
+    runs.sort(reverse=True)
+    tower = [(pos, DEMO_GRID[i][0], f1_team_color(DEMO_GRID[i][1]),
+              "LEADER" if pos == 1 else f"+{(runs[pos - 2][0] - run) * 89:.3f}", "")
+             for pos, (run, i) in enumerate(runs, 1)]
+    session = {"key": 0, "name": "Race", "type": "Race",
+               "start": event["start"], "end": event["end"]}
+    lap_no = int(runs[0][0]) + 1
+    return {"phase": "live", "event": event, "track": track, "facts": {}, "session": session,
+            "race": True, "state": "Started", "flag": ("GREEN FLAG", COL_GREEN) if lap_no % 6 else
+            ("VIRTUAL SAFETY CAR", COL_YELLOW), "tower": tower,
+            "drivers": {str(i + 1): (tla, f1_team_color(c)) for i, (tla, c) in enumerate(DEMO_GRID)},
+            "message": f"DRS ENABLED" if lap_no % 6 else "VIRTUAL SAFETY CAR DEPLOYED",
+            "fastest": (DEMO_GRID[0][0], 91.254, f1_team_color(DEMO_GRID[0][1])),
+            "weather": "air 24°  ·  track 38°", "laps": (lap_no, 57), "clock": None,
+            "cars": {"bounds": bounds, "cars": cars}}
+
+
+def demo_f1_track():
+    """A made-up circuit: a long straight, a hairpin and some esses."""
+    xs, ys = [], []
+    for i in range(480):
+        a = 2 * math.pi * i / 480
+        xs.append(9000 * math.cos(a) + 1400 * math.cos(3 * a))
+        ys.append(4200 * math.sin(a) + 900 * math.sin(2 * a) - 700 * math.sin(4 * a))
+    return TrackMap({"x": xs, "y": ys, "rotation": 0, "trackPositionTime": [i * 0.19 for i in range(480)],
+                     "corners": [{}] * 14, "pitLoss": {"normal": "20.5"}})
+
+
 def demo_worker(model):
     """--demo: moving numbers, a thinking spinner every other 8s, a fake song,
     a fake print and a fake plane."""
@@ -1906,11 +2744,16 @@ def demo_worker(model):
     model.set_art("demo:art", art)
     photo = demo_plane_photo()
     liveries = load_liveries(model.cfg.planes_liveries)
+    f1_track_map = demo_f1_track()
+    today = datetime.datetime.now().astimezone()
+    f1_event = {"key": 0, "name": "Demo Grand Prix", "location": "Demo City", "country": "", "circuit": "Demo",
+                "circuit_key": 0, "year": today.year, "start": today, "end": today, "sessions": []}
     start = time.time()
     while True:
         t = time.time()
         now = datetime.datetime.now().astimezone()
         demo_sky(model, t, start, photo, liveries)
+        model.set_f1(demo_f1(t, start, f1_track_map, f1_event))
         done = ((t - start) / 600) % 1.0  # a 10-minute "print" on loop
         model.update_printer({
             "gcode_state": "RUNNING", "subtask_name": "Articulated Dragon.3mf",
@@ -1988,6 +2831,8 @@ class BeaconHandler(BaseHTTPRequestHandler):
             elif want == "planes":
                 self._send(409, "planes screen not set up - run "
                                 "python3 pi/claude_display.py --setup-planes\n")
+            elif want == "f1":
+                self._send(409, "the F1 screen is turned off ([f1] enabled in config.ini)\n")
             else:
                 self._send(409, "printer not configured - run "
                                 "python3 pi/claude_display.py --setup-bambu\n")
@@ -2364,6 +3209,16 @@ class Renderer:
                           repr(sky.get("airline")), sky.get("model_name"), sky.get("no_photo"),
                           (sky.get("art") or {}).get("path"),
                           (sky.get("photo") or (None,))[0], snap.planes_status, snap.thinking)
+        if snap.mode == "f1":
+            f = snap.f1 or {}
+            if f.get("phase") == "live":
+                clock = int(f1_clock_left(f["clock"], now)) if f.get("clock") else None
+                return key + ("live", f["session"]["key"], tuple(f.get("tower") or ()), f.get("message"),
+                              f.get("flag"), f.get("state"), f.get("laps"), clock, f.get("fastest"),
+                              f.get("weather"), id(f.get("track")), snap.f1_status, snap.thinking)
+            ev = f.get("event") or {}
+            return key + ("off", ev.get("key"), repr(f.get("results")), repr(f.get("next")),
+                          repr(f.get("facts")), id(f.get("track")), snap.f1_status, snap.thinking)
         if snap.mode == "bambu":
             # only what's drawn, so fan speeds and wifi strength don't cause redraws
             v = printer_view(snap.printer, now)
@@ -2388,7 +3243,8 @@ class Renderer:
         addr = f"{snap.host}.local  {snap.ip}".rstrip()
         status = snap.flash or {"usage": snap.usage_status, "spotify": snap.sp_status,
                                 "bambu": snap.printer_status,
-                                "planes": snap.planes_status}[snap.mode]
+                                "planes": snap.planes_status,
+                                "f1": snap.f1_status}[snap.mode]
         if self.working_note(snap):
             # Only the usage screen has the big spinner, so on the others Claude
             # working shows up here - the Pi's stand-in for the ESP32's LED.
@@ -2584,6 +3440,9 @@ class Renderer:
                                                            45, COL_ORANGE))
             surf.blit(icon, (self.x(60) - s // 2, self.y(52) - s // 2))
             title, color, sub = "Planes overhead", COL_ORANGE, subtitle
+        elif brand == "f1":
+            self.text(surf, "F1", 34, 66, 44, COL_F1, bold=True)
+            title, color, sub = "Formula 1", COL_F1, subtitle
         else:
             self.mascot(surf, 32, 28, 6)
             title, color, sub = "Claude Code", COL_ORANGE, "usage monitor"
@@ -3303,6 +4162,289 @@ class Renderer:
 
     PLANES_DEFAULT_NM = 15
 
+    # -- the F1 screen: the track (cars on it when live) | live timing or the circuit | results
+    F1_MAP = {"bar": (24, 18, 420, 256), "landscape": (32, 118, 330, 300),
+              "portrait": (12, 58, 156, 104), "strip": (24, 250, 272, 330)}
+
+    def f1_geometry(self, track, rect):
+        """Scale and offset that fit the track into rect (physical pixels)."""
+        m = self.n(10)
+        bx0, by0, bx1, by1 = track.box
+        k = min((rect.w - 2 * m) / max(1.0, bx1 - bx0), (rect.h - 2 * m) / max(1.0, by1 - by0))
+        ox = rect.x + (rect.w - (bx1 - bx0) * k) / 2 - bx0 * k
+        oy = rect.y + (rect.h - (by1 - by0) * k) / 2 - by0 * k
+        return k, ox, oy
+
+    def f1_track_surface(self, track, rect):
+        """The track drawn once onto the background, anti-aliased."""
+        key = ("f1-track", id(track), rect.size)
+        img = self.shape_cache.get(key)
+        if img is None:
+            k, ox, oy = self.f1_geometry(track, pygame.Rect(0, 0, *rect.size))
+            big = pygame.Surface((rect.w * SS, rect.h * SS))
+            big.fill(COL_BG)
+            pts = [((x * k + ox) * SS, (y * k + oy) * SS) for x, y in track.pts]
+            w = max(3, round(self.s * 4.5 * SS))
+            for color, width in (((70, 70, 76), w + 2 * SS), ((205, 205, 212), w)):
+                pygame.draw.lines(big, color, True, pts, width)
+                for p in pts[::2]:
+                    pygame.draw.circle(big, color, p, width / 2)
+            (x0, y0), (x1, y1) = pts[0], pts[min(3, len(pts) - 1)]  # the start/finish line
+            d = math.hypot(x1 - x0, y1 - y0) or 1
+            nx, ny = -(y1 - y0) / d * w * 1.6, (x1 - x0) / d * w * 1.6
+            pygame.draw.line(big, COL_F1, (x0 - nx, y0 - ny), (x0 + nx, y0 + ny), max(2, w // 2))
+            img = pygame.transform.smoothscale(big, rect.size)
+            self.shape_cache[key] = img
+        return img
+
+    def car_frame(self, snap):
+        """The cars' animation step while they're on the map, else -1."""
+        f = snap.f1 or {}
+        if snap.mode != "f1" or f.get("phase") != "live" or not (f.get("cars") or {}).get("cars"):
+            return -1
+        return int(snap.mono * 10)
+
+    def draw_f1_map(self, surf, snap):
+        """The map with the cars where they are right now; returns its rect
+        (live, only this is repainted ten times a second)."""
+        f = snap.f1 or {}
+        mx, my, mw, mh = self.F1_MAP[self.layout]
+        rect = self.rect(mx, my, mw, mh)
+        track = f.get("track")
+        surf.fill(COL_BG, rect)
+        if not track:
+            self.text(surf, "no map yet", mx + mw / 2, my + mh / 2, 16, COL_DIM, align="c")
+            return rect
+        surf.blit(self.f1_track_surface(track, rect), rect.topleft)
+        cars = f.get("cars") or {}
+        if f.get("phase") == "live" and cars.get("cars"):
+            k, ox, oy = self.f1_geometry(track, rect)
+            where = car_fractions(cars, snap.mono)
+            order = {row[1]: row[0] for row in f.get("tower") or []}
+            who = f.get("drivers") or {}
+            r = max(3, self.n(min(6.0, mw * 0.014)))
+            spots = []
+            for num, frac in where.items():
+                tla, color = who.get(num, (num, COL_DIM))
+                x, y = track.at(frac)
+                spots.append((order.get(tla, 99), tla, color, round(x * k + ox), round(y * k + oy)))
+            for pos, tla, color, x, y in sorted(spots, reverse=True):  # the leader on top
+                def dot(big, s, c=color):
+                    mid = big.get_width() / 2
+                    pygame.draw.circle(big, COL_BG, (mid, mid), (r + 1) * s)  # keeps close cars apart
+                    pygame.draw.circle(big, c, (mid, mid), r * s)
+                surf.blit(self._ss(("car", color, r), 2 * r + 2, 2 * r + 2, dot), (x - r - 1, y - r - 1))
+                if pos <= 3:
+                    self.text(surf, tla, (x + r + 2 - self.ox) / self.s, (y - r - self.oy) / self.s, 12,
+                              COL_TEXT, bold=True)
+        return rect
+
+    def f1_row(self, surf, x0, x1, base, row, size):
+        """One line of a timing tower: position, team colour, driver, time
+        (yellow while in the pits, dim once out)."""
+        pos, tla, color, text = row[:4]
+        state = row[4] if len(row) > 4 else ""
+        self.text(surf, str(pos), x0 + size * 1.1, base, size * 0.85, COL_DIM, align="r")
+        surf.fill(color, self.rect(x0 + size * 1.4, base - size * 0.78, max(2, size * 0.18), size * 0.9))
+        self.text(surf, tla, x0 + size * 1.8, base, size, COL_TEXT, bold=True)
+        tone = COL_YELLOW if state == "pit" or text == "PIT" else             COL_DIM if state == "out" or text in ("OUT", "DNF", "DNS", "DSQ") else COL_SUB
+        self.text(surf, self.fit(text, x1 - x0 - size * 4.6, size * 0.9), x1, base, size * 0.9, tone,
+                  align="r")
+
+    def f1_list(self, surf, rows, x0, x1, top, step, size, cols=1, per_col=5):
+        colw = (x1 - x0 - (cols - 1) * size) / cols
+        for i, row in enumerate(rows[:cols * per_col]):
+            cx = x0 + (i // per_col) * (colw + size)
+            self.f1_row(surf, cx, cx + colw, top + (i % per_col) * step, row, size)
+
+    @staticmethod
+    def f1_when(when, now):
+        """"Fri 8:00 AM" (or "tomorrow 8:00 AM", "8:00 AM" today)."""
+        local = when.astimezone(now.tzinfo)
+        days = (local.date() - now.date()).days
+        day = "" if days == 0 else "tomorrow " if days == 1 else local.strftime("%a ")
+        return day + clock_str(local)
+
+    @staticmethod
+    def f1_countdown(when, now):
+        secs = int((when - now).total_seconds())
+        if secs < 3600:
+            return f"in {max(1, secs // 60)}m"
+        if secs < 86400:
+            return f"in {secs // 3600}h {secs % 3600 // 60:02d}m"
+        return f"in {secs // 86400}d {secs % 86400 // 3600}h"
+
+    def f1_schedule_rows(self, f, now):
+        """The weekend's sessions as rows for the right-hand list."""
+        rows = []
+        for s in f["event"]["sessions"]:
+            done = s["end"] <= now
+            rows.append((F1_SHORT.get(s["name"], s["name"].upper()[:8]), self.f1_when(s["start"], now), done))
+        return rows
+
+    def f1_panel_right(self, surf, f, now, x0, x1, top, size, step, cols, per_col):
+        """Right: the live running order, today's results, or the weekend's schedule."""
+        if f.get("phase") == "live":
+            self.text(surf, "RUNNING ORDER", x0, top - size * 1.5, size * 0.75, COL_DIM, bold=True)
+            self.f1_list(surf, f.get("tower") or [], x0, x1, top, step, size, cols, per_col)
+        elif f.get("results"):
+            session, rows = f["results"]
+            self.text(surf, f"{session['name'].upper()} RESULT", x0, top - size * 1.5, size * 0.75,
+                      COL_DIM, bold=True)
+            self.f1_list(surf, rows, x0, x1, top, step, size, cols, per_col)
+        else:
+            self.text(surf, "THIS WEEKEND", x0, top - size * 1.5, size * 0.75, COL_DIM, bold=True)
+            nxt = f.get("next")
+            for i, (name, when, done) in enumerate(self.f1_schedule_rows(f, now)[:cols * per_col]):
+                cx = x0 + (i // per_col) * ((x1 - x0) / cols)
+                base = top + (i % per_col) * step
+                is_next = nxt and name == F1_SHORT.get(nxt["name"], nxt["name"].upper()[:8])
+                color = COL_ORANGE if is_next else COL_DIM if done else COL_TEXT
+                self.text(surf, name, cx, base, size * 0.85, color, bold=True)
+                self.text(surf, when, cx + size * 5.2, base, size * 0.85, color)
+
+    def f1_live_middle(self, surf, f, now, x0, x1, top, size):
+        """Middle, live: session and flag, the clock or laps, race control, fastest lap."""
+        name = f["session"]["name"].upper()
+        r = size * 0.3
+        pygame.draw.circle(surf, COL_F1, (self.x(x0 + r), self.y(top - size * 0.35)), self.n(r))
+        self.text(surf, "LIVE", x0 + r * 2.8, top, size * 0.8, COL_F1, bold=True)
+        flag, color = f.get("flag") or ("", COL_DIM)
+        state = f.get("state") or ""
+        if state in ("Finished", "Finalised", "Ends"):
+            flag, color = "CHEQUERED FLAG", COL_TEXT
+        elif state == "Aborted":
+            flag, color = "SESSION STOPPED", COL_RED
+        self.text(surf, flag, x1, top, size * 0.7, color, bold=True, align="r")
+        nx = x0 + r * 2.8 + self.width("LIVE", size * 0.8, True) + size * 0.5
+        room = x1 - nx - self.width(flag, size * 0.7, True) - size * 0.5
+        self.text(surf, self.fit(name, room, size * 0.8, bold=True), nx, top, size * 0.8, COL_TEXT,
+                  bold=True)
+        if f.get("laps") and f["laps"][0]:
+            big = f"LAP {f['laps'][0]}/{f['laps'][1]}"
+        elif f.get("clock"):
+            left = int(f1_clock_left(f["clock"], now))
+            big = f"{left // 3600}:{left % 3600 // 60:02d}:{left % 60:02d}" if left >= 3600 else \
+                f"{left // 60}:{left % 60:02d}"
+        else:
+            big = "--"
+        self.text(surf, big, x0, top + size * 2.15, size * 1.9, COL_TEXT, bold=True)
+        if f.get("laps") is None and f.get("clock"):
+            self.text(surf, "left", x0 + self.width(big, size * 1.9, True) + size * 0.4,
+                      top + size * 2.15, size * 0.7, COL_DIM)
+        l1, l2 = self.wrap2(f.get("message") or "", x1 - x0, size * 0.62)
+        self.text(surf, l1, x0, top + size * 3.3, size * 0.62, COL_SUB)
+        if l2:
+            self.text(surf, l2, x0, top + size * 4.1, size * 0.62, COL_SUB)
+        bits = []
+        if f.get("fastest"):
+            tla, best, _ = f["fastest"]
+            bits.append(f"fastest {tla} {fmt_lap(best)}")
+        if f.get("weather"):
+            bits.append(f["weather"])
+        self.text(surf, self.fit("   ·   ".join(bits), x1 - x0, size * 0.6), x0, top + size * 5.3,
+                  size * 0.6, COL_DIM)
+
+    def f1_off_middle(self, surf, f, now, x0, x1, top, size, lines=4):
+        """Middle, between sessions: the circuit's name, big, and the weekend at a glance."""
+        ev, facts, track = f["event"], f.get("facts") or {}, f.get("track")
+        name = facts.get("circuit") or ev["circuit"] or ev["location"]
+        big = self.fit_size(name, x1 - x0, int(size * 2.1), bold=True, smallest=int(size * 1.1))
+        self.text(surf, self.fit(name, x1 - x0, big, bold=True), x0, top, big, COL_TEXT, bold=True)
+        sub = ev["name"] + (f"  ·  Round {facts['round']}" if facts.get("round") else "")
+        self.text(surf, self.fit(sub, x1 - x0, size * 0.75), x0, top + size * 1.25, size * 0.75, COL_SUB)
+        out = []
+        nxt = f.get("next")
+        if nxt:
+            out.append((f"{nxt['name']} {self.f1_countdown(nxt['start'], now)}  ·  "
+                        f"{self.f1_when(nxt['start'], now)}", COL_ORANGE))
+        else:
+            out.append(("race weekend over", COL_DIM))
+        if track:
+            bits = [f"{track.length_km:.2f} km"]
+            if track.corners:
+                bits.append(f"{track.corners} corners")
+            if track.pit_loss:
+                bits.append(f"pit stop costs {track.pit_loss:.0f} s")
+            out.append(("  ·  ".join(bits), COL_DIM))
+        bits = []
+        if facts.get("last_winner"):
+            bits.append(f"{facts['last_winner'][0]} winner {facts['last_winner'][1]}")
+        if facts.get("leaders"):
+            name0, pts = facts["leaders"][0]
+            bits.append(f"leader {name0} {pts} pts")
+        if bits:
+            out.append(("  ·  ".join(bits), COL_DIM))
+        for i, (text, color) in enumerate(out[:lines]):
+            s = size * (0.75 if i == 0 else 0.62)
+            s = self.fit_size(text, x1 - x0, s, smallest=s * 0.8)  # shrink a little before cutting
+            self.text(surf, self.fit(text, x1 - x0, s), x0, top + size * (2.55 + i * 1.12), s, color)
+
+    def f1_waiting(self, surf, snap, x, base, size, align="l"):
+        self.text(surf, "Formula 1", x, base, size, COL_F1, bold=True, align=align)
+        self.text(surf, "loading the season...", x, base + size * 0.95, size * 0.5, COL_DIM, align=align)
+
+    def _f1_bar(self, surf, snap, now):
+        f = snap.f1
+        self.draw_f1_map(surf, snap)
+        surf.fill(COL_CARD, self.rect(462, 40, 2, 196))
+        surf.fill(COL_CARD, self.rect(1030, 40, 2, 196))
+        if not f:
+            self.f1_waiting(surf, snap, 490, 130, 44)
+        elif f.get("phase") == "live":
+            self.f1_live_middle(surf, f, now, 490, 1010, 62, 32)
+        else:
+            self.f1_off_middle(surf, f, now, 490, 1010, 84, 32)
+        if f:
+            self.f1_panel_right(surf, f, now, 1054, 1456, 80, 20, 38, 2, 5)
+        self._clock_bar(surf, now)
+
+    def _f1_landscape(self, surf, snap, now):
+        f = snap.f1
+        ev = (f or {}).get("event")
+        self._header_landscape(surf, now, "f1", ev["name"] if ev else "loading the season...")
+        self.draw_f1_map(surf, snap)
+        if not f:
+            return
+        x0, x1 = 384, 768
+        if f.get("phase") == "live":
+            self.f1_live_middle(surf, f, now, x0, x1, 148, 22)
+            self.f1_list(surf, f.get("tower") or [], x0, x1, 300, 23, 15, cols=2, per_col=6)
+        else:
+            self.f1_off_middle(surf, f, now, x0, x1, 150, 20, lines=3)
+            self.f1_panel_right(surf, f, now, x0, x1, 300, 15, 23, 2, 6)
+
+    def _f1_portrait(self, surf, snap, now):
+        f = snap.f1
+        self.text(surf, "F1", 12, 34, 22, COL_F1, bold=True)
+        ev = (f or {}).get("event")
+        self.text(surf, self.fit(ev["name"] if ev else "loading...", 120, 11), 48, 32, 11, COL_SUB)
+        self.draw_f1_map(surf, snap)
+        if not f:
+            return
+        if f.get("phase") == "live":
+            self.f1_live_middle(surf, f, now, 12, 168, 186, 11)
+            self.f1_list(surf, f.get("tower") or [], 12, 168, 262, 12, 9, per_col=4)
+        else:
+            self.f1_off_middle(surf, f, now, 12, 168, 190, 10, lines=2)
+            self.f1_panel_right(surf, f, now, 12, 168, 262, 9, 12, 1, 4)
+
+    def _f1_strip(self, surf, snap, now):
+        f = snap.f1
+        self.text(surf, "F1", 160, 120, 80, COL_F1, bold=True, align="c")
+        ev = (f or {}).get("event")
+        self.text(surf, self.fit(ev["name"] if ev else "loading the season...", 272, 20), 160, 180, 20,
+                  COL_SUB, align="c")
+        self.draw_f1_map(surf, snap)
+        if f:
+            if f.get("phase") == "live":
+                self.f1_live_middle(surf, f, now, 24, 296, 640, 26)
+            else:
+                self.f1_off_middle(surf, f, now, 24, 296, 650, 24, lines=3)
+            self.f1_panel_right(surf, f, now, 24, 296, 880, 20, 28, 1, 10)
+        self._clock_strip(surf, now)
+
+
 
 # ---------------------------------------------------------------- main
 
@@ -3378,7 +4520,7 @@ def main():
     if args.demo and not cfg.planes_ready:
         cfg.planes_lat, cfg.planes_lon = 40.70, -73.86  # between JFK and LGA
     model = Model(cfg, state, spotify_ready, bambu_ready=args.demo or cfg.bambu_ready,
-                  planes_ready=cfg.planes_ready)
+                  planes_ready=cfg.planes_ready, f1_ready=cfg.f1_enabled)
     model.ip = local_ip()
 
     BeaconHandler.model = model
@@ -3406,6 +4548,8 @@ def main():
             forever(bambu_worker, model)
         if cfg.planes_ready:
             forever(planes_worker, model)
+        if cfg.f1_enabled:
+            forever(f1_worker, model)
 
     try:
         screen = open_screen(args, cfg)
@@ -3440,7 +4584,7 @@ def main():
             pygame.display.flip()
 
     clock = pygame.time.Clock()
-    last_key, last_frame, last_ip_check = None, -1, 0.0
+    last_key, last_frame, last_cars, last_ip_check = None, -1, -1, 0.0
     try:
         while True:
             for ev in pygame.event.get():
@@ -3465,8 +4609,9 @@ def main():
             moving = renderer.advance(snap)  # the session panel's slide
             key = renderer.scene_key(snap, now)
             frame = renderer.spin_frame(snap)
+            cars = renderer.car_frame(snap)
             if key != last_key:
-                last_key, last_frame = key, frame
+                last_key, last_frame, last_cars = key, frame, cars
                 renderer.draw(canvas, snap, now)
                 present()
             else:  # repaint and push only what moved
@@ -3474,9 +4619,12 @@ def main():
                 if frame != last_frame:
                     last_frame = frame
                     rects += renderer.draw_activity(canvas, snap)
+                if cars != last_cars:
+                    last_cars = cars
+                    rects.append(renderer.draw_f1_map(canvas, snap))
                 if rects:
                     present(*rects)
-            clock.tick(60 if moving else 30 if frame >= 0 else 10)
+            clock.tick(60 if moving else 30 if frame >= 0 or cars >= 0 else 10)
     finally:
         pygame.quit()
 
