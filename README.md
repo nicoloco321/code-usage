@@ -454,6 +454,16 @@ the screen from its own Power port.
 
   It only polls while the planes screen is showing: every 10 s for positions,
   with the rest looked up once per plane and cached.
+
+  **The planes log.** Every plane the screen shows is logged with the
+  picture it got: its livery, a blank livery, a photo, or nothing. Open
+  `http://claude-display.local:8080/planes/log` (or **Planes log...** in
+  the Windows tray) to see what's missing. It lists the airline and type
+  pairs that showed a blank livery, as the `("UAL", "B737")` keys to add to
+  `LIVERIES` in `pi/build_liveries.py`. Then it lists the types with no
+  illustration at all, for `BLANKS`, with the most-seen first. The raw log
+  is `~/.local/state/claude-display/planes_log.csv`, also downloadable
+  from the page.
 - **Formula 1.** A fifth screen follows the F1 weekend, with no setup:
   - **Left:** this week's (or the next) track, drawn the way F1 draws it.
     While a session is on, the cars move round it in team colours, with the

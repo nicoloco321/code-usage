@@ -41,6 +41,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 import winreg
 
 try:
@@ -513,6 +514,7 @@ class TrayApp:
                  checked=lambda _: self.mode == "planes", enabled=lambda _: self.online),
             Item("Formula 1 screen", self.on_mode("f1"), radio=True,
                  checked=lambda _: self.mode == "f1", enabled=lambda _: self.online),
+            Item("Planes log...", self.on_planes_log, enabled=lambda _: self.online),
             Menu.SEPARATOR,
             Item("Track Claude with hooks (exact)", self.on_hooks,
                  checked=lambda _: hooks_status()["ours"] is not None,
@@ -528,6 +530,10 @@ class TrayApp:
             Item("Refresh", lambda: self.poll_soon.set()),
             Item("Quit", self.on_quit),
         )
+
+    def on_planes_log(self):
+        """Every plane the display's planes screen has shown, in the browser."""
+        webbrowser.open(f"http://{self.settings['host']}:{self.settings['port']}/planes/log")
 
     def on_mode(self, what):
         def switch():

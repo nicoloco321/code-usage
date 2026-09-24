@@ -40,6 +40,7 @@ import csv
 import datetime
 import gzip
 import hashlib
+import html
 import io
 import json
 import math
@@ -85,6 +86,7 @@ SPOTIFY_NOW_URL = ("https://api.spotify.com/v1/me/player/currently-playing"
 ROOT_TEXT = ("Claude Code usage display (Raspberry Pi). POST /thinking/on while "
              "working, /thinking/off when done. POST /mode/usage, /mode/spotify, "
              "/mode/bambu, /mode/planes, /mode/f1 or /mode/toggle to switch screens; GET /mode to ask; "
+             "GET /planes/log for every plane the planes screen has shown; "
              "GET /usage for JSON.\n")
 
 # ---- palette: the firmware's RGB565 colours, in full RGB ----
@@ -1471,6 +1473,133 @@ def download_photo(info):
     return body
 
 
+# Every plane the screen shows, and what picture it got, so the gaps in the
+# art can be filled: GET /planes/log is the summary, /planes/log.csv the lot.
+PLANES_LOG = os.path.join(os.path.dirname(STATE_PATH), "planes_log.csv")
+PLANES_LOG_FIELDS = ["time", "hex", "callsign", "reg", "type", "model", "livery", "airline",
+                     "picture", "art", "from", "to"]
+PICTURE_WORDS = {"livery": "its livery", "blank": "blank livery", "photo": "photo", "none": "nothing"}
+
+
+def log_plane(path, row):
+    """Add one plane to the log; past 4 MB the log moves to .old and starts over."""
+    try:
+        new = not os.path.exists(path)
+        if not new and os.path.getsize(path) > 4_000_000:
+            os.replace(path, path + ".old")
+            new = True
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, PLANES_LOG_FIELDS, extrasaction="ignore")
+            if new:
+                w.writeheader()
+            w.writerow(row)
+    except OSError as e:
+        log(f"planes log: {e}")
+
+
+def read_plane_log(path):
+    """Everything logged, oldest first (the .old part too)."""
+    rows = []
+    for part in (path + ".old", path):
+        try:
+            with open(part, newline="", encoding="utf-8", errors="replace") as f:
+                rows += [r for r in csv.DictReader(f) if r.get("hex") is not None]
+        except (OSError, csv.Error) as e:  # a damaged log shouldn't take the page down
+            if not isinstance(e, FileNotFoundError):
+                log(f"planes log {part}: {e}")
+    return rows
+
+
+def plane_log_groups(rows, by):
+    """Sightings grouped by the fields in `by`, most seen first. The latest
+    sighting says what picture the group gets now (art may have been added)."""
+    groups = {}
+    for r in rows:
+        g = groups.setdefault(tuple(r.get(k) or "" for k in by),
+                              {"seen": 0, "last": "", "examples": [], "airlines": []})
+        g["seen"] += 1
+        g.update({k: v for k, v in r.items() if v})
+        g["last"] = r.get("time") or g["last"]
+        for key, value in (("examples", r.get("reg") or r.get("callsign")), ("airlines", r.get("airline"))):
+            if value and value not in g[key]:
+                g[key] = (g[key] + [value])[-4:]
+    return sorted(groups.values(), key=lambda g: (-g["seen"], g.get("livery", ""), g.get("type", "")))
+
+
+def planes_log_html(rows):
+    """The log as a page: what's missing art first, then everything recent."""
+    esc = lambda v: html.escape(str(v or ""))
+    when = lambda t: esc((t or "").replace("T", " ")[:16])
+    tag = lambda k: f'<span class="tag {esc(k)}">{esc(PICTURE_WORDS.get(k, k))}</span>'
+    out = ['<!doctype html><html><head><meta charset="utf-8">',
+           '<meta name="viewport" content="width=device-width, initial-scale=1">',
+           "<title>Planes log</title><style>",
+           ":root{color-scheme:dark}body{background:#121212;color:#e6e6e6;margin:24px;",
+           "font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}",
+           "h1{color:#d97757;font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:30px 0 4px}",
+           "p{color:#8a8a8a;margin:0 0 12px}a{color:#9fc3e8}",
+           "table{border-collapse:collapse;width:100%;max-width:1150px}",
+           "th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #262626;vertical-align:top}",
+           "th{color:#8a8a8a;font-size:13px;font-weight:600}td.n{text-align:right;font-variant-numeric:tabular-nums}",
+           "code{color:#b5c7d6;white-space:nowrap}.tag{padding:1px 8px;border-radius:9px;font-size:12px;white-space:nowrap}",
+           ".livery{background:#1d3a22;color:#86d392}.blank{background:#3a3220;color:#e3c565}",
+           ".photo{background:#3d2420;color:#ec9478}.none{background:#2e2e2e;color:#aaa}",
+           "@media(max-width:700px){.wide{display:none}}</style></head><body>",
+           "<h1>Planes overhead: the log</h1>"]
+    if not rows:
+        out.append("<p>Nothing yet - planes land here as the planes screen shows them.</p></body></html>")
+        return "".join(out)
+    hexes = {r.get("hex") for r in rows}
+    out.append(f"<p>{len(rows)} sightings of {len(hexes)} planes since {when(rows[0].get('time'))}"
+               ' &middot; <a href="/planes/log.csv">download the CSV</a></p>')
+    groups = plane_log_groups(rows, ("livery", "type"))
+    blank = [g for g in groups if g.get("picture") == "blank" and g.get("livery")]  # (private: blank is right)
+    out.append(f"<h2>Blank livery shown: no art of the airline's livery on this type ({len(blank)})</h2>"
+               "<p>Add these to LIVERIES in pi/build_liveries.py as (livery, type).</p>")
+    out.append("<table><tr><th>Seen</th><th>(livery, type)</th><th>Airline</th><th>Aircraft</th>"
+               '<th class="wide">Last seen</th><th class="wide">For example</th></tr>' if blank else
+               "<p><i>None so far.</i></p><table>")
+    for g in blank:
+        out.append(f'<tr><td class="n">{g["seen"]}</td><td><code>("{esc(g.get("livery"))}", '
+                   f'"{esc(g.get("type"))}")</code></td><td>{esc(", ".join(g["airlines"]) or "-")}</td>'
+                   f'<td>{esc(g.get("model"))}</td><td class="wide">{when(g["last"])}</td>'
+                   f'<td class="wide">{esc(", ".join(g["examples"]))}</td></tr>')
+    out.append("</table>")
+    latest = {r.get("type"): r.get("picture") for r in rows}  # (art may have been added since)
+    missing = [g for g in plane_log_groups([r for r in rows if r.get("picture") in ("photo", "none")],
+                                           ("type",))
+               if latest.get(g.get("type")) in ("photo", "none")]
+    out.append(f"<h2>No illustration of the type at all ({len(missing)})</h2>"
+               "<p>Add these to BLANKS (or LIVERIES) in pi/build_liveries.py.</p>")
+    out.append("<table><tr><th>Seen</th><th>Type</th><th>Aircraft</th><th>Showed</th><th>Airlines</th>"
+               '<th class="wide">Last seen</th><th class="wide">For example</th></tr>' if missing else
+               "<p><i>None so far.</i></p><table>")
+    for g in missing:
+        out.append(f'<tr><td class="n">{g["seen"]}</td><td><code>"{esc(g.get("type") or "?")}"</code></td>'
+                   f'<td>{esc(g.get("model"))}</td><td>{tag(g.get("picture"))}</td>'
+                   f'<td>{esc(", ".join(g["airlines"]) or "-")}</td><td class="wide">{when(g["last"])}</td>'
+                   f'<td class="wide">{esc(", ".join(g["examples"]))}</td></tr>')
+    out.append("</table><h2>Latest 150</h2><table><tr><th>When</th><th>Flight</th><th>Aircraft</th>"
+               '<th>Picture</th><th class="wide">Airline</th><th class="wide">Route</th></tr>')
+    for r in reversed(rows[-150:]):
+        route = f'{esc(r.get("from"))} &rarr; {esc(r.get("to"))}' if r.get("to") else ""
+        out.append(f'<tr><td>{when(r.get("time"))}</td><td>{esc(r.get("callsign") or r.get("reg"))}</td>'
+                   f'<td>{esc(r.get("model") or r.get("type"))} <code>{esc(r.get("reg"))}</code></td>'
+                   f'<td>{tag(r.get("picture"))}</td><td class="wide">{esc(r.get("airline"))}</td>'
+                   f'<td class="wide">{route}</td></tr>')
+    out.append("</table></body></html>")
+    return "\n".join(out)
+
+
+def planes_log_csv(rows):
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, PLANES_LOG_FIELDS, extrasaction="ignore")
+    w.writeheader()
+    w.writerows(rows)
+    return buf.getvalue()
+
+
 def planes_worker(model):
     """While the planes screen is up, follow the nearest airborne aircraft."""
     cfg = model.cfg
@@ -1479,6 +1608,7 @@ def planes_worker(model):
     cache = {}  # (kind, key) -> (expires, value); a value of None = nobody knows
     refs = {"airlines": None, "types": None, "retry": 0.0}  # the two reference files
     focus = shown = None  # shown: (photo key, info, jpeg) of the plane on screen
+    logged = None         # the plane last written to the log
     liveries = load_liveries(cfg.planes_liveries)
     log(f"plane art: {sum(map(len, liveries['liveries'].values()))} liveries, "
         f"{len(liveries['blanks'])} blank types" if liveries else
@@ -1594,6 +1724,24 @@ def planes_worker(model):
                     publish()
                 except Exception as e:
                     log(f"plane photo: {e}")
+            art = art_now()
+            if current["hex"] != logged and art is not None:  # into the log, picture settled
+                picture = (art["kind"] if art else "photo" if shown else
+                           "none" if pkey is None or recall("photo", pkey) == (True, None) else None)
+                if picture:
+                    sky = model.sky or {}
+                    v = plane_view(sky)
+                    route = recall("route", cs)[1] if cs else None
+                    log_plane(PLANES_LOG, {
+                        "time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "hex": current["hex"], "callsign": cs, "reg": current["reg"],
+                        "type": current["type"], "model": sky.get("model_name") or "",
+                        "livery": livery_brand(cs, (info or {}).get("link")),
+                        "airline": ((refs["airlines"] or {}).get(airline_code(cs)) or {}).get("name")
+                        or (route or {}).get("airline") or "",
+                        "picture": picture, "art": os.path.basename(art["path"]) if art else "",
+                        "from": v.origin if v else "", "to": v.dest if v else ""})
+                    logged = current["hex"]
         model.planes_wake.wait(cfg.planes_poll)
         model.planes_wake.clear()
 
@@ -2838,6 +2986,10 @@ class BeaconHandler(BaseHTTPRequestHandler):
                                 "python3 pi/claude_display.py --setup-bambu\n")
         elif path == "/usage":
             self._send(200, json.dumps(m.usage_json()) + "\n", "application/json")
+        elif path == "/planes/log":
+            self._send(200, planes_log_html(read_plane_log(PLANES_LOG)), "text/html; charset=utf-8")
+        elif path == "/planes/log.csv":
+            self._send(200, planes_log_csv(read_plane_log(PLANES_LOG)), "text/csv; charset=utf-8")
         elif path == "/":
             self._send(200, ROOT_TEXT)
         else:
@@ -4299,7 +4451,7 @@ class Renderer:
                 cx = x0 + (i // per_col) * ((x1 - x0) / cols)
                 base = top + (i % per_col) * step
                 is_next = nxt and name == F1_SHORT.get(nxt["name"], nxt["name"].upper()[:8])
-                color = COL_ORANGE if is_next else COL_DIM if done else COL_TEXT
+                color = COL_F1 if is_next else COL_DIM if done else COL_TEXT
                 self.text(surf, name, cx, base, size * 0.85, color, bold=True)
                 self.text(surf, when, cx + size * 5.2, base, size * 0.85, color)
 
@@ -4357,7 +4509,7 @@ class Renderer:
         nxt = f.get("next")
         if nxt:
             out.append((f"{nxt['name']} {self.f1_countdown(nxt['start'], now)}  ·  "
-                        f"{self.f1_when(nxt['start'], now)}", COL_ORANGE))
+                        f"{self.f1_when(nxt['start'], now)}", COL_F1))
         else:
             out.append(("race weekend over", COL_DIM))
         if track:
