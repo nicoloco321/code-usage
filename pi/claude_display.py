@@ -68,6 +68,7 @@ except ImportError:
 CONFIG_PATH = os.path.expanduser("~/.config/claude-display/config.ini")
 STATE_PATH = os.path.expanduser("~/.local/state/claude-display/state.json")
 CACHE_DIR = os.path.expanduser("~/.cache/claude-display")  # reference data, re-fetched monthly
+LIVERY_DIR = os.path.expanduser("~/.local/share/claude-display/liveries")  # pi/build_liveries.py
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
@@ -193,6 +194,7 @@ class Config:
         self.planes_lon = num("planes", "lon", 0) if s("planes", "lon") else None
         self.planes_radius = max(2.0, min(60.0, num("planes", "radius_nm", 15)))
         self.planes_poll = max(5.0, num("planes", "poll_seconds", 10))
+        self.planes_liveries = os.path.expanduser(s("planes", "liveries") or LIVERY_DIR)
 
     @property
     def planes_ready(self):
@@ -1362,6 +1364,55 @@ def nice_model(desc):
     return " ".join(words)
 
 
+# Regional airlines fly in a mainline brand's livery. These fly for just one;
+# the shared ones (SkyWest, Republic, Air Wisconsin...) fly for several, and
+# the planespotters page of the airframe says which ("n240jq-delta-connection-...").
+REGIONAL_BRANDS = {"EDV": "delta-connection", "ENY": "american-eagle", "PDT": "american-eagle",
+                   "JIA": "american-eagle", "ASH": "united-express", "GJS": "united-express",
+                   "UCA": "united-express", "QXE": "ASA"}
+SHARED_REGIONALS = {"SKW", "RPA", "AWI", "CPZ"}
+BRAND_WORDS = (("united-express", "united-express"), ("delta-connection", "delta-connection"),
+               ("american-eagle", "american-eagle"), ("alaska", "ASA"))
+
+
+def load_liveries(folder):
+    """The aircraft art pi/build_liveries.py made: its index.json plus the
+    folder it's in, or None if it hasn't been built."""
+    try:
+        with open(os.path.join(folder, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(index, dict):
+        return None
+    return {"dir": folder, "liveries": index.get("liveries") or {}, "blanks": index.get("blanks") or {}}
+
+
+def livery_brand(callsign, photo_link=""):
+    """Whose paint this flight wears: the airline's code, a regional brand
+    like united-express, or "" if there's no telling."""
+    code = airline_code(callsign)
+    if code in SHARED_REGIONALS:
+        slug = (photo_link or "").lower()
+        return next((brand for word, brand in BRAND_WORDS if word in slug), "")
+    return REGIONAL_BRANDS.get(code, code)
+
+
+def plane_art_for(liveries, brand, type_code):
+    """The illustration for this plane: its airline's livery on this exact
+    type, else the type unpainted - {"path", "kind"} - or None, and it's the
+    planespotters photo instead."""
+    if not liveries or not type_code:
+        return None
+    entry, kind = (liveries["liveries"].get(brand) or {}).get(type_code) if brand else None, "livery"
+    if not entry:
+        entry, kind = liveries["blanks"].get(type_code), "blank"
+    if not isinstance(entry, dict) or not entry.get("file"):
+        return None
+    path = os.path.join(liveries["dir"], os.path.basename(entry["file"]))
+    return {"path": path, "kind": kind} if os.path.exists(path) else None
+
+
 def photo_key(plane):
     """What planespotters knows this airframe by: its hex, or failing a real
     ICAO address, its registration."""
@@ -1405,6 +1456,10 @@ def planes_worker(model):
     cache = {}  # (kind, key) -> (expires, value); a value of None = nobody knows
     refs = {"airlines": None, "types": None, "retry": 0.0}  # the two reference files
     focus = shown = None  # shown: (photo key, info, jpeg) of the plane on screen
+    liveries = load_liveries(cfg.planes_liveries)
+    log(f"plane art: {sum(map(len, liveries['liveries'].values()))} liveries, "
+        f"{len(liveries['blanks'])} blank types" if liveries else
+        f"plane art: none in {cfg.planes_liveries} - photos only (see pi/build_liveries.py)")
 
     def remember(kind, key, value, ttl):
         cache[(kind, key)] = (time.monotonic() + ttl, value)
@@ -1452,16 +1507,31 @@ def planes_worker(model):
         pkey = photo_key(current) if current else None
         if shown and shown[0] != pkey:
             shown = None
+        # shared regionals: which brand they fly for comes from the photo's page
+        needs_page = airline_code(cs) in SHARED_REGIONALS and pkey is not None
+
+        def art_now():
+            """The illustration to show, None while it depends on a lookup
+            still to come, or False if there's none (so: the photo)."""
+            known, info = recall("photo", pkey) if pkey else (True, None)
+            if needs_page and not known:
+                return None
+            art = plane_art_for(liveries, livery_brand(cs, (info or {}).get("link")), current["type"])
+            return art or False
 
         def publish():
             info = {}
             if current:
                 types = refs["types"] or {}
+                art = art_now()
                 info = {"route": recall("route", cs)[1] if cs else None,
                         "airline": (refs["airlines"] or {}).get(airline_code(cs)),
                         "model_name": nice_model(current["desc"] or types.get(current["type"], "")),
-                        "photo": shown and (shown[1]["link"], shown[2], shown[1]["photographer"]),
-                        "no_photo": pkey is None or recall("photo", pkey) == (True, None)}
+                        "art": art or None,
+                        "photo": (shown[1]["link"], shown[2], shown[1]["photographer"])
+                                 if art is False and shown else None,
+                        "no_photo": art is False and (pkey is None or
+                                                      recall("photo", pkey) == (True, None))}
             model.set_sky({"home": home, "radius": cfg.planes_radius, "planes": planes,
                            "source": source,
                            "focus": current and dict(current, trail=list(trails[current["hex"]])),
@@ -1473,7 +1543,7 @@ def planes_worker(model):
             if airline_code(cs) and not recall("route", cs)[0]:
                 steps.append(("route", cs, lambda: lookup_route(cs, current["lat"], current["lon"]),
                               ROUTE_TTL))
-            if pkey and not recall("photo", pkey)[0]:
+            if pkey and not recall("photo", pkey)[0] and (needs_page or not art_now()):
                 steps.append(("photo", pkey, lambda: lookup_photo(pkey), PHOTO_TTL))
             for kind, key, lookup, ttl in steps:
                 try:
@@ -1495,7 +1565,7 @@ def planes_worker(model):
                     log(f"plane reference data: {e}")
                     refs["retry"] = time.monotonic() + 3600
             info = pkey and recall("photo", pkey)[1]
-            if info and not shown:
+            if info and not shown and art_now() is False:  # no art for it: the photo
                 try:
                     shown = (pkey, info, download_photo(info))
                     publish()
@@ -1799,8 +1869,9 @@ def demo_plane_photo():
     return buf.getvalue()
 
 
-def demo_sky(model, t, start, photo):
-    """A United 737 crossing westbound about every 5 minutes, plus a neighbour."""
+def demo_sky(model, t, start, photo, liveries=None):
+    """A United 737 crossing westbound about every 5 minutes, plus a neighbour
+    - in its livery if pi/build_liveries.py's art is installed."""
     lat0, lon0 = model.cfg.planes_lat, model.cfg.planes_lon
     k = ((t - start) / 300) % 1.0
     plat, plon = lat0 + 0.05, lon0 + 0.25 - 0.5 * k
@@ -1824,6 +1895,7 @@ def demo_sky(model, t, start, photo):
             "airline": "", "airline_iata": ""},
         "airline": {"name": "United Airlines", "iata": "UA"},
         "model_name": nice_model(plane["desc"]), "no_photo": False,
+        "art": plane_art_for(liveries, "UAL", plane["type"]),
         "photo": ("https://www.planespotters.net/", photo, "demo photo")})
 
 
@@ -1833,11 +1905,12 @@ def demo_worker(model):
     art = demo_art()
     model.set_art("demo:art", art)
     photo = demo_plane_photo()
+    liveries = load_liveries(model.cfg.planes_liveries)
     start = time.time()
     while True:
         t = time.time()
         now = datetime.datetime.now().astimezone()
-        demo_sky(model, t, start, photo)
+        demo_sky(model, t, start, photo, liveries)
         done = ((t - start) / 600) % 1.0  # a 10-minute "print" on loop
         model.update_printer({
             "gcode_state": "RUNNING", "subtask_name": "Articulated Dragon.3mf",
@@ -1984,6 +2057,7 @@ class Renderer:
         self.photo_url = None  # the plane photo currently decoded
         self.photo_img = None
         self.qr_link = self.qr_grid = self.qr_key = self.qr_surf = None  # its page, as a QR
+        self.plane_art_key = self.plane_art_img = None  # the plane's illustration, scaled
         self.font_paths = fonts
         self.fonts = {}
         self.text_cache = {}
@@ -2288,6 +2362,7 @@ class Renderer:
                            for p in sky.get("planes") or [])
             return key + (snap.sky is None, plane, others, repr(sky.get("route")),
                           repr(sky.get("airline")), sky.get("model_name"), sky.get("no_photo"),
+                          (sky.get("art") or {}).get("path"),
                           (sky.get("photo") or (None,))[0], snap.planes_status, snap.thinking)
         if snap.mode == "bambu":
             # only what's drawn, so fan speeds and wifi strength don't cause redraws
@@ -3079,6 +3154,46 @@ class Renderer:
             color = COL_RED if v.alert and i == 0 else COL_DIM
             self.text(surf, self.fit(item, x1 - x0, size), x0, base + i * step, size, color)
 
+    def plane_art(self, surf, rect, sky):
+        """pi/build_liveries.py's side view of this plane - its livery, or
+        the type unpainted - fitted into rect. True if there was one."""
+        art = sky.get("art") if sky.get("focus") else None
+        if not art:
+            return False
+        key = (art["path"], rect.size)
+        if self.plane_art_key != key:
+            self.plane_art_key, self.plane_art_img = key, None
+            try:
+                img = pygame.image.load(art["path"]).convert_alpha()
+                k = min(rect.w / img.get_width(), rect.h / img.get_height())
+                self.plane_art_img = pygame.transform.smoothscale(
+                    img, (max(1, round(img.get_width() * k)), max(1, round(img.get_height() * k))))
+            except Exception as e:
+                log(f"could not load {art['path']}: {e}")
+        img = self.plane_art_img
+        if img is None:
+            return False
+        surf.blit(img, (rect.x + (rect.w - img.get_width()) // 2,
+                        rect.y + (rect.h - img.get_height()) // 2))
+        return True
+
+    def plane_picture(self, surf, sky, art, photo, qr_at, credit, label=None, empty=None):
+        """The plane's picture: its illustration in the rect `art`; failing
+        that, the planespotters photo in `photo` with the QR code of its page
+        at qr_at, which their terms ask for (label(qr size) places "scan for
+        the full photo"). credit = (x, base, width, size) of the credit line."""
+        sky = sky or {}
+        x, base, w, size = credit
+        if self.plane_art(surf, art, sky):
+            text = ("illustration © Norebbo" if sky["art"]["kind"] == "livery"
+                    else "blank livery · illustration © Norebbo")
+            self.text(surf, self.fit(text, w, size), x, base, size, COL_DIM)
+            return
+        qr = self.plane_photo(surf, photo, sky, qr_at=qr_at, empty=empty)
+        if qr and label:
+            self.qr_label(surf, *label(qr))
+        self.plane_credit(surf, sky, qr, x, base, w, size)
+
     def plane_credit(self, surf, sky, qr, x, base, w, size):
         """planespotters' terms: the photographer, by name, next to the photo."""
         if qr:
@@ -3102,15 +3217,14 @@ class Renderer:
     def _planes_bar(self, surf, snap, now):
         sky = snap.sky or {}
         v = plane_view(sky)
-        qr = self.plane_photo(surf, self.rect(28, 30, 258, 172), sky, qr_at=(298, 30, 100),
-                              empty=self.rect(28, 30, 368, 172))
-        if qr:
-            self.qr_label(surf, 298 + qr / 2, 30 + qr + 22, 13, align="c")
-        self.plane_credit(surf, sky, qr, 28, 228, 368, 14)
-        surf.fill(COL_CARD, self.rect(416, 40, 2, 196))
+        self.plane_picture(surf, sky, self.rect(24, 26, 428, 186), self.rect(24, 30, 300, 172),
+                           (340, 30, 100), (24, 236, 428, 14),
+                           label=lambda qr: (340 + qr / 2, 30 + qr + 22, 13, "c"),
+                           empty=self.rect(24, 30, 428, 172))
+        surf.fill(COL_CARD, self.rect(470, 40, 2, 196))
         surf.fill(COL_CARD, self.rect(1124, 40, 2, 196))
         self.radar(surf, sky, 1290, 150, 124)
-        x0, x1 = 446, 1098
+        x0, x1 = 498, 1098
         if not v:
             self.quiet_sky(surf, snap, x0, 130, 44)
         else:
@@ -3125,10 +3239,9 @@ class Renderer:
         self._header_landscape(surf, now, "planes",
                                f"within {sky.get('radius', self.PLANES_DEFAULT_NM):.0f} nm of you")
         v = plane_view(sky)
-        qr = self.plane_photo(surf, self.rect(32, 126, 228, 152), sky, qr_at=(32, 312, 100))
-        self.plane_credit(surf, sky, qr, 32, 298, 228, 12)
-        if qr:
-            self.qr_label(surf, 32 + qr + 12, 312 + qr / 2 - 4, 13)
+        self.plane_picture(surf, sky, self.rect(32, 126, 228, 152), self.rect(32, 126, 228, 152),
+                           (32, 312, 100), (32, 298, 228, 12),
+                           label=lambda qr: (32 + qr + 12, 312 + qr / 2 - 4, 13))
         self.radar(surf, sky, 668, 262, 100, label=14)
         x0, x1 = 282, 556
         if not v:
@@ -3140,7 +3253,8 @@ class Renderer:
         self.plane_stats(surf, v, x0, x1, 286, 15, lines=4, step=21)
 
     def _planes_portrait(self, surf, snap, now):
-        # too small for a scannable QR code, so no photo either (see plane_photo)
+        # the illustration if there is one, else the radar: too small for a
+        # photo's QR code (see plane_photo)
         sky = snap.sky or {}
         s = self.n(34)
         icon = self._ss(("title-plane",), s, s,
@@ -3151,7 +3265,10 @@ class Renderer:
         self.text(surf, f"within {sky.get('radius', self.PLANES_DEFAULT_NM):.0f} nm", 72, 47, 11,
                   COL_DIM)
         v = plane_view(sky)
-        self.radar(surf, sky, 90, 124, 58, label=9)
+        if self.plane_art(surf, self.rect(12, 66, 156, 100), sky):
+            self.text(surf, "illustration © Norebbo", 12, 178, 8, COL_DIM)
+        else:
+            self.radar(surf, sky, 90, 124, 58, label=9)
         if not v:
             self.quiet_sky(surf, snap, 90, 222, 15, align="c")
             return
@@ -3171,10 +3288,9 @@ class Renderer:
         self.text(surf, f"within {sky.get('radius', self.PLANES_DEFAULT_NM):.0f} nm of you", 160,
                   224, 20, COL_DIM, align="c")
         v = plane_view(sky)
-        qr = self.plane_photo(surf, self.rect(24, 250, 272, 181), sky, qr_at=(24, 476, 100))
-        self.plane_credit(surf, sky, qr, 24, 458, 272, 14)
-        if qr:
-            self.qr_label(surf, 24 + qr + 14, 476 + qr / 2 - 4, 16)
+        self.plane_picture(surf, sky, self.rect(24, 250, 272, 181), self.rect(24, 250, 272, 181),
+                           (24, 476, 100), (24, 458, 272, 14),
+                           label=lambda qr: (24 + qr + 14, 476 + qr / 2 - 4, 16))
         self.radar(surf, sky, 160, 1022, 132, label=18)
         if v:
             self.plane_head(surf, v, 24, 296, 642, 60, 18)

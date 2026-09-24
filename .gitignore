@@ -2,5 +2,5 @@
 firmware/.vscode
 .claude
 __pycache__/
-
-
+# pi/build_liveries.py output - Norebbo art, personal use only, never commit it
+out/

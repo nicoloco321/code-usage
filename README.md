@@ -394,9 +394,8 @@ the screen from its own Power port.
   while the printer screen is showing. If the printer refuses a correct code,
   newer firmware may need **LAN Only Mode** with **Developer Mode** turned on.
 - **Planes overhead.** A fourth screen follows the nearest aircraft in the
-  air around you. On the left is a photo of that exact airframe, so you see
-  its real livery, with the photographer's credit and a QR code you can scan
-  for the full-size photo. In the middle, its destination airport is the
+  air around you. On the left is a side view of the plane in its airline's
+  livery, gear up (see **Aircraft art** below). In the middle, its destination airport is the
   headline, with the airport's name, the flight number and airline, a line
   showing how far along the route it is and the miles left, then the aircraft
   (type, registration, year built), altitude with climb/descent, speed,
@@ -425,12 +424,33 @@ the screen from its own Power port.
     [Virtual Radar Server's standing data](https://github.com/vradarserver/standing-data)
     and [tar1090-db](https://github.com/wiedehopf/tar1090-db). They're
     downloaded once and kept in `~/.cache/claude-display`, refreshed monthly.
-  - **Photos** come from [Planespotters.net](https://www.planespotters.net).
-    Their terms ask for the photographer's name, a QR code to the photo's
-    page on a screen you can't click, and that the image is only kept in
-    memory while it's shown. So it's never saved to the SD card, and it's
-    dropped when you leave the screen. On the small portrait layout there's
-    no room for a scannable code, so it shows the radar instead of the photo.
+  - **Aircraft art** is [Norebbo](https://www.norebbo.com)'s side-view
+    illustrations: the airline's livery on that exact type, else the type
+    in blank white livery, else a photo (below). Regional flights get
+    their brand's paint (a SkyWest E175 flying as United Express shows the
+    United Express livery). There are about 80 liveries: United, American,
+    Delta, Southwest, Alaska, the regionals, and the international carriers
+    at IAD. There are about 110 blank types, including private jets
+    (Gulfstream G550/G650, Global 5000/7500, Learjet 45/60, Falcon 50,
+    Citation X, King Air). Norebbo's art is for personal use, so it isn't in
+    this repo. Build it on your PC and copy it to the Pi:
+
+    ```sh
+    pip install pillow numpy scipy
+    python3 pi/build_liveries.py out/liveries
+    scp -r out/liveries nico@claude-display.local:.local/share/claude-display/
+    ```
+
+    It downloads each illustration once, cuts out the gear-up plane onto a
+    transparent background, and writes the PNGs and an `index.json`. `out/`
+    is gitignored; don't share the images.
+  - **Photos** come from [Planespotters.net](https://www.planespotters.net)
+    when there's no illustration for the type. Their terms ask for the
+    photographer's name, a QR code to the photo's page on a screen you
+    can't click, and that the image is only kept in memory while it's shown.
+    So only a photo gets a QR code, it's never saved to the SD card, and
+    it's dropped when you leave the screen. The small portrait layout has no
+    room for a scannable code, so it shows the radar there instead of a photo.
 
   It only polls while the planes screen is showing: every 10 s for positions,
   with the rest looked up once per plane and cached.
