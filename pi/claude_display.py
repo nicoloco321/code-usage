@@ -89,12 +89,20 @@ COL_SUB = (175, 175, 175)     # artist names: between the title and the dim deta
 COL_GREEN = (57, 186, 82)
 COL_YELLOW = (222, 162, 66)
 COL_RED = (230, 81, 74)
-COL_SPOTIFY = (29, 185, 84)
+COL_SPOTIFY = (30, 215, 96)   # Spotify green (#1ED760)
 COL_BAMBU = (35, 165, 67)     # Bambu Lab green
 COL_EYE = (0, 0, 0)
 
 # The screens, in the order a tap or /mode/toggle cycles through them.
 MODES = ("usage", "spotify", "bambu")
+
+# The Spotify mark's three strokes, measured off the logo, in units of the
+# circle's radius from its centre: (start, bend, end, width at start, at end).
+SPOTIFY_ARCS = [
+    ((-0.59, -0.335), (0.02, -0.4765), (0.63, -0.20), 0.185, 0.205),
+    ((-0.54, 0.0), (-0.015, -0.1355), (0.51, 0.115), 0.155, 0.172),
+    ((-0.516, 0.29), (-0.058, 0.185), (0.40, 0.40), 0.121, 0.138),
+]
 
 # The Bambu Lab mark: two columns, each cut by a slanted gap - four panels,
 # in units of a 442 x 574 box.
@@ -943,6 +951,7 @@ def printer_view(p, now):
     for ext in (".gcode.3mf", ".3mf", ".gcode"):
         if job.lower().endswith(ext):
             job = job[:-len(ext)]
+    job = job.replace("_", " ").strip()  # file-style names read better with spaces
     pct = p.get("mc_percent")
     pct = max(0, min(100, int(pct))) if isinstance(pct, (int, float)) else None
     if state == "FINISH":
@@ -1421,12 +1430,16 @@ class Renderer:
 
     @staticmethod
     def _logo(big, cx, cy, radius, color, bg):
-        # flat take on the three "sound wave" bars of the Spotify mark (firmware r=20)
-        u = radius / 20.0
+        """The Spotify mark: three curved strokes with round ends, drawn as
+        circles stamped along a curve so each can thicken toward its right end."""
         pygame.draw.circle(big, color, (cx, cy), radius)
-        for x0, y0, w in ((-13, -9, 27), (-11, -1, 22), (-8, 7, 17)):
-            pygame.draw.rect(big, bg, pygame.Rect(cx + x0 * u, cy + y0 * u, w * u, 4 * u),
-                             border_radius=int(2 * u))
+        for (x0, y0), (xc, yc), (x1, y1), w0, w1 in SPOTIFY_ARCS:
+            for i in range(97):
+                t, s = i / 96, 1 - i / 96  # quadratic Bezier from start to end
+                x = s * s * x0 + 2 * s * t * xc + t * t * x1
+                y = s * s * y0 + 2 * s * t * yc + t * t * y1
+                pygame.draw.circle(big, bg, (cx + x * radius, cy + y * radius),
+                                   radius * (w0 + (w1 - w0) * t) / 2)
 
     def spotify_logo(self, surf, cx, cy, radius):
         d = self.n(2 * radius)
@@ -1596,6 +1609,12 @@ class Renderer:
     def width(self, s, size, bold=False):
         """Width of s in design units."""
         return self.font(size, bold).size(s)[0] / self.s
+
+    def fit_size(self, s, max_w, size, bold=False, smallest=24):
+        """The largest font size up to `size` at which s fits in max_w."""
+        while size > smallest and self.width(s, size, bold) > max_w:
+            size -= 2
+        return size
 
     def _session_panel(self, surf, snap, x, y, w, h, k=1.0, visible=None):
         """What each Claude Code session is up to, laid out in the box
@@ -1866,8 +1885,9 @@ class Renderer:
                           xb, top + 24, 20, COL_DIM, align="r")
             self.bar(surf, self.rect(x0, top + 36, xb - x0, 46),
                      None if pct is None else pct / 100, bar_color(pct), 14, fast=moving)
-            self.text(surf, "--" if pct is None else f"{round(pct)}%", x1, top + 79, 54,
-                      COL_TEXT, bold=True, align="r")
+            label = "--" if pct is None else f"{round(pct)}%"
+            size = self.fit_size(label, x1 - xb - 16, 54, bold=True)  # "100%" in a wide font
+            self.text(surf, label, x1, top + 79, size, COL_TEXT, bold=True, align="r")
         self._clock_bar(surf, now)
 
     def _spotify_bar(self, surf, snap, now):
@@ -1974,8 +1994,9 @@ class Renderer:
                       COL_TEXT, bold=True)
             self.bar(surf, self.rect(x0, 92, xb - x0, 62),
                      None if v.pct is None else v.pct / 100, v.bar, 16)
-            self.text(surf, "--" if v.pct is None else f"{v.pct}%", x1, 148, 60, COL_TEXT,
-                      bold=True, align="r")
+            label = "--" if v.pct is None else f"{v.pct}%"
+            size = self.fit_size(label, x1 - xb - 16, 60, bold=True)  # "100%" in a wide font
+            self.text(surf, label, x1, 148, size, COL_TEXT, bold=True, align="r")
             if v.layers:
                 self.text(surf, v.layers, x0, 206, 22, COL_DIM)
             right = "  ·  ".join(x for x in (v.left, v.eta) if x)
