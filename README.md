@@ -393,6 +393,47 @@ the screen from its own Power port.
   (MQTT over TLS on port 8883) directly: no Bambu cloud login, and only
   while the printer screen is showing. If the printer refuses a correct code,
   newer firmware may need **LAN Only Mode** with **Developer Mode** turned on.
+- **Planes overhead.** A fourth screen follows the nearest aircraft in the
+  air around you. On the left is a photo of that exact airframe, so you see
+  its real livery, with the photographer's credit and a QR code you can scan
+  for the full-size photo. In the middle, its destination airport is the
+  headline, with the airport's name, the flight number and airline, a line
+  showing how far along the route it is and the miles left, then the aircraft
+  (type, registration, year built), altitude with climb/descent, speed,
+  heading and how far away it is. An emergency squawk (7500/7600/7700) shows
+  in red. On the right, a radar, north up, centred on you, shows every plane
+  around, the followed one's trail, a dashed line along its heading for the
+  next four minutes, and a notch pointing toward where it's headed. Set your
+  location once:
+
+  ```sh
+  python3 pi/claude_display.py --setup-planes
+  ```
+
+  It suggests a spot from your IP (rough), takes exact coordinates if you
+  paste them (right-click your house in Google Maps), checks the feed, and
+  saves them to config.ini. Restart the display, then tap through, or
+  `POST /mode/planes`. All the sources are free and need no account:
+  - **Positions** come from [adsb.fi](https://adsb.fi)'s open data, falling
+    back to [adsb.lol](https://adsb.lol) if it's down. The feed in use is
+    named in the status line.
+  - **Routes** come from [adsb.im](https://adsb.im), then
+    [adsbdb](https://www.adsbdb.com). A route only shows when the plane
+    really is near it, because flight numbers get reused and route data can
+    be stale. Private planes and helicopters show "route unknown".
+  - **Airline and aircraft-type names** come from two reference lists,
+    [Virtual Radar Server's standing data](https://github.com/vradarserver/standing-data)
+    and [tar1090-db](https://github.com/wiedehopf/tar1090-db). They're
+    downloaded once and kept in `~/.cache/claude-display`, refreshed monthly.
+  - **Photos** come from [Planespotters.net](https://www.planespotters.net).
+    Their terms ask for the photographer's name, a QR code to the photo's
+    page on a screen you can't click, and that the image is only kept in
+    memory while it's shown. So it's never saved to the SD card, and it's
+    dropped when you leave the screen. On the small portrait layout there's
+    no room for a scannable code, so it shows the radar instead of the photo.
+
+  It only polls while the planes screen is showing: every 10 s for positions,
+  with the rest looked up once per plane and cached.
 - Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
   `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
   `rotate` for a monitor mounted on its side. Apply changes with
@@ -421,7 +462,7 @@ Windows notification area, next to the clock:
   times.
 - Clawd **walks** while Claude is working, on any of your machines.
 - **Left-click** cycles the display through its screens (usage, Spotify,
-  3D printer); the menu lists them all.
+  3D printer, planes overhead); the menu lists them all.
 - **Track Claude with hooks (exact)** installs or removes the
   [Claude Code hooks](#option-a--claude-code-hooks-recommended). While they're
   installed, the tray runs their watcher: it catches Esc interrupts and keeps

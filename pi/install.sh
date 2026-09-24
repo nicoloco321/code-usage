@@ -114,6 +114,12 @@ if [ -z "$(conf_get bambu access_code)" ] && interactive \
     || echo "Printer setup didn't finish - run it again later: python3 pi/claude_display.py --setup-bambu"
 fi
 
+if [ -z "$(conf_get planes lat)" ] && interactive \
+   && ask "Set up the optional planes-overhead screen now (it asks for your location)?" n; then
+  python3 "$APP" --setup-planes --config "$CONF" \
+    || echo "Planes setup didn't finish - run it again later: python3 pi/claude_display.py --setup-planes"
+fi
+
 NEED_REBOOT=0
 if [ "$(hostname)" != "$WANT_HOSTNAME" ] \
    && ask "Rename this Pi to '$WANT_HOSTNAME' so it answers at $WANT_HOSTNAME.local?" y; then

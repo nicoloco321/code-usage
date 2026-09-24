@@ -7,7 +7,7 @@ helper - that sits next to the clock and:
   - shows your 5-hour / weekly usage at a glance: a meter under Clawd in the
     icon (or the 5-hour % itself), the numbers in the tooltip and menu
   - walks Clawd while Claude is working, on any of your machines
-  - switches the display between its usage, Spotify and 3D printer screens
+  - switches the display between its usage, Spotify, 3D printer and planes screens
     (left-click the icon to cycle, or pick one from the menu)
   - tells the display exactly when Claude Code is working on this PC: one
     click installs the Claude Code hooks (server/display_hook.py), and the
@@ -509,6 +509,8 @@ class TrayApp:
                  checked=lambda _: self.mode == "spotify", enabled=lambda _: self.online),
             Item("3D printer screen", self.on_mode("bambu"), radio=True,
                  checked=lambda _: self.mode == "bambu", enabled=lambda _: self.online),
+            Item("Planes overhead screen", self.on_mode("planes"), radio=True,
+                 checked=lambda _: self.mode == "planes", enabled=lambda _: self.online),
             Menu.SEPARATOR,
             Item("Track Claude with hooks (exact)", self.on_hooks,
                  checked=lambda _: hooks_status()["ours"] is not None,
@@ -531,11 +533,14 @@ class TrayApp:
                 if code == 409 and what == "bambu":
                     self.notify("The printer isn't set up on the display yet - run "
                                 "claude_display.py --setup-bambu on the Pi.")
+                elif code == 409 and what == "planes":
+                    self.notify("The planes screen needs your location first - run "
+                                "claude_display.py --setup-planes on the Pi.")
                 elif code == 409:
                     self.notify("Spotify isn't set up on the display yet - see the README.")
                 elif code == 404:
-                    self.notify("This display doesn't have that screen (the 3D printer "
-                                "screen is in the Raspberry Pi app).")
+                    self.notify("This display doesn't have that screen (the 3D printer and "
+                                "planes screens are in the Raspberry Pi app).")
             self.post_async(f"/mode/{what}", result)
         return switch
 

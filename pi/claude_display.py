@@ -9,9 +9,9 @@ official touchscreen:
     OAuth usage API with a dedicated login (server/device_login.py)
   - a spinner while Claude is working, driven by the same HTTP beacons
     (POST /thinking/on, /thinking/off) from Claude Code hooks or beacon.py
-  - an optional Spotify now-playing screen, and an optional 3D printer screen
-    with a Bambu Lab print's progress (POST /mode/spotify, /mode/bambu,
-    /mode/usage, /mode/toggle - or just tap the screen)
+  - optional screens for Spotify's now playing, a Bambu Lab print's
+    progress, and the planes flying overhead (POST /mode/spotify,
+    /mode/bambu, /mode/planes, /mode/usage, /mode/toggle - or tap the screen)
 
 It speaks the firmware's HTTP API on the same port, so the hooks, beacon.py,
 find_display.py and the /switch command work unchanged - point them at the Pi.
@@ -22,6 +22,7 @@ reads that).
     python3 pi/claude_display.py --windowed 800x480   # in a window, for testing
     python3 pi/claude_display.py --demo               # fake data, no logins needed
     python3 pi/claude_display.py --setup-bambu        # add your Bambu Lab printer
+    python3 pi/claude_display.py --setup-planes       # your location, for planes overhead
 
 Settings live in ~/.config/claude-display/config.ini (see config.example.ini);
 pi/install.sh sets everything up to start fullscreen on boot. Needs pygame 2
@@ -32,7 +33,9 @@ Keys: tap / click / space switches screens, Ctrl+Q quits (Esc too, windowed).
 
 import argparse
 import configparser
+import csv
 import datetime
+import gzip
 import hashlib
 import io
 import json
@@ -64,6 +67,7 @@ except ImportError:
 
 CONFIG_PATH = os.path.expanduser("~/.config/claude-display/config.ini")
 STATE_PATH = os.path.expanduser("~/.local/state/claude-display/state.json")
+CACHE_DIR = os.path.expanduser("~/.cache/claude-display")  # reference data, re-fetched monthly
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
@@ -76,7 +80,7 @@ SPOTIFY_NOW_URL = ("https://api.spotify.com/v1/me/player/currently-playing"
 
 ROOT_TEXT = ("Claude Code usage display (Raspberry Pi). POST /thinking/on while "
              "working, /thinking/off when done. POST /mode/usage, /mode/spotify, "
-             "/mode/bambu or /mode/toggle to switch screens; GET /mode to ask; "
+             "/mode/bambu, /mode/planes or /mode/toggle to switch screens; GET /mode to ask; "
              "GET /usage for JSON.\n")
 
 # ---- palette: the firmware's RGB565 colours, in full RGB ----
@@ -94,7 +98,7 @@ COL_BAMBU = (35, 165, 67)     # Bambu Lab green
 COL_EYE = (0, 0, 0)
 
 # The screens, in the order a tap or /mode/toggle cycles through them.
-MODES = ("usage", "spotify", "bambu")
+MODES = ("usage", "spotify", "bambu", "planes")
 
 # The Spotify mark's three strokes, measured off the logo, in units of the
 # circle's radius from its centre: (start, bend, end, width at start, at end).
@@ -185,6 +189,14 @@ class Config:
         self.bambu_serial = s("bambu", "serial")
         self.bambu_code = s("bambu", "access_code")
         self.bambu_name = s("bambu", "name")
+        self.planes_lat = num("planes", "lat", 0) if s("planes", "lat") else None
+        self.planes_lon = num("planes", "lon", 0) if s("planes", "lon") else None
+        self.planes_radius = max(2.0, min(60.0, num("planes", "radius_nm", 15)))
+        self.planes_poll = max(5.0, num("planes", "poll_seconds", 10))
+
+    @property
+    def planes_ready(self):
+        return self.planes_lat is not None and self.planes_lon is not None
 
     @property
     def bambu_ready(self):
@@ -405,9 +417,10 @@ def local_ip():
 class Model:
     """Everything on screen, shared by the workers, the HTTP server and the renderer."""
 
-    def __init__(self, cfg, state, spotify_ready, bambu_ready=False):
+    def __init__(self, cfg, state, spotify_ready, bambu_ready=False, planes_ready=False):
         self.cfg, self.state = cfg, state
-        self.ready = {"usage": True, "spotify": spotify_ready, "bambu": bambu_ready}
+        self.ready = {"usage": True, "spotify": spotify_ready, "bambu": bambu_ready,
+                      "planes": planes_ready}
         self.lock = threading.Lock()
         saved = state.get("mode")
         self.mode = saved if self.ready.get(saved) else "usage"
@@ -427,6 +440,8 @@ class Model:
 
         self.printer = None        # Bambu "print" report, merged update by update
         self.printer_status = None
+        self.sky = None            # planes overhead: see planes_worker
+        self.planes_status = None
         self.remote_sessions = {}  # sender -> (monotonic time, [session summaries])
 
         self.last_beacon = 0.0     # monotonic time of the last "thinking" ping, 0 = off
@@ -436,6 +451,7 @@ class Model:
         self.usage_wake = threading.Event()
         self.spotify_wake = threading.Event()
         self.bambu_wake = threading.Event()
+        self.planes_wake = threading.Event()
 
     # -- beacons: "thinking" is sticky between on and off; the TTL is a backstop
     def thinking(self, now=None):
@@ -461,11 +477,15 @@ class Model:
                 self.sp_status = ("fetching spotify...", COL_DIM)
             if mode == "bambu" and self.printer is None:
                 self.printer_status = ("connecting to the printer...", COL_DIM)
+            if mode == "planes" and self.sky is None:
+                self.planes_status = ("looking for planes...", COL_DIM)
         self.state.put("mode", mode)
         if mode == "spotify":
             self.spotify_wake.set()
         elif mode == "bambu":
             self.bambu_wake.set()
+        elif mode == "planes":
+            self.planes_wake.set()
         else:  # back on the usage screen: refresh numbers gone stale off-screen
             now = time.monotonic()
             if now >= self.backoff_until and now - self.usage_ok_at > self.cfg.usage_poll:
@@ -525,6 +545,23 @@ class Model:
         with self.lock:
             self.printer_status = (text, color)
 
+    def set_sky(self, sky):
+        n = len(sky["planes"])
+        with self.lock:
+            self.sky = sky
+            self.planes_status = (f"{n} plane{'s' if n != 1 else ''} within "
+                                  f"{sky['radius']:.0f} nm  ·  data: {sky.get('source') or '?'}",
+                                  COL_GREEN)
+
+    def drop_plane_photo(self):
+        with self.lock:
+            if self.sky and self.sky.get("photo"):
+                self.sky = dict(self.sky, photo=None)
+
+    def set_planes_status(self, text, color):
+        with self.lock:
+            self.planes_status = (text, color)
+
     def set_sessions(self, sender, sessions):
         """Claude Code sessions reported by one machine's hooks (display_hook.py)."""
         def clean(s):
@@ -560,6 +597,7 @@ class Model:
                 printer=self.printer, printer_status=self.printer_status,
                 sessions=self.sessions_now(now),
                 printer_name=self.cfg.bambu_name or "3D printer",
+                sky=self.sky, planes_status=self.planes_status,
                 thinking=self.thinking(now), flash=flash and flash[:2],
                 host=self.host, ip=self.ip, mono=now)
 
@@ -1062,6 +1100,680 @@ def setup_bambu(config_path):
           "reboot), then tap the screen to reach the printer screen.")
 
 
+# ---------------------------------------------------------------- planes overhead
+#
+# Live positions: adsb.fi's open data (personal use, cite adsb.fi; 1 request a
+# second allowed), with adsb.lol (ODbL) standing in when it's down. Routes:
+# adsb.im, then adsbdb - both can be stale for a reused flight number, so a
+# route only counts when the plane is actually near one of its legs. Airline
+# and aircraft-type names come from two reference files cached in CACHE_DIR.
+# Photos: planespotters.net, whose terms want the photographer credited next
+# to the photo, a QR code of the photo's page on a screen nobody can click,
+# and the image kept in memory only while it's on screen - never on disk.
+
+PLANES_FEEDS = (
+    ("adsb.fi", "https://opendata.adsb.fi/api/v3/lat/{lat:.4f}/lon/{lon:.4f}/dist/{radius}"),
+    ("adsb.lol", "https://api.adsb.lol/v2/point/{lat:.4f}/{lon:.4f}/{radius}"),
+)
+ROUTESET_URL = "https://adsb.im/api/0/routeset"
+ROUTE_URL = "https://api.adsbdb.com/v0/callsign/{callsign}"
+AIRLINES_URL = ("https://raw.githubusercontent.com/vradarserver/standing-data/main/"
+                "airlines/schema-01/airlines.csv")
+TYPES_URL = "https://raw.githubusercontent.com/wiedehopf/tar1090-db/master/db/icao_aircraft_types2.js"
+PHOTO_HEX_URL = "https://api.planespotters.net/pub/photos/hex/{hex}"
+PHOTO_REG_URL = "https://api.planespotters.net/pub/photos/reg/{reg}"
+# planespotters wants a way to reach whoever runs a client in its User-Agent
+PLANES_USER_AGENT = "claude-usage-display/1.0 (+https://github.com/nicoloco321/code-usage)"
+NM_PER_MILE = 0.868976
+EARTH_NM = 3440.065
+ROUTE_TTL, UNKNOWN_TTL, PHOTO_TTL = 6 * 3600, 30 * 60, 24 * 3600
+
+# A top-down airliner, nose up, in units of its half-length - the radar's plane.
+PLANE_SHAPE = [(0, -1), (0.1, -0.86), (0.12, -0.3), (0.95, 0.12), (0.95, 0.26),
+               (0.12, 0.08), (0.09, 0.6), (0.38, 0.82), (0.38, 0.94), (0, 0.86),
+               (-0.38, 0.94), (-0.38, 0.82), (-0.09, 0.6), (-0.12, 0.08), (-0.95, 0.26),
+               (-0.95, 0.12), (-0.12, -0.3), (-0.1, -0.86)]
+SQUAWKS = {"7500": "hijack squawk 7500", "7600": "radio failure (7600)",
+           "7700": "emergency squawk 7700"}
+
+
+def distance_nm(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * EARTH_NM * math.asin(min(1.0, math.sqrt(a)))
+
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return math.degrees(math.atan2(y, x)) % 360
+
+
+def compass(deg):
+    return ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[int((deg % 360 + 22.5) // 45) % 8]
+
+
+def get_json(url, body=None, timeout=8):
+    """GET (or POST `body` as JSON) and parse the reply: (status, data or
+    None). Network errors raise."""
+    headers = {"User-Agent": PLANES_USER_AGENT, "Accept": "application/json"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    code, raw, _ = http(url, data=data, headers=headers, timeout=timeout)
+    try:
+        return code, json.loads(raw) if raw else None
+    except ValueError:  # rate-limit and error pages come back as HTML
+        return code, None
+
+
+def fetch_planes(lat, lon, radius_nm, resting=None):
+    """(feed name, aircraft within radius_nm of (lat, lon) as plain dicts).
+    A feed that fails or rate-limits rests for a minute (in `resting`)
+    while the other one stands in - neither is ever retried straight away."""
+    resting = {} if resting is None else resting
+    error = None
+    for name, template in PLANES_FEEDS:
+        if resting.get(name, 0) > time.monotonic():
+            continue
+        try:
+            code, data = get_json(template.format(lat=lat, lon=lon, radius=max(1, round(radius_nm))))
+        except OSError as e:
+            code, data, error = None, None, e
+        if code == 200 and isinstance(data, dict) and isinstance(data.get("ac"), list):
+            return name, [p for p in (parse_plane(a, lat, lon) for a in data["ac"]) if p]
+        if code is not None:
+            error = OSError(f"{name}: HTTP {code}")
+        resting[name] = time.monotonic() + 60
+    raise error or OSError("both plane feeds are resting after errors")
+
+
+def parse_plane(a, home_lat, home_lon):
+    """One aircraft from the feed (readsb's format), or None without a position."""
+    if not isinstance(a, dict):
+        return None
+
+    def num(*keys):
+        return next((a[k] for k in keys if isinstance(a.get(k), (int, float))
+                     and not isinstance(a.get(k), bool)), None)
+
+    lat, lon = num("lat"), num("lon")
+    if lat is None or lon is None:
+        return None
+    alt = num("alt_baro")
+    raw_hex = str(a.get("hex") or "").lower()
+    text = lambda k: str(a.get(k) or "").strip()
+    return {
+        "hex": raw_hex.lstrip("~"),
+        "icao": not raw_hex.startswith("~"),  # "~" marks an address that isn't an ICAO hex
+        "callsign": text("flight").upper(), "reg": text("r").upper(), "type": text("t").upper(),
+        "desc": text("desc"), "year": text("year"),  # these two only from adsb.fi
+        "lat": lat, "lon": lon,
+        "alt": None if alt is None else max(0, int(alt)),  # baro reads < 0 on a high-pressure day
+        "gs": num("gs"), "track": num("track", "true_heading", "mag_heading"),
+        "rate": num("baro_rate", "geom_rate"), "squawk": text("squawk"),
+        "seen": num("seen_pos"),
+        "ground": a.get("alt_baro") == "ground",
+        "dist": distance_nm(home_lat, home_lon, lat, lon),
+        "bearing": bearing_deg(home_lat, home_lon, lat, lon),
+    }
+
+
+def airport(a):
+    """adsb.im and adsbdb name the same things differently."""
+    a = a if isinstance(a, dict) else {}
+    lat, lon = a.get("lat", a.get("latitude")), a.get("lon", a.get("longitude"))
+    return {"iata": a.get("iata") or a.get("iata_code") or "",
+            "icao": a.get("icao") or a.get("icao_code") or "",
+            "name": a.get("name") or "", "city": a.get("location") or a.get("municipality") or "",
+            "lat": lat if isinstance(lat, (int, float)) else None,
+            "lon": lon if isinstance(lon, (int, float)) else None}
+
+
+def lookup_route(callsign, lat, lon):
+    """The airports this callsign's flight stops at, in order, or None if
+    nobody knows it. Whether it fits today's flight is route_leg's call."""
+    try:
+        code, data = get_json(ROUTESET_URL, {"planes": [{"callsign": callsign, "lat": lat, "lng": lon}]})
+        r = data[0] if code == 200 and isinstance(data, list) and data else None
+    except OSError:
+        r = None
+    if isinstance(r, dict) and isinstance(r.get("_airports"), list) and len(r["_airports"]) > 1:
+        return {"airports": [airport(a) for a in r["_airports"]], "airline": "", "airline_iata": ""}
+    code, data = get_json(ROUTE_URL.format(callsign=urllib.parse.quote(callsign)))
+    fr = data.get("response") if isinstance(data, dict) else None
+    fr = fr.get("flightroute") if isinstance(fr, dict) else None
+    if not isinstance(fr, dict):
+        if code in (200, 404):  # 404 = "unknown callsign"
+            return None
+        raise OSError(f"adsbdb: HTTP {code}")
+    airline = fr.get("airline") if isinstance(fr.get("airline"), dict) else {}
+    stops = [fr.get(k) for k in ("origin", "midpoint", "destination")]
+    return {"airports": [airport(a) for a in stops if isinstance(a, dict)],
+            "airline": airline.get("name") or "", "airline_iata": airline.get("iata") or ""}
+
+
+def leg_offset(a, b, lat, lon):
+    """How far (nm) the point is from the great-circle leg a -> b."""
+    d13 = distance_nm(a["lat"], a["lon"], lat, lon)
+    d12 = distance_nm(a["lat"], a["lon"], b["lat"], b["lon"])
+    if d12 < 1:
+        return d13
+    t = math.radians(bearing_deg(a["lat"], a["lon"], lat, lon)
+                     - bearing_deg(a["lat"], a["lon"], b["lat"], b["lon"]))
+    xt = math.asin(max(-1.0, min(1.0, math.sin(d13 / EARTH_NM) * math.sin(t))))
+    along = math.acos(max(-1.0, min(1.0, math.cos(d13 / EARTH_NM) / math.cos(xt)))) * EARTH_NM
+    if math.cos(t) < 0 or along > d12:  # beyond an end: how far from the nearer end
+        return min(d13, distance_nm(b["lat"], b["lon"], lat, lon))
+    return abs(xt) * EARTH_NM
+
+
+def route_leg(airports, lat, lon, track=None):
+    """The leg of a (maybe multi-stop) route this plane is flying, as
+    (origin, dest, progress 0..1, nm to go) - or None when it's nowhere near
+    any leg, which means the route data doesn't fit today's flight."""
+    best = None
+    for a, b in zip(airports, airports[1:]):
+        if None in (a["lat"], a["lon"], b["lat"], b["lon"]):
+            continue
+        leg = distance_nm(a["lat"], a["lon"], b["lat"], b["lon"])
+        off = leg_offset(a, b, lat, lon)
+        if off > max(50.0, 0.2 * leg):
+            continue
+        score = off
+        if track is not None:  # at a stop both legs are close: take the one it's flying
+            turn = abs((bearing_deg(lat, lon, b["lat"], b["lon"]) - track + 180) % 360 - 180)
+            score += 25 if turn > 100 else 0
+        flown = distance_nm(a["lat"], a["lon"], lat, lon)
+        left = distance_nm(lat, lon, b["lat"], b["lon"])
+        if best is None or score < best[0]:
+            best = (score, a, b, flown / (flown + left) if flown + left else 0.0, left)
+    return best and best[1:]
+
+
+def airline_code(callsign):
+    """"UAL1234" -> "UAL"; "" for registrations and other non-airline callsigns."""
+    return callsign[:3] if re.match(r"^[A-Z]{3}\d", callsign or "") else ""
+
+
+def cached_download(url, name, max_age=30 * 86400):
+    """A reference file, kept in CACHE_DIR and fetched again once it's a
+    month old - a stale copy beats none when the fetch fails."""
+    path = os.path.join(CACHE_DIR, name)
+    try:
+        fresh = time.time() - os.path.getmtime(path) < max_age
+    except OSError:
+        fresh = None  # no copy yet
+    if not fresh:
+        try:
+            code, raw, _ = http(url, headers={"User-Agent": PLANES_USER_AGENT}, timeout=20)
+            if code != 200 or not raw:
+                raise OSError(f"{name}: HTTP {code}")
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(path + ".tmp", "wb") as f:
+                f.write(raw)
+            os.replace(path + ".tmp", path)
+            return raw
+        except OSError:
+            if fresh is None:
+                raise
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def load_airlines():
+    """Airline ICAO code -> {"name", "iata"}, from Virtual Radar Server's
+    standing data (about 180 KB; fresher IATA codes than adsbdb's)."""
+    text = cached_download(AIRLINES_URL, "airlines.csv").decode("utf-8-sig")
+    airlines = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        icao = (row.get("ICAO") or "").strip().upper()
+        if icao and icao not in airlines:
+            airlines[icao] = {"name": (row.get("Name") or "").strip(),
+                              "iata": (row.get("IATA") or "").strip()}
+    return airlines
+
+
+def load_type_names():
+    """ICAO type code -> "BOEING 737 MAX 8", from tar1090-db (about 33 KB).
+    Only needed when the feed didn't say (adsb.lol doesn't)."""
+    raw = cached_download(TYPES_URL, "aircraft_types.json.gz")
+    if raw[:2] == b"\x1f\x8b":  # it's gzip despite the name
+        raw = gzip.decompress(raw)
+    data = json.loads(raw)
+    return {k: v[0] for k, v in data.items() if isinstance(v, list) and v and isinstance(v[0], str)}
+
+
+def nice_model(desc):
+    """"BOEING 737 MAX 8" -> "Boeing 737 MAX 8": the registry shouts the
+    maker's name; the model part is fine as it is."""
+    words = (desc or "").split()
+    for i, w in enumerate(words):
+        if w == "DE":
+            words[i] = "de"  # de Havilland
+        elif w.isalpha() and w.isupper() and len(w) > 3:
+            words[i] = "Mc" + w[2:].capitalize() if w.startswith("MC") else w.capitalize()
+        else:
+            break
+    return " ".join(words)
+
+
+def photo_key(plane):
+    """What planespotters knows this airframe by: its hex, or failing a real
+    ICAO address, its registration."""
+    if plane["icao"] and plane["hex"]:
+        return "hex", plane["hex"]
+    return ("reg", plane["reg"]) if plane["reg"] else None
+
+
+def lookup_photo(key):
+    """planespotters' newest photo of this very airframe: {"src", "link",
+    "photographer"}, or None if nobody has photographed it yet."""
+    kind, value = key
+    url = (PHOTO_HEX_URL if kind == "hex" else PHOTO_REG_URL).format(
+        **{kind: urllib.parse.quote(value)})
+    code, data = get_json(url)
+    if code != 200 or not isinstance(data, dict):
+        raise OSError(f"planespotters: HTTP {code}")
+    photos = data.get("photos")
+    if data.get("error") or not isinstance(photos, list) or not photos or not isinstance(photos[0], dict):
+        return None
+    p = photos[0]
+    img = p.get("thumbnail_large") or p.get("thumbnail")
+    if not (isinstance(img, dict) and img.get("src") and p.get("link")):
+        return None
+    return {"src": img["src"], "link": p["link"], "photographer": str(p.get("photographer") or "unknown")}
+
+
+def download_photo(info):
+    """The JPEG itself - kept in memory while it's on screen, never saved."""
+    code, body, _ = http(info["src"], headers={"User-Agent": PLANES_USER_AGENT}, timeout=10)
+    if code != 200 or not body:
+        raise OSError(f"photo download: HTTP {code}")
+    return body
+
+
+def planes_worker(model):
+    """While the planes screen is up, follow the nearest airborne aircraft."""
+    cfg = model.cfg
+    home = (cfg.planes_lat, cfg.planes_lon)
+    trails, resting = {}, {}
+    cache = {}  # (kind, key) -> (expires, value); a value of None = nobody knows
+    refs = {"airlines": None, "types": None, "retry": 0.0}  # the two reference files
+    focus = shown = None  # shown: (photo key, info, jpeg) of the plane on screen
+
+    def remember(kind, key, value, ttl):
+        cache[(kind, key)] = (time.monotonic() + ttl, value)
+        if len(cache) > 500:
+            now = time.monotonic()
+            for k in [k for k, (t, _) in cache.items() if t < now] or list(cache)[:100]:
+                del cache[k]
+
+    def recall(kind, key):
+        """(known, value)"""
+        hit = cache.get((kind, key))
+        return (True, hit[1]) if hit and hit[0] > time.monotonic() else (False, None)
+
+    while True:
+        if model.mode != "planes":
+            shown = None  # planespotters: in memory only while it's on screen
+            model.drop_plane_photo()
+            model.planes_wake.wait()
+            model.planes_wake.clear()
+            continue
+        try:
+            source, planes = fetch_planes(*home, cfg.planes_radius, resting)
+        except Exception as e:
+            log(f"plane feed: {e}")
+            model.set_planes_status("plane feed unreachable - retrying", COL_RED)
+            model.planes_wake.wait(20)
+            model.planes_wake.clear()
+            continue
+        planes = [p for p in planes if not p["ground"] and (p["seen"] is None or p["seen"] <= 30)]
+        seen = {p["hex"] for p in planes}
+        for hex_id in [h for h in trails if h not in seen]:
+            del trails[hex_id]
+        for p in planes:
+            trail = trails.setdefault(p["hex"], [])
+            if not trail or trail[-1] != (p["lat"], p["lon"]):
+                trail.append((p["lat"], p["lon"]))
+                del trail[:-40]
+        # the nearest plane - but don't flip back and forth between two
+        nearest = min(planes, key=lambda p: p["dist"], default=None)
+        current = next((p for p in planes if p["hex"] == focus), None)
+        if current is None or (nearest and nearest["dist"] < current["dist"] - 1.0):
+            current = nearest
+        focus = current and current["hex"]
+        cs = current["callsign"] if current else ""
+        pkey = photo_key(current) if current else None
+        if shown and shown[0] != pkey:
+            shown = None
+
+        def publish():
+            info = {}
+            if current:
+                types = refs["types"] or {}
+                info = {"route": recall("route", cs)[1] if cs else None,
+                        "airline": (refs["airlines"] or {}).get(airline_code(cs)),
+                        "model_name": nice_model(current["desc"] or types.get(current["type"], "")),
+                        "photo": shown and (shown[1]["link"], shown[2], shown[1]["photographer"]),
+                        "no_photo": pkey is None or recall("photo", pkey) == (True, None)}
+            model.set_sky({"home": home, "radius": cfg.planes_radius, "planes": planes,
+                           "source": source,
+                           "focus": current and dict(current, trail=list(trails[current["hex"]])),
+                           **info})
+
+        publish()
+        if current:  # anything new to find out about this plane? (cached, so rarely)
+            steps = []  # (registrations as callsigns never have a route)
+            if airline_code(cs) and not recall("route", cs)[0]:
+                steps.append(("route", cs, lambda: lookup_route(cs, current["lat"], current["lon"]),
+                              ROUTE_TTL))
+            if pkey and not recall("photo", pkey)[0]:
+                steps.append(("photo", pkey, lambda: lookup_photo(pkey), PHOTO_TTL))
+            for kind, key, lookup, ttl in steps:
+                try:
+                    value = lookup()
+                except Exception as e:
+                    log(f"plane lookup {kind} {key}: {e}")
+                    continue  # try again next round
+                remember(kind, key, value, ttl if value else UNKNOWN_TTL)
+                publish()
+            want = [(k, load) for k, load, needed in (
+                ("airlines", load_airlines, airline_code(cs)),
+                ("types", load_type_names, not current["desc"])) if needed and refs[k] is None]
+            if want and time.monotonic() > refs["retry"]:
+                try:
+                    for k, load in want:
+                        refs[k] = load()
+                    publish()
+                except Exception as e:
+                    log(f"plane reference data: {e}")
+                    refs["retry"] = time.monotonic() + 3600
+            info = pkey and recall("photo", pkey)[1]
+            if info and not shown:
+                try:
+                    shown = (pkey, info, download_photo(info))
+                    publish()
+                except Exception as e:
+                    log(f"plane photo: {e}")
+        model.planes_wake.wait(cfg.planes_poll)
+        model.planes_wake.clear()
+
+
+def plane_view(sky):
+    """What the planes screen says about the plane it's following."""
+    f = (sky or {}).get("focus")
+    if not f:
+        return None
+    route, airline = sky.get("route") or {}, sky.get("airline") or {}
+    leg = route_leg(route.get("airports") or [], f["lat"], f["lon"], f["track"])
+    origin, dest, progress, left = leg or ({}, {}, None, None)
+    # "UA 1234" when the callsign is an airline's plus a plain number; ATC-style
+    # callsigns like UAL334K aren't the public flight number, so they stay as is
+    m = re.match(r"^[A-Z]{3}0*(\d{1,4})$", f["callsign"])
+    iata = airline.get("iata") or route.get("airline_iata") or ""
+    flight = f"{iata} {m.group(1)}" if iata and m else f["callsign"] or f["reg"] or f["hex"].upper()
+    stats = []
+    if f["alt"] is not None:
+        trend = ""
+        if f["rate"] is not None and abs(f["rate"]) >= 300:
+            trend = " ↑" if f["rate"] > 0 else " ↓"
+        stats.append(f"{f['alt']:,} ft{trend}")
+    if f["gs"] is not None:
+        stats.append(f"{round(f['gs'] * 1.15078)} mph")
+    if f["track"] is not None:
+        stats.append(f"heading {compass(f['track'])}")
+    miles = f["dist"] / NM_PER_MILE
+    stats.append("right overhead" if miles < 0.6 else f"{miles:.1f} mi {compass(f['bearing'])} of you")
+    return SimpleNamespace(
+        origin=origin.get("iata") or origin.get("icao") or "",
+        dest=dest.get("iata") or dest.get("icao") or "",
+        dest_name=dest.get("name") or "", dest_city=dest.get("city") or "",
+        progress=progress, to_go=None if left is None else left / NM_PER_MILE,
+        flight=flight,
+        airline=airline.get("name") or route.get("airline") or "",
+        aircraft=" · ".join(x for x in (sky.get("model_name") or f["type"],
+                                        f["reg"] if f["reg"] != flight else "",
+                                        f"built {f['year']}" if f["year"] else "") if x),
+        alert=SQUAWKS.get(f["squawk"]),
+        stats=stats)
+
+
+def setup_planes(config_path):
+    """--setup-planes: where you are, so the screen knows what's overhead."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "server"))
+    from device_login import save_to_config
+
+    guess = None
+    try:
+        code, data = get_json("https://ipapi.co/json/", timeout=6)
+        if code == 200 and data and data.get("latitude") is not None:
+            guess = (round(float(data["latitude"]), 4), round(float(data["longitude"]), 4),
+                     data.get("city") or "")
+    except Exception:
+        pass
+    print("The planes screen needs your location (it stays in config.ini on this Pi).")
+    print("Tip: right-click your home in Google Maps to copy its coordinates.")
+    if guess:
+        print(f"Your internet connection looks like it's near {guess[2] or 'here'}: "
+              f"{guess[0]}, {guess[1]} (approximate).")
+    answer = input("Latitude, longitude" + (" [Enter = use that]" if guess else "") + ": ").strip()
+    if answer:
+        try:
+            lat, lon = (float(x) for x in answer.replace(" ", "").split(",")[:2])
+        except ValueError:
+            sys.exit("Couldn't read that - use the form 38.4496, -78.8689")
+    elif guess:
+        lat, lon = guess[0], guess[1]
+    else:
+        sys.exit("No location given.")
+    radius = input("How far out to look, in nautical miles [15]: ").strip() or "15"
+    try:
+        radius_nm = max(2.0, min(60.0, float(radius)))
+    except ValueError:
+        sys.exit("Couldn't read that radius - use a number like 15")
+    try:
+        source, planes = fetch_planes(lat, lon, radius_nm)
+        up = [p for p in planes if not p["ground"]]
+        print(f"{source} sees {len(up)} aircraft in the air within {radius_nm:g} nm right now.")
+    except Exception as e:
+        print(f"Couldn't reach the plane feeds ({e}) - saving anyway.")
+    save_to_config(config_path, "planes", {"lat": f"{lat:.4f}", "lon": f"{lon:.4f}",
+                                           "radius_nm": f"{radius_nm:g}"})
+    print(f"Saved to [planes] in {config_path}. Restart the display, then tap through to it.")
+
+
+# ---------------------------------------------------------------- qr codes
+# Planespotters asks that a photo shown on a screen nobody can click carries a
+# QR code of its page. This is a small byte-mode encoder (ECC level L, versions
+# 1-10: up to 271 bytes), after Project Nayuki's reference implementation.
+
+# per version: (ECC codewords per block, [(blocks, data codewords per block), ...])
+QR_BLOCKS_L = [None, (7, [(1, 19)]), (10, [(1, 34)]), (15, [(1, 55)]), (20, [(1, 80)]),
+               (26, [(1, 108)]), (18, [(2, 68)]), (20, [(2, 78)]), (24, [(2, 97)]),
+               (30, [(2, 116)]), (18, [(2, 68), (2, 69)])]
+QR_ALIGN = [None, [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42],
+            [6, 26, 46], [6, 28, 50]]
+
+
+def _gf_mul(x, y):
+    z = 0
+    for i in reversed(range(8)):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z
+
+
+def _rs_ecc(data, degree):
+    """Reed-Solomon error-correction codewords for one block."""
+    gen, root = [0] * (degree - 1) + [1], 1
+    for _ in range(degree):
+        for j in range(degree):
+            gen[j] = _gf_mul(gen[j], root)
+            if j + 1 < degree:
+                gen[j] ^= gen[j + 1]
+        root = _gf_mul(root, 2)
+    rem = [0] * degree
+    for b in data:
+        factor = b ^ rem.pop(0)
+        rem.append(0)
+        for i, g in enumerate(gen):
+            rem[i] ^= _gf_mul(g, factor)
+    return rem
+
+
+def qr_matrix(data):
+    """The QR code for `data` (bytes) as rows of booleans (True = dark)."""
+    for version in range(1, 11):
+        ecc_len, groups = QR_BLOCKS_L[version]
+        capacity = sum(n * k for n, k in groups)
+        count_bits = 8 if version < 10 else 16
+        if 4 + count_bits + 8 * len(data) <= capacity * 8:
+            break
+    else:
+        raise ValueError("too long for a QR code this encoder makes")
+    # the bit stream: byte mode, length, data, terminator, padding
+    bits = [int(c) for c in f"0100{len(data):0{count_bits}b}"]
+    for b in data:
+        bits += [(b >> i) & 1 for i in range(7, -1, -1)]
+    bits += [0] * min(4, capacity * 8 - len(bits))
+    bits += [0] * (-len(bits) % 8)
+    words = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8)]
+    words += [0xEC, 0x11] * ((capacity - len(words)) // 2) + [0xEC] * ((capacity - len(words)) % 2)
+    # split into blocks, add error correction, interleave
+    blocks, at = [], 0
+    for n, k in groups:
+        for _ in range(n):
+            blocks.append(words[at:at + k])
+            at += k
+    eccs = [_rs_ecc(b, ecc_len) for b in blocks]
+    stream = [b[i] for i in range(max(map(len, blocks))) for b in blocks if i < len(b)]
+    stream += [e[i] for i in range(ecc_len) for e in eccs]
+
+    size = version * 4 + 17
+    grid = [[False] * size for _ in range(size)]
+    fixed = [[False] * size for _ in range(size)]
+
+    def put(x, y, dark):
+        grid[y][x], fixed[y][x] = dark, True
+
+    for i in range(size):  # timing patterns
+        put(6, i, i % 2 == 0)
+        put(i, 6, i % 2 == 0)
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):  # finders + separators
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                if 0 <= cx + dx < size and 0 <= cy + dy < size:
+                    put(cx + dx, cy + dy, max(abs(dx), abs(dy)) not in (2, 4))
+    align = QR_ALIGN[version]
+    for i, ax in enumerate(align):
+        for j, ay in enumerate(align):
+            if (i, j) in ((0, 0), (0, len(align) - 1), (len(align) - 1, 0)):
+                continue
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    put(ax + dx, ay + dy, max(abs(dx), abs(dy)) != 1)
+
+    def format_bits(mask):
+        data = 1 << 3 | mask  # 01 = level L
+        rem = data
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        v = (data << 10 | rem) ^ 0x5412
+        for i in range(6):
+            put(8, i, (v >> i) & 1)
+        put(8, 7, (v >> 6) & 1)
+        put(8, 8, (v >> 7) & 1)
+        put(7, 8, (v >> 8) & 1)
+        for i in range(9, 15):
+            put(14 - i, 8, (v >> i) & 1)
+        for i in range(8):
+            put(size - 1 - i, 8, (v >> i) & 1)
+        for i in range(8, 15):
+            put(8, size - 15 + i, (v >> i) & 1)
+        put(8, size - 8, True)  # the dark module
+
+    format_bits(0)  # reserve the format areas
+    if version >= 7:
+        rem = version
+        for _ in range(12):
+            rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+        v = version << 12 | rem
+        for i in range(18):
+            a, b = size - 11 + i % 3, i // 3
+            put(a, b, (v >> i) & 1)
+            put(b, a, (v >> i) & 1)
+
+    # the data, zig-zagging up and down in two-module columns from the right
+    i, total = 0, len(stream) * 8
+    right = size - 1
+    while right >= 1:
+        if right == 6:
+            right = 5
+        upward = ((right + 1) & 2) == 0
+        for vert in range(size):
+            y = size - 1 - vert if upward else vert
+            for x in (right, right - 1):
+                if not fixed[y][x] and i < total:
+                    grid[y][x] = bool((stream[i >> 3] >> (7 - (i & 7))) & 1)
+                    i += 1
+        right -= 2
+
+    masks = (lambda x, y: (x + y) % 2 == 0, lambda x, y: y % 2 == 0, lambda x, y: x % 3 == 0,
+             lambda x, y: (x + y) % 3 == 0, lambda x, y: (x // 3 + y // 2) % 2 == 0,
+             lambda x, y: x * y % 2 + x * y % 3 == 0,
+             lambda x, y: (x * y % 2 + x * y % 3) % 2 == 0,
+             lambda x, y: ((x + y) % 2 + x * y % 3) % 2 == 0)
+
+    def apply(mask):
+        f = masks[mask]
+        for y in range(size):
+            for x in range(size):
+                if not fixed[y][x] and f(x, y):
+                    grid[y][x] = not grid[y][x]
+
+    def penalty():
+        score = 0
+        lines = [row for row in grid] + [list(col) for col in zip(*grid)]
+        for line in lines:  # runs of 5+, and finder look-alikes
+            run, prev = 0, None
+            for m in line:
+                if m == prev:
+                    run += 1
+                else:
+                    if run >= 5:
+                        score += run - 2
+                    run, prev = 1, m
+            if run >= 5:
+                score += run - 2
+            s = "".join("1" if m else "0" for m in line)
+            score += 40 * (s.count("10111010000") + s.count("00001011101"))
+        for y in range(size - 1):  # 2x2 blocks
+            for x in range(size - 1):
+                if grid[y][x] == grid[y][x + 1] == grid[y + 1][x] == grid[y + 1][x + 1]:
+                    score += 3
+        dark = sum(map(sum, grid))
+        score += 10 * (abs(dark * 20 - size * size * 10) // (size * size))
+        return score
+
+    best = None
+    for mask in range(8):
+        apply(mask)
+        format_bits(mask)
+        score = penalty()
+        if best is None or score < best[0]:
+            best = (score, mask)
+        apply(mask)  # XOR again to undo
+    apply(best[1])
+    format_bits(best[1])
+    return grid
+
+
 # ---------------------------------------------------------------- demo data
 
 def demo_art():
@@ -1076,15 +1788,56 @@ def demo_art():
     return buf.getvalue()
 
 
+def demo_plane_photo():
+    """A stand-in aircraft photo, encoded like a download would be."""
+    s = pygame.Surface((420, 280))
+    for y in range(280):
+        pygame.draw.line(s, (70 + y // 5, 120 + y // 6, 190 - y // 8), (0, y), (419, y))
+    Renderer.plane_icon(s, 210, 150, 150, 90, (235, 235, 240))
+    buf = io.BytesIO()
+    pygame.image.save(s, buf, "photo.png")
+    return buf.getvalue()
+
+
+def demo_sky(model, t, start, photo):
+    """A United 737 crossing westbound about every 5 minutes, plus a neighbour."""
+    lat0, lon0 = model.cfg.planes_lat, model.cfg.planes_lon
+    k = ((t - start) / 300) % 1.0
+    plat, plon = lat0 + 0.05, lon0 + 0.25 - 0.5 * k
+    plane = {"hex": "a4f0e5", "icao": True, "callsign": "UAL1234", "reg": "N37522",
+             "type": "B39M", "desc": "BOEING 737 MAX 9", "year": "2018",
+             "lat": plat, "lon": plon, "alt": 12500, "gs": 310.0, "track": 270.0, "rate": 1400.0,
+             "squawk": "4312", "seen": 0.2, "ground": False,
+             "dist": distance_nm(lat0, lon0, plat, plon),
+             "bearing": bearing_deg(lat0, lon0, plat, plon)}
+    other = dict(plane, hex="c0ffee", lat=lat0 - 0.12, lon=lon0 + 0.1, track=45.0,
+                 dist=distance_nm(lat0, lon0, lat0 - 0.12, lon0 + 0.1),
+                 bearing=bearing_deg(lat0, lon0, lat0 - 0.12, lon0 + 0.1))
+    model.set_sky({
+        "home": (lat0, lon0), "radius": 15.0, "planes": [plane, other], "source": "demo",
+        "focus": dict(plane, trail=[(plat, plon + 0.02 * i) for i in range(8, -1, -1)]),
+        "route": {"airports": [
+            {"iata": "JFK", "icao": "KJFK", "city": "New York",
+             "name": "John F Kennedy International Airport", "lat": 40.6398, "lon": -73.7789},
+            {"iata": "LAX", "icao": "KLAX", "city": "Los Angeles",
+             "name": "Los Angeles International Airport", "lat": 33.9425, "lon": -118.408}],
+            "airline": "", "airline_iata": ""},
+        "airline": {"name": "United Airlines", "iata": "UA"},
+        "model_name": nice_model(plane["desc"]), "no_photo": False,
+        "photo": ("https://www.planespotters.net/", photo, "demo photo")})
+
+
 def demo_worker(model):
-    """--demo: moving numbers, a thinking spinner every other 8s, a fake song
-    and a fake print."""
+    """--demo: moving numbers, a thinking spinner every other 8s, a fake song,
+    a fake print and a fake plane."""
     art = demo_art()
     model.set_art("demo:art", art)
+    photo = demo_plane_photo()
     start = time.time()
     while True:
         t = time.time()
         now = datetime.datetime.now().astimezone()
+        demo_sky(model, t, start, photo)
         done = ((t - start) / 600) % 1.0  # a 10-minute "print" on loop
         model.update_printer({
             "gcode_state": "RUNNING", "subtask_name": "Articulated Dragon.3mf",
@@ -1159,6 +1912,9 @@ class BeaconHandler(BaseHTTPRequestHandler):
             elif want == "spotify":
                 self._send(409, "spotify not configured - run server/spotify_login.py "
                                 "--config ~/.config/claude-display/config.ini\n")
+            elif want == "planes":
+                self._send(409, "planes screen not set up - run "
+                                "python3 pi/claude_display.py --setup-planes\n")
             else:
                 self._send(409, "printer not configured - run "
                                 "python3 pi/claude_display.py --setup-bambu\n")
@@ -1225,6 +1981,9 @@ class Renderer:
         self.anim = 0.0      # 0 = usage bars full width, 1 = session panel open
         self.anim_at = 0.0
         self.spin_cache = {}  # (frame, px) -> the spark, drawn once
+        self.photo_url = None  # the plane photo currently decoded
+        self.photo_img = None
+        self.qr_link = self.qr_grid = self.qr_key = self.qr_surf = None  # its page, as a QR
         self.font_paths = fonts
         self.fonts = {}
         self.text_cache = {}
@@ -1519,6 +2278,17 @@ class Renderer:
                               for s in snap.sessions)
             sliding = "sliding" if 0 < self.anim < 1 else self.anim
             return key + (snap.usage_version, snap.usage_status, snap.thinking, sliding, panel)
+        if snap.mode == "planes":
+            sky = snap.sky or {}
+            f = sky.get("focus")
+            plane = f and (f["hex"], round(f["lat"], 4), round(f["lon"], 4), f["alt"],
+                           f["gs"] and round(f["gs"]), f["track"] and round(f["track"]),
+                           len(f.get("trail") or []))
+            others = tuple((p["hex"], round(p["lat"], 3), round(p["lon"], 3))
+                           for p in sky.get("planes") or [])
+            return key + (snap.sky is None, plane, others, repr(sky.get("route")),
+                          repr(sky.get("airline")), sky.get("model_name"), sky.get("no_photo"),
+                          (sky.get("photo") or (None,))[0], snap.planes_status, snap.thinking)
         if snap.mode == "bambu":
             # only what's drawn, so fan speeds and wifi strength don't cause redraws
             v = printer_view(snap.printer, now)
@@ -1529,6 +2299,8 @@ class Renderer:
                       self.progress_ms(snap) // 1000 if playing else -1)
 
     def draw(self, surf, snap, now):
+        if snap.mode != "planes" and self.photo_img is not None:
+            self.photo_url = self.photo_img = None  # planespotters: only while it's on screen
         surf.fill(COL_BG)
         getattr(self, f"_{snap.mode}_{self.layout}")(surf, snap, now)
         self._status(surf, snap)
@@ -1540,7 +2312,8 @@ class Renderer:
     def _status(self, surf, snap):
         addr = f"{snap.host}.local  {snap.ip}".rstrip()
         status = snap.flash or {"usage": snap.usage_status, "spotify": snap.sp_status,
-                                "bambu": snap.printer_status}[snap.mode]
+                                "bambu": snap.printer_status,
+                                "planes": snap.planes_status}[snap.mode]
         if self.working_note(snap):
             # Only the usage screen has the big spinner, so on the others Claude
             # working shows up here - the Pi's stand-in for the ESP32's LED.
@@ -1729,6 +2502,13 @@ class Renderer:
         elif brand == "bambu":
             self.bambu_logo(surf, 38, 24, 58)
             title, color, sub = "Bambu Lab", COL_BAMBU, subtitle
+        elif brand == "planes":
+            s = self.n(56)
+            icon = self._ss(("title-plane",), s, s,
+                            lambda big, k: self.plane_icon(big, s * k / 2, s * k / 2, s * k * 0.48,
+                                                           45, COL_ORANGE))
+            surf.blit(icon, (self.x(60) - s // 2, self.y(52) - s // 2))
+            title, color, sub = "Planes overhead", COL_ORANGE, subtitle
         else:
             self.mascot(surf, 32, 28, 6)
             title, color, sub = "Claude Code", COL_ORANGE, "usage monitor"
@@ -2089,6 +2869,325 @@ class Renderer:
         self._clock_strip(surf, now)
 
 
+    # -- the planes-overhead screen: exact airframe photo | route and flight | radar
+    @staticmethod
+    def plane_icon(big, cx, cy, size, track, color):
+        """PLANE_SHAPE turned to `track` (degrees clockwise from north); size
+        is its half-length in pixels."""
+        a = math.radians(track or 0)
+        ca, sa = math.cos(a), math.sin(a)
+        pygame.draw.polygon(big, color, [(cx + (x * ca - y * sa) * size, cy + (x * sa + y * ca) * size)
+                                         for x, y in PLANE_SHAPE])
+
+    QR_LIGHT = (236, 236, 236)
+
+    def plane_qr(self, link, size):
+        """The photo's page as a QR code at most `size` design units square,
+        in whole pixels per module so it stays crisp - or None if it can't be
+        drawn big enough (2 px a module) to scan."""
+        if link != self.qr_link:
+            self.qr_link, self.qr_grid = link, None
+            try:
+                self.qr_grid = qr_matrix(link.encode())
+            except ValueError as e:
+                log(f"photo link: {e}")
+        if not self.qr_grid:
+            return None
+        n = len(self.qr_grid) + 4  # a 2-module light margin
+        m = int(size * self.s) // n
+        if m < 2:
+            return None
+        if self.qr_key != (link, m):
+            img = pygame.Surface((n * m, n * m))
+            img.fill(self.QR_LIGHT)
+            for y, row in enumerate(self.qr_grid):
+                for x, dark in enumerate(row):
+                    if dark:
+                        img.fill(COL_BG, ((x + 2) * m, (y + 2) * m, m, m))
+            self.qr_key, self.qr_surf = (link, m), img
+        return self.qr_surf
+
+    def plane_photo(self, surf, rect, sky, qr_at=None, empty=None):
+        """The photo of this exact aircraft, cover-cropped into rect, with
+        the QR code of its planespotters page at qr_at (x, y, max size) -
+        both or neither, so where a scannable code won't fit (or qr_at is
+        None) the placeholder shows instead, in `empty` if given. Returns
+        the QR code's size in design units, or 0 if it was the placeholder."""
+        sky = sky or {}
+        photo = sky.get("photo") if sky.get("focus") else None
+        qr = photo and qr_at and self.plane_qr(photo[0], qr_at[2])
+        if not qr:
+            photo = None
+        if photo and photo[0] != self.photo_url:
+            self.photo_url, self.photo_img = photo[0], None
+            try:
+                img = pygame.image.load(io.BytesIO(photo[1]), "photo.jpg").convert()
+                iw, ih = img.get_size()
+                want = rect.w / rect.h
+                if iw / ih > want:
+                    cw = int(ih * want)
+                    crop = pygame.Rect((iw - cw) // 2, 0, cw, ih)
+                else:
+                    ch = int(iw / want)
+                    crop = pygame.Rect(0, (ih - ch) // 2, iw, ch)
+                self.photo_img = pygame.transform.smoothscale(img.subsurface(crop), rect.size)
+            except Exception as e:
+                log(f"could not decode the plane photo: {e}")
+        if photo and self.photo_img is not None and self.photo_url == photo[0]:
+            if self.photo_img.get_size() != rect.size:
+                self.photo_img = pygame.transform.smoothscale(self.photo_img, rect.size)
+            surf.blit(self.photo_img, rect.topleft)
+            surf.blit(qr, (self.x(qr_at[0]), self.y(qr_at[1])))
+            return qr.get_width() / self.s
+
+        rect = empty or rect
+
+        def draw(big, k):
+            pygame.draw.rect(big, COL_CARD, big.get_rect(), border_radius=int(rect.h * k * 0.05))
+            w, h = big.get_size()
+            self.plane_icon(big, w / 2, h / 2, h * 0.34, 90, COL_DIM)
+
+        surf.blit(self._ss(("photo-placeholder",), rect.w, rect.h, draw), rect.topleft)
+        return 0
+
+    def radar(self, surf, sky, cx, cy, r, label=16):
+        """Top-down, north up, you in the middle: range rings, the other
+        planes, and the followed plane with its trail and the next few
+        minutes of its heading."""
+        px = self.n(2 * r)
+        big = pygame.Surface((px * SS, px * SS), pygame.SRCALPHA)
+        big.fill((*COL_BG, 0))
+        c, R = px * SS / 2, px * SS / 2 * 0.94
+        sky = sky or {}
+        radius, home = sky.get("radius") or 15, sky.get("home")
+        w = max(2, round(SS * self.s * 1.3))
+        for frac in (1.0, 0.5):
+            pygame.draw.circle(big, COL_CARD, (c, c), R * frac, w)
+        pygame.draw.line(big, COL_DIM, (c, c - R), (c, c - R * 0.9), w)
+
+        def to_xy(lat, lon):  # flat-earth is fine over a few dozen miles
+            dx = (lon - home[1]) * 60 * math.cos(math.radians(home[0]))
+            dy = (lat - home[0]) * 60
+            return c + dx / radius * R, c - dy / radius * R
+
+        focus, dest_label = sky.get("focus"), None
+        if home:
+            for p in sky.get("planes") or []:
+                if not focus or p["hex"] != focus["hex"]:
+                    self.plane_icon(big, *to_xy(p["lat"], p["lon"]), R * 0.055, p["track"], COL_DIM)
+            if focus:
+                x0, y0 = to_xy(focus["lat"], focus["lon"])
+                trail = [to_xy(*ll) for ll in focus.get("trail") or []]
+                if len(trail) > 1:
+                    pygame.draw.lines(big, (150, 84, 62), False, trail, w)
+                if focus["track"] is not None and focus["gs"]:
+                    ahead = min(focus["gs"] * 4 / 60, radius * 2)  # the next 4 minutes
+                    a = math.radians(focus["track"])
+                    dx, dy = math.sin(a) * ahead / radius * R, -math.cos(a) * ahead / radius * R
+                    for i in range(0, 12, 2):  # dashed
+                        pygame.draw.line(big, COL_ORANGE, (x0 + dx * i / 12, y0 + dy * i / 12),
+                                         (x0 + dx * (i + 1) / 12, y0 + dy * (i + 1) / 12), w)
+                self.plane_icon(big, x0, y0, R * 0.12, focus["track"], COL_ORANGE)
+                leg = route_leg((sky.get("route") or {}).get("airports") or [], focus["lat"],
+                                focus["lon"], focus["track"])
+                dest = leg[1] if leg else {}
+                code = dest.get("iata") or dest.get("icao")
+                if code:
+                    dest_label = (code, bearing_deg(home[0], home[1], dest["lat"], dest["lon"]))
+                    # a notch on the ring pointing the way its destination lies
+                    a = math.radians(dest_label[1])
+                    ux, uy = math.sin(a), -math.cos(a)
+                    tip, back, half = R * 1.05, R * 0.9, R * 0.07
+                    pygame.draw.polygon(big, COL_ORANGE, [
+                        (c + ux * tip, c + uy * tip),
+                        (c + ux * back - uy * half, c + uy * back + ux * half),
+                        (c + ux * back + uy * half, c + uy * back - ux * half)])
+        pygame.draw.circle(big, COL_TEXT, (c, c), R * 0.04)  # you
+        surf.blit(pygame.transform.smoothscale(big, (px, px)),
+                  (self.x(cx) - px // 2, self.y(cy) - px // 2))
+        self.text(surf, "N", cx, cy - r * 0.94 + label * 1.45, label, COL_DIM, align="c")
+        self.text(surf, f"{radius:.0f} nm", cx + r * 0.94, cy + r * 0.94, label * 0.8, COL_DIM,
+                  align="r")
+        if dest_label:
+            a = math.radians(dest_label[1])
+            lx, ly = cx + math.sin(a) * r * 0.72, cy - math.cos(a) * r * 0.72
+            self.text(surf, dest_label[0], lx, ly + label * 0.35, label * 0.85, COL_ORANGE,
+                      bold=True, align="c")
+
+    def plane_head(self, surf, v, x0, x1, base, size, sub):
+        """The headline: where it's going, big, with that airport's name under
+        it, and the flight number and airline on the right. With no route
+        known the flight itself is the headline."""
+        fsize, asize = size * 0.46, sub * 0.9
+        right_w = max(self.width(v.flight, fsize, True) if v.dest else 0,
+                      min(self.width(v.airline, asize), (x1 - x0) * 0.45))
+        big = v.dest or v.flight
+        room = x1 - x0 - (right_w + size * 0.4 if right_w else 0)
+        bsize = self.fit_size(big, room, size, bold=True, smallest=int(size * 0.5))
+        self.text(surf, self.fit(big, room, bsize, bold=True), x0, base, bsize, COL_TEXT, bold=True)
+        if v.dest:
+            self.text(surf, v.flight, x1, base - size * 0.36, fsize, COL_ORANGE, bold=True, align="r")
+        if v.airline:
+            self.text(surf, self.fit(v.airline, right_w, asize), x1, base, asize, COL_DIM, align="r")
+        if v.dest:
+            name = v.dest_name
+            if v.dest_city and v.dest_city.lower() not in name.lower():
+                name = f"{name}, {v.dest_city}" if name else v.dest_city
+            under, color = name, COL_SUB
+        else:
+            under, color = "route unknown", COL_DIM
+        self.text(surf, self.fit(under, x1 - x0, sub), x0, base + sub * 1.7, sub, color)
+
+    def route_progress(self, surf, v, x0, x1, base, size):
+        """from JFK ━━━━✈──── 1,832 mi to go: the plane sits as far along the
+        line as it is along its route."""
+        if not v.origin:
+            return
+        left = f"from {v.origin}"
+        right = f"{v.to_go:,.0f} mi to go" if v.to_go is not None else ""
+        gap = size * 0.7
+        wl = self.width(left, size)
+        wr = self.width(right, size) if right else 0
+        if x1 - x0 - wl - wr - 2 * gap < size * 5:
+            right, wr = "", 0
+        self.text(surf, left, x0, base, size, COL_DIM)
+        if right:
+            self.text(surf, right, x1, base, size, COL_DIM, align="r")
+        lx0, lx1 = x0 + wl + gap, x1 - (wr + gap if right else 0)
+        s = self.n(size * 1.5)
+        span = lx1 - lx0 - s / self.s
+        if span < size:
+            return
+        ly = base - size * 0.34
+        at = lx0 + s / self.s / 2 + span * (v.progress if v.progress is not None else 0.5)
+        t = max(1.5, size * 0.12)
+        surf.fill(COL_CARD, self.rect(lx0, ly - t / 2, lx1 - lx0, t))
+        if v.progress is not None:
+            surf.fill(COL_ORANGE, self.rect(lx0, ly - t / 2, at - lx0, t))
+        icon = self._ss(("route-plane", s), s, s,
+                        lambda big, k: self.plane_icon(big, s * k / 2, s * k / 2, s * k * 0.46, 90,
+                                                       COL_ORANGE))
+        surf.blit(icon, (self.x(at) - s // 2, self.y(ly) - s // 2))
+
+    def plane_stats(self, surf, v, x0, x1, base, size, lines=1, step=0):
+        """Altitude, speed, heading, how far from you - on one line, or one
+        per line. An emergency squawk leads, in red."""
+        items = ([v.alert] if v.alert else []) + v.stats
+        if lines == 1:
+            items = ["   ·   ".join(items)]
+        for i, item in enumerate(items[:lines]):
+            color = COL_RED if v.alert and i == 0 else COL_DIM
+            self.text(surf, self.fit(item, x1 - x0, size), x0, base + i * step, size, color)
+
+    def plane_credit(self, surf, sky, qr, x, base, w, size):
+        """planespotters' terms: the photographer, by name, next to the photo."""
+        if qr:
+            self.text(surf, self.fit(f"© {sky['photo'][2]} / Planespotters.net", w, size), x, base,
+                      size, COL_DIM)
+        elif (sky or {}).get("focus") and sky.get("no_photo"):
+            self.text(surf, "no photo of this one yet", x, base, size, COL_DIM)
+
+    def qr_label(self, surf, x, base, size, align="l"):
+        self.text(surf, "scan for the", x, base, size, COL_DIM, align=align)
+        self.text(surf, "full photo", x, base + size * 1.3, size, COL_DIM, align=align)
+
+    def quiet_sky(self, surf, snap, x, base, size, align="l"):
+        sky = snap.sky or {}
+        self.text(surf, "quiet skies" if snap.sky else "looking for planes...", x, base, size,
+                  COL_DIM, bold=True, align=align)
+        if snap.sky:
+            self.text(surf, f"nothing flying within {sky['radius']:.0f} nm right now", x,
+                      base + size * 0.95, max(9, size * 0.5), COL_DIM, align=align)
+
+    def _planes_bar(self, surf, snap, now):
+        sky = snap.sky or {}
+        v = plane_view(sky)
+        qr = self.plane_photo(surf, self.rect(28, 30, 258, 172), sky, qr_at=(298, 30, 100),
+                              empty=self.rect(28, 30, 368, 172))
+        if qr:
+            self.qr_label(surf, 298 + qr / 2, 30 + qr + 22, 13, align="c")
+        self.plane_credit(surf, sky, qr, 28, 228, 368, 14)
+        surf.fill(COL_CARD, self.rect(416, 40, 2, 196))
+        surf.fill(COL_CARD, self.rect(1124, 40, 2, 196))
+        self.radar(surf, sky, 1290, 150, 124)
+        x0, x1 = 446, 1098
+        if not v:
+            self.quiet_sky(surf, snap, x0, 130, 44)
+        else:
+            self.plane_head(surf, v, x0, x1, 96, 66, 20)
+            self.route_progress(surf, v, x0, x1, 166, 18)
+            self.text(surf, self.fit(v.aircraft, x1 - x0, 22), x0, 202, 22, COL_TEXT)
+            self.plane_stats(surf, v, x0, x1, 236, 20)
+        self._clock_bar(surf, now)
+
+    def _planes_landscape(self, surf, snap, now):
+        sky = snap.sky or {}
+        self._header_landscape(surf, now, "planes",
+                               f"within {sky.get('radius', self.PLANES_DEFAULT_NM):.0f} nm of you")
+        v = plane_view(sky)
+        qr = self.plane_photo(surf, self.rect(32, 126, 228, 152), sky, qr_at=(32, 312, 100))
+        self.plane_credit(surf, sky, qr, 32, 298, 228, 12)
+        if qr:
+            self.qr_label(surf, 32 + qr + 12, 312 + qr / 2 - 4, 13)
+        self.radar(surf, sky, 668, 262, 100, label=14)
+        x0, x1 = 282, 556
+        if not v:
+            self.quiet_sky(surf, snap, x0, 200, 30)
+            return
+        self.plane_head(surf, v, x0, x1, 170, 46, 14)
+        self.route_progress(surf, v, x0, x1, 226, 13)
+        self.text(surf, self.fit(v.aircraft, x1 - x0, 15), x0, 256, 15, COL_TEXT)
+        self.plane_stats(surf, v, x0, x1, 286, 15, lines=4, step=21)
+
+    def _planes_portrait(self, surf, snap, now):
+        # too small for a scannable QR code, so no photo either (see plane_photo)
+        sky = snap.sky or {}
+        s = self.n(34)
+        icon = self._ss(("title-plane",), s, s,
+                        lambda big, k: self.plane_icon(big, s * k / 2, s * k / 2, s * k * 0.48, 45,
+                                                       COL_ORANGE))
+        surf.blit(icon, (self.x(38) - s // 2, self.y(32) - s // 2))
+        self.text(surf, "Overhead", 72, 30, 16, COL_ORANGE, bold=True)
+        self.text(surf, f"within {sky.get('radius', self.PLANES_DEFAULT_NM):.0f} nm", 72, 47, 11,
+                  COL_DIM)
+        v = plane_view(sky)
+        self.radar(surf, sky, 90, 124, 58, label=9)
+        if not v:
+            self.quiet_sky(surf, snap, 90, 222, 15, align="c")
+            return
+        self.plane_head(surf, v, 12, 168, 222, 30, 9)
+        self.route_progress(surf, v, 12, 168, 252, 9)
+        self.text(surf, self.fit(v.aircraft, 156, 10), 12, 270, 10, COL_TEXT)
+        self.plane_stats(surf, v, 12, 168, 287, 9)
+
+    def _planes_strip(self, surf, snap, now):
+        sky = snap.sky or {}
+        s = self.n(90)
+        icon = self._ss(("title-plane",), s, s,
+                        lambda big, k: self.plane_icon(big, s * k / 2, s * k / 2, s * k * 0.48, 45,
+                                                       COL_ORANGE))
+        surf.blit(icon, (self.x(160) - s // 2, self.y(96) - s // 2))
+        self.text(surf, "Overhead", 160, 192, 34, COL_ORANGE, bold=True, align="c")
+        self.text(surf, f"within {sky.get('radius', self.PLANES_DEFAULT_NM):.0f} nm of you", 160,
+                  224, 20, COL_DIM, align="c")
+        v = plane_view(sky)
+        qr = self.plane_photo(surf, self.rect(24, 250, 272, 181), sky, qr_at=(24, 476, 100))
+        self.plane_credit(surf, sky, qr, 24, 458, 272, 14)
+        if qr:
+            self.qr_label(surf, 24 + qr + 14, 476 + qr / 2 - 4, 16)
+        self.radar(surf, sky, 160, 1022, 132, label=18)
+        if v:
+            self.plane_head(surf, v, 24, 296, 642, 60, 18)
+            self.route_progress(surf, v, 24, 296, 712, 16)
+            self.text(surf, self.fit(v.aircraft, 272, 19), 24, 748, 19, COL_TEXT)
+            self.plane_stats(surf, v, 24, 296, 786, 18, lines=3, step=28)
+        else:
+            self.quiet_sky(surf, snap, 160, 660, 26, align="c")
+        self._clock_strip(surf, now)
+
+    PLANES_DEFAULT_NM = 15
+
+
 # ---------------------------------------------------------------- main
 
 def forever(fn, *args):
@@ -2136,10 +3235,15 @@ def main():
     ap.add_argument("--windowed", metavar="WxH", help="run in a window, e.g. 800x480 or 480x800")
     ap.add_argument("--demo", action="store_true", help="fake data - no logins or network needed")
     ap.add_argument("--port", type=int, help="HTTP port (overrides config.ini)")
+    ap.add_argument("--setup-planes", action="store_true",
+                    help="set your location for the planes-overhead screen")
     ap.add_argument("--setup-bambu", action="store_true",
                     help="find your Bambu Lab printer, ask for its access code, save it")
     args = ap.parse_args()
 
+    if args.setup_planes:
+        setup_planes(args.config)
+        return
     if args.setup_bambu:
         setup_bambu(args.config)
         return
@@ -2155,7 +3259,10 @@ def main():
     spotify_ready = args.demo or bool(cfg.sp_client_id and cfg.sp_refresh_token)
     if args.demo and not cfg.bambu_name:
         cfg.bambu_name = "demo P1S"
-    model = Model(cfg, state, spotify_ready, bambu_ready=args.demo or cfg.bambu_ready)
+    if args.demo and not cfg.planes_ready:
+        cfg.planes_lat, cfg.planes_lon = 40.70, -73.86  # between JFK and LGA
+    model = Model(cfg, state, spotify_ready, bambu_ready=args.demo or cfg.bambu_ready,
+                  planes_ready=cfg.planes_ready)
     model.ip = local_ip()
 
     BeaconHandler.model = model
@@ -2181,6 +3288,8 @@ def main():
                                spotify_exchange(cfg.sp_client_id), 3600))
         if cfg.bambu_ready:
             forever(bambu_worker, model)
+        if cfg.planes_ready:
+            forever(planes_worker, model)
 
     try:
         screen = open_screen(args, cfg)
