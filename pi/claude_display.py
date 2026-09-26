@@ -3434,14 +3434,19 @@ class Renderer:
     PANEL_LAYOUTS = ("bar", "landscape")
 
     def session_open(self, snap):
-        return (snap.mode == "usage" and self.layout in self.PANEL_LAYOUTS
-                and (snap.thinking or bool(snap.sessions)))
+        return self.layout in self.PANEL_LAYOUTS and (snap.thinking or bool(snap.sessions))
 
     def advance(self, snap):
         """Step the open / close slide toward where it should be; True while it moves."""
         target = 1.0 if self.session_open(snap) else 0.0
         dt = min(0.05, snap.mono - self.anim_at) if self.anim_at else 0.0
         self.anim_at = snap.mono
+        if snap.mode != "usage":
+            # Only the usage screen has the slide: elsewhere, just be where it
+            # should be. (Sliding here would paint the usage bars' slide frames
+            # over the other screen, and coming back finds the panel as it was.)
+            self.anim = target
+            return False
         if self.anim == target:
             return False
         step = dt / self.ANIM_SECS
