@@ -1450,7 +1450,8 @@ SISTER_TYPES = {
 def plane_art_for(liveries, brand, type_code):
     """The illustration for this plane, best first: its airline's livery on
     this exact type, on a sister type, the type blank, a sister type's blank.
-    {"path", "kind", "type"} - or None, and it's the planespotters photo."""
+    {"path", "kind", "type", "credit"} - or None, and it's the planespotters
+    photo. credit is whose art it is: Norebbo, or the airline's own site."""
     if not liveries or not type_code:
         return None
     sisters = SISTER_TYPES.get(type_code, ())
@@ -1462,7 +1463,8 @@ def plane_art_for(liveries, brand, type_code):
         if isinstance(entry, dict) and entry.get("file"):
             path = os.path.join(liveries["dir"], os.path.basename(entry["file"]))
             if os.path.exists(path):
-                return {"path": path, "kind": kind, "type": t}
+                return {"path": path, "kind": kind, "type": t,
+                        "credit": str(entry.get("credit") or "Norebbo")}
     return None
 
 
@@ -4296,7 +4298,7 @@ class Renderer:
         if self.plane_art(surf, art, sky):
             text = {"livery": "", "sister": "sister type · ", "blank": "blank livery · ",
                     "sister blank": "blank, sister type · "}.get(sky["art"]["kind"], "")
-            text += "illustration © Norebbo"
+            text += f"illustration © {sky['art'].get('credit') or 'Norebbo'}"
             self.text(surf, self.fit(text, w, size), x, base, size, COL_DIM)
             return
         qr = self.plane_photo(surf, photo, sky, qr_at=qr_at, empty=empty)
@@ -4376,7 +4378,8 @@ class Renderer:
                   COL_DIM)
         v = plane_view(sky)
         if self.plane_art(surf, self.rect(12, 66, 156, 100), sky):
-            self.text(surf, "illustration © Norebbo", 12, 178, 8, COL_DIM)
+            self.text(surf, self.fit(f"illustration © {sky['art'].get('credit') or 'Norebbo'}",
+                                     156, 8), 12, 178, 8, COL_DIM)
         else:
             self.radar(surf, sky, 90, 124, 58, label=9)
         if not v:

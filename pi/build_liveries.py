@@ -136,6 +136,62 @@ LIVERIES = {
     ("UPS", "MD11"): "2024/08/MD-11F_ups_2014_livery.jpg",
 }
 
+# The airlines' own side views, from their fleet pages - the same flat, gear-up
+# style, in the current livery, and (Delta's, Air Canada's) with real
+# transparency. These win over Norebbo's for the same (livery, type): United's
+# replace its old 2010 globe livery, Delta's are sharper, and they fill gaps
+# (United Express CRJ-550/700, E170, ERJ-145; Delta's 717 and Connection CRJs;
+# Air Canada Express). Air Canada's face right - flipping would mirror the
+# titles - so they're left as they are.
+UNITED = "https://media.united.com/assets/m/"
+DELTA = "https://www.delta.com/content/dam/delta-www/responsive/airports-aircraft/"
+AIRCANADA = "https://www.aircanada.com/content/dam/aircanada/portal/images/fleet/aircraft/"
+OFFICIAL = {
+    ("UAL", "B788"): (UNITED + "4a29a23b8c38ff55/original/787-8-png-2x.png", "United Airlines"),
+    ("UAL", "B77W"): (UNITED + "2c8d559fcfcec38f/original/777-300-2x.png", "United Airlines"),
+    ("UAL", "B752"): (UNITED + "4b144548aa973560/original/757-200-2x.png", "United Airlines"),
+    ("UAL", "B38M"): (UNITED + "e1fdecdb14fce86/original/737-MAX-2x.png", "United Airlines"),
+    ("united-express", "CRJ7"): (UNITED + "397e6277cf7a2e3e/original/CRJ-550-2x.png", "United Airlines"),
+    ("united-express", "E170"): (UNITED + "187e894982636b99/original/EMB-170-2x.png", "United Airlines"),
+    ("united-express", "E145"): (UNITED + "44ea4f4757c31074/original/EMB-145-2x.png", "United Airlines"),
+    ("united-express", "E45X"): (UNITED + "44ea4f4757c31074/original/EMB-145-2x.png", "United Airlines"),
+    ("DAL", "A319"): (DELTA + "Airbus/Profile-Detail/aircraft-A319-profile-detail-924.png", "Delta Air Lines"),
+    ("DAL", "A320"): (DELTA + "Airbus/Profile-Detail/aircraft-A320-M-and-K-profile-detail-924.png", "Delta Air Lines"),
+    ("DAL", "A332"): (DELTA + "Airbus/Profile-Detail/aircraft-A330-200-332-profile-detail-924.png", "Delta Air Lines"),
+    ("DAL", "A333"): (DELTA + "Airbus/Profile-Detail/aircraft-A330-300-333-profile-detail-924.png", "Delta Air Lines"),
+    ("DAL", "A359"): (DELTA + "Airbus/Profile-Detail/aircraft-A350-profile-detail-924.png", "Delta Air Lines"),
+    ("DAL", "BCS1"): (DELTA + "Airbus/nov13/aircraft-a220-profile-detail-924.png", "Delta Air Lines"),
+    ("DAL", "B712"): (DELTA + "Boeing/Profile-Detail/aircraft-boeing-717-profile-detail-924.png", "Delta Air Lines"),
+    ("DAL", "B738"): (DELTA + "Boeing/Profile-Detail/aircraft-boeing-737-800-profile-detail-924.png", "Delta Air Lines"),
+    ("DAL", "B739"): (DELTA + "aircraft-boeing-737-900er-profile-detail-838x278.jpg", "Delta Air Lines"),
+    ("DAL", "B752"): (DELTA + "Boeing/Profile-Detail/aircraft-boeing-757-200-75d-h-s-profile-details-924.png",
+                      "Delta Air Lines"),
+    ("DAL", "B763"): (DELTA + "Boeing/Profile-Detail/aircraft-boeing-767-300er-76z-v1-v2-profile-detail-924.png",
+                      "Delta Air Lines"),
+    ("DAL", "B764"): (DELTA + "Boeing/Profile-Detail/aircraft-boeing-767-400er-76d-profile-detail-924.png",
+                      "Delta Air Lines"),
+    ("delta-connection", "CRJ7"): (DELTA + "bombardier/Profile-Detail/aircraft-boeing-CRJ700-profile-detail-924.png",
+                                   "Delta Air Lines"),
+    ("delta-connection", "CRJ9"): (DELTA + "bombardier/Profile-Detail/aircraft-boeing-CRJ900-profile-detail-924.png",
+                                   "Delta Air Lines"),
+    ("delta-connection", "E170"): (DELTA + "Embraer/Profile-Detail/aircraft-boeing-E170-profile-detail-924.png",
+                                   "Delta Air Lines"),
+    ("delta-connection", "E75L"): (DELTA + "Embraer/Profile-Detail/aircraft-boeing-E175-profile-detail-924.png",
+                                   "Delta Air Lines"),
+    ("ACA", "B77W"): (AIRCANADA + "B77W.png", "Air Canada"),
+    ("ACA", "B77L"): (AIRCANADA + "B77L.png", "Air Canada"),
+    ("ACA", "A333"): (AIRCANADA + "A333.png", "Air Canada"),
+    ("ACA", "B788"): (AIRCANADA + "B788.png", "Air Canada"),
+    ("ACA", "A320"): (AIRCANADA + "A320.png", "Air Canada"),
+    ("ACA", "BCS3"): (AIRCANADA + "A223.png", "Air Canada"),
+    ("JZA", "CRJ9"): (AIRCANADA + "CRA.png", "Air Canada"),
+    ("JZA", "E75L"): (AIRCANADA + "E75.png", "Air Canada"),
+    ("JZA", "DH8D"): (AIRCANADA + "DH4J.png", "Air Canada"),
+    ("ROU", "A319"): (AIRCANADA + "A319r.png", "Air Canada"),
+    ("ROU", "A320"): (AIRCANADA + "A320r.png", "Air Canada"),
+    ("ROU", "A321"): (AIRCANADA + "A321r.png", "Air Canada"),
+}
+
 # ICAO type -> the all-white illustration of it (airliners, props, bizjets).
 BLANKS = {
     "A318": "2018/01/A318_cfm56_white_sm.jpg",
@@ -252,9 +308,12 @@ BLANKS = {
 
 
 def fetch(path, cache):
-    local = os.path.join(cache, path.replace("/", "_"))
+    """A source image, downloaded once into the cache: a norebbo.com uploads
+    path, or a full URL (the airlines' own)."""
+    url = path if path.startswith("http") else UPLOADS + path
+    local = os.path.join(cache, re.sub(r"[^A-Za-z0-9._-]", "_", path.split("://")[-1]))
     if not os.path.exists(local):
-        req = urllib.request.Request(UPLOADS + path, headers={"User-Agent": USER_AGENT})
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=30) as r:
             data = r.read()
         with open(local, "wb") as f:
@@ -264,24 +323,29 @@ def fetch(path, cache):
 
 
 def gear_up_plane(path):
-    """The top plane of Norebbo's gear-up / gear-down pair, as an RGBA
-    image cropped to the plane, background made transparent."""
+    """The gear-up plane as an RGBA image cropped to it, background
+    transparent. Norebbo's pair (gear up above gear down) gives the top one;
+    a lone plane (the airlines' art) is taken whole. A source with real
+    transparency keeps it; one drawn on white is matted off the white."""
     import numpy as np
-    from PIL import Image
+    from PIL import Image, ImageFilter
     from scipy import ndimage
 
     src = Image.open(path)
-    if src.mode in ("RGBA", "LA", "P"):  # a transparent PNG: onto white, like the site's JPEGs
-        src = src.convert("RGBA")
-        white = Image.new("RGBA", src.size, (255, 255, 255, 255))
-        white.alpha_composite(src)
-        src = white
+    src = src.convert("RGBA") if src.mode in ("RGBA", "LA", "P") else src.convert("RGB")
     if src.width > 2048:  # bought art is 5000 px wide - plenty at 2048, and far quicker
         src = src.resize((2048, round(src.height * 2048 / src.width)), Image.LANCZOS)
-    rgb = np.asarray(src.convert("RGB")).astype(np.float32)
+    arr = np.asarray(src).astype(np.float32)
+    native = arr.shape[2] == 4 and (arr[..., 3] < 128).mean() > 0.05  # real transparency
+    if native:
+        a = arr[..., 3] / 255.0
+        white = arr[..., :3] * a[..., None] + 255.0 * (1 - a[..., None])  # as if on white
+        rgb, ink = white, a > 0.5
+    else:
+        rgb = arr[..., :3]
+        ink = rgb.min(axis=2) < 240
     h, w, _ = rgb.shape
     lo = rgb.min(axis=2)
-    ink = lo < 240
     # The gear-down plane is the gear-up one again, straight below it: find
     # that offset (where the drawing best overlaps itself shifted down)...
     small = ink[::2, ::2]
@@ -310,24 +374,34 @@ def gear_up_plane(path):
     ink = ndimage.binary_closing(ink, np.ones((5, 5)))
     # the silhouette: that ink plus whatever it encloses (white paint)
     solid = ndimage.binary_fill_holes(ndimage.binary_closing(region, np.ones((3, 3))))
-    bg_lab, _ = ndimage.label((lo >= 250) & ~solid)
-    edge = set(np.unique(np.concatenate([bg_lab[0], bg_lab[-1], bg_lab[:, 0], bg_lab[:, -1]]))) - {0}
-    keep = ~np.isin(bg_lab, list(edge))
-    keep &= ~ndimage.binary_dilation(ink & ~region & ~solid, iterations=2)  # the other plane
-    keep = ndimage.binary_fill_holes(keep) & ndimage.binary_dilation(solid, iterations=3)
-    # soft edge: rim pixels are un-blended from the white they were drawn on
-    alpha = keep.astype(np.float32)
-    rim = keep & ndimage.binary_dilation(~keep, iterations=2)
-    alpha[rim] = np.clip((255.0 - lo[rim]) / 55.0, 0, 1)
-    a3 = np.maximum(alpha, 1e-3)[..., None]
-    out = rgb.copy()
-    out[rim] = np.clip(((rgb - (1 - a3) * 255.0) / a3)[rim], 0, 255)
+    if native:  # the source's own edges are the best there are: keep them
+        keep = ndimage.binary_dilation(solid, iterations=3)
+        alpha = np.where(keep, arr[..., 3] / 255.0, 0.0).astype(np.float32)
+        out = arr[..., :3].copy()
+    else:
+        bg_lab, _ = ndimage.label((lo >= 250) & ~solid)
+        edge = set(np.unique(np.concatenate([bg_lab[0], bg_lab[-1], bg_lab[:, 0], bg_lab[:, -1]]))) - {0}
+        keep = ~np.isin(bg_lab, list(edge))
+        keep &= ~ndimage.binary_dilation(ink & ~region & ~solid, iterations=2)  # the other plane
+        keep = ndimage.binary_fill_holes(keep) & ndimage.binary_dilation(solid, iterations=3)
+        # soft edge: rim pixels are un-blended from the white they were drawn on.
+        # Near-white rim pixels are JPEG ringing, not plane: they go clear, so
+        # no pale fringe shows against the dark screen.
+        alpha = keep.astype(np.float32)
+        rim = keep & ndimage.binary_dilation(~keep, iterations=2)
+        alpha[rim] = np.clip((248.0 - lo[rim]) / 58.0, 0, 1)
+        a3 = np.maximum(alpha, 1e-3)[..., None]
+        out = rgb.copy()
+        out[rim] = np.clip(((rgb - (1 - a3) * 255.0) / a3)[rim], 0, 255)
     rgba = np.dstack([out, alpha * 255]).astype(np.uint8)
     ys, xs = np.nonzero(alpha > 0.02)
     img = Image.fromarray(rgba[ys.min():ys.max() + 1, xs.min():xs.max() + 1], "RGBA")
     if img.width > WIDTH:
         img = img.resize((WIDTH, round(img.height * WIDTH / img.width)), Image.LANCZOS)
-    return img
+    # a touch of sharpening after the downscale (colour only - the edges stay soft)
+    r, g, b, a = img.split()
+    sharp = Image.merge("RGB", (r, g, b)).filter(ImageFilter.UnsharpMask(radius=0.8, percent=55, threshold=2))
+    return Image.merge("RGBA", (*sharp.split(), a))
 
 
 def main():
@@ -340,7 +414,13 @@ def main():
     cache = os.path.join(args.out, ".cache")
     os.makedirs(cache, exist_ok=True)
     index = {"credit": "Norebbo", "liveries": {}, "blanks": {}}
-    jobs = [(f"{liv}_{t}.png", src, ("liveries", liv, t)) for (liv, t), src in LIVERIES.items()]
+    sources = {k: (src, "Norebbo") for k, src in LIVERIES.items()}
+    sources.update(OFFICIAL)  # the airlines' own, where they have them
+    credits = {}
+    jobs = []
+    for (liv, t), (src, credit) in sources.items():
+        jobs.append((f"{liv}_{t}.png", src, ("liveries", liv, t)))
+        credits[src] = credit
     jobs += [(f"blank_{t}.png", src, ("blanks", None, t)) for t, src in BLANKS.items()]
     done = {}
     for name, src, (kind, liv, t) in jobs:
@@ -356,8 +436,13 @@ def main():
                     b.write(a.read())
         except Exception as e:
             print(f"skipped {name} ({src}): {e}", file=sys.stderr)
+            if src.startswith("http"):  # delta.com / aircanada.com turn scripts away
+                print(f"  -> open it in a browser and save it as "
+                      f"{os.path.join(cache, re.sub(r'[^A-Za-z0-9._-]', '_', src.split('://')[-1]))}",
+                      file=sys.stderr)
             continue
-        entry = {"file": name, "source": UPLOADS + src}
+        entry = {"file": name, "source": src if src.startswith("http") else UPLOADS + src,
+                 "credit": credits.get(src, "Norebbo")}
         if kind == "liveries":
             index["liveries"].setdefault(liv, {})[t] = entry
         else:
@@ -375,7 +460,7 @@ def main():
         except Exception as e:
             print(f"skipped {name}: {e}", file=sys.stderr)
             continue
-        entry = {"file": out, "source": "bought: " + name}
+        entry = {"file": out, "source": "bought: " + name, "credit": "Norebbo"}
         if liv.lower() == "blank":
             index["blanks"][t] = entry
         else:

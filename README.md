@@ -432,8 +432,12 @@ the screen from its own Power port.
     Delta, Southwest, Alaska, the regionals, and the international carriers
     at IAD. There are about 110 blank types, including private jets
     (Gulfstream G550/G650, Global 5000/7500, Learjet 45/60, Falcon 50,
-    Citation X, King Air). Norebbo's art is for personal use, so it isn't in
-    this repo. Build it on your PC and copy it to the Pi:
+    Citation X, King Air). Where United, Delta or Air Canada publish their
+    own side views on their fleet pages, those are used instead: they're in
+    the current livery, and they fill gaps like United Express, Delta
+    Connection and Air Canada Express. The credit under the picture names
+    whose art it is. None of this art is in this repo; Norebbo's is for
+    personal use. Build it on your PC and copy it to the Pi:
 
     ```sh
     pip install pillow numpy scipy
@@ -443,7 +447,9 @@ the screen from its own Power port.
 
     It downloads each illustration once, cuts out the gear-up plane onto a
     transparent background, and writes the PNGs and an `index.json`. `out/`
-    is gitignored; don't share the images.
+    is gitignored; don't share the images. delta.com and aircanada.com turn
+    away scripted downloads. For each one it skips, the script prints the
+    file name to save the image as from your browser, then you run it again.
   - **Photos** come from [Planespotters.net](https://www.planespotters.net)
     when there's no illustration for the type. Their terms ask for the
     photographer's name, a QR code to the photo's page on a screen you
