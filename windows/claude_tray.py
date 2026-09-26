@@ -7,7 +7,7 @@ helper - that sits next to the clock and:
   - shows your 5-hour / weekly usage at a glance: a meter under Clawd in the
     icon (or the 5-hour % itself), the numbers in the tooltip and menu
   - walks Clawd while Claude is working, on any of your machines
-  - switches the display between its usage, Spotify, 3D printer, planes and F1 screens
+  - switches the display between its usage, Spotify, 3D printer, planes, F1 and Metro screens
     (left-click the icon to cycle, or pick one from the menu)
   - tells the display exactly when Claude Code is working on this PC: one
     click installs the Claude Code hooks (server/display_hook.py), and the
@@ -514,6 +514,8 @@ class TrayApp:
                  checked=lambda _: self.mode == "planes", enabled=lambda _: self.online),
             Item("Formula 1 screen", self.on_mode("f1"), radio=True,
                  checked=lambda _: self.mode == "f1", enabled=lambda _: self.online),
+            Item("Metro screen", self.on_mode("metro"), radio=True,
+                 checked=lambda _: self.mode == "metro", enabled=lambda _: self.online),
             Menu.SEPARATOR,
             Item("Track Claude with hooks (exact)", self.on_hooks,
                  checked=lambda _: hooks_status()["ours"] is not None,
@@ -526,6 +528,7 @@ class TrayApp:
             Item("Start with Windows", self.on_startup, checked=lambda _: startup_enabled()),
             Item(lambda _: f"Display address: {self.settings['host']}...", self.on_address),
             Item("Planes log...", self.on_planes_log, enabled=lambda _: self.online),
+            Item("Metro station...", self.on_metro_station, enabled=lambda _: self.online),
             Menu.SEPARATOR,
             Item("Refresh", lambda: self.poll_soon.set()),
             Item("Quit", self.on_quit),
@@ -535,6 +538,10 @@ class TrayApp:
         """Every plane the display's planes screen has shown, in the browser."""
         webbrowser.open(f"http://{self.settings['host']}:{self.settings['port']}/planes/log")
 
+    def on_metro_station(self):
+        """The display's page for picking your Metro station, in the browser."""
+        webbrowser.open(f"http://{self.settings['host']}:{self.settings['port']}/metro")
+
     def on_mode(self, what):
         def switch():
             def result(code):
@@ -543,6 +550,9 @@ class TrayApp:
                                 "claude_display.py --setup-bambu on the Pi.")
                 elif code == 409 and what == "f1":
                     self.notify("The F1 screen is turned off in the display's config.ini.")
+                elif code == 409 and what == "metro":
+                    self.notify("The Metro screen needs a WMATA api key first - run "
+                                "claude_display.py --setup-metro on the Pi.")
                 elif code == 409 and what == "planes":
                     self.notify("The planes screen needs your location first - run "
                                 "claude_display.py --setup-planes on the Pi.")
@@ -550,7 +560,7 @@ class TrayApp:
                     self.notify("Spotify isn't set up on the display yet - see the README.")
                 elif code == 404:
                     self.notify("This display doesn't have that screen (the 3D printer, "
-                                "planes and F1 screens are in the Raspberry Pi app).")
+                                "planes, F1 and Metro screens are in the Raspberry Pi app).")
             self.post_async(f"/mode/{what}", result)
         return switch
 

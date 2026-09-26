@@ -10,9 +10,9 @@ official touchscreen:
   - a spinner while Claude is working, driven by the same HTTP beacons
     (POST /thinking/on, /thinking/off) from Claude Code hooks or beacon.py
   - optional screens for Spotify's now playing, a Bambu Lab print's
-    progress, the planes flying overhead, and Formula 1 (POST /mode/spotify,
-    /mode/bambu, /mode/planes, /mode/f1, /mode/usage, /mode/toggle - or tap
-    the screen)
+    progress, the planes flying overhead, Formula 1, and Washington's Metro
+    (POST /mode/spotify, /mode/bambu, /mode/planes, /mode/f1, /mode/metro,
+    /mode/usage, /mode/toggle - or tap the screen)
 
 It speaks the firmware's HTTP API on the same port, so the hooks, beacon.py,
 find_display.py and the /switch command work unchanged - point them at the Pi.
@@ -24,6 +24,7 @@ reads that).
     python3 pi/claude_display.py --demo               # fake data, no logins needed
     python3 pi/claude_display.py --setup-bambu        # add your Bambu Lab printer
     python3 pi/claude_display.py --setup-planes       # your location, for planes overhead
+    python3 pi/claude_display.py --setup-metro        # WMATA key and your Metro station
 
 Settings live in ~/.config/claude-display/config.ini (see config.example.ini);
 pi/install.sh sets everything up to start fullscreen on boot. Needs pygame 2
@@ -85,8 +86,9 @@ SPOTIFY_NOW_URL = ("https://api.spotify.com/v1/me/player/currently-playing"
 
 ROOT_TEXT = ("Claude Code usage display (Raspberry Pi). POST /thinking/on while "
              "working, /thinking/off when done. POST /mode/usage, /mode/spotify, "
-             "/mode/bambu, /mode/planes, /mode/f1 or /mode/toggle to switch screens; GET /mode to ask; "
-             "GET /planes/log for every plane the planes screen has shown; "
+             "/mode/bambu, /mode/planes, /mode/f1, /mode/metro or /mode/toggle to switch screens; "
+             "GET /mode to ask; GET /planes/log for every plane the planes screen has shown; "
+             "GET /metro to pick your Metro station; "
              "GET /usage for JSON.\n")
 
 # ---- palette: the firmware's RGB565 colours, in full RGB ----
@@ -104,7 +106,7 @@ COL_BAMBU = (35, 165, 67)     # Bambu Lab green
 COL_EYE = (0, 0, 0)
 
 # The screens, in the order a tap or /mode/toggle cycles through them.
-MODES = ("usage", "spotify", "bambu", "planes", "f1")
+MODES = ("usage", "spotify", "bambu", "planes", "f1", "metro")
 
 # The Spotify mark's three strokes, measured off the logo, in units of the
 # circle's radius from its centre: (start, bend, end, width at start, at end).
@@ -201,6 +203,9 @@ class Config:
         self.planes_poll = max(5.0, num("planes", "poll_seconds", 10))
         self.planes_liveries = os.path.expanduser(s("planes", "liveries") or LIVERY_DIR)
         self.f1_enabled = s("f1", "enabled").lower() not in ("no", "false", "off", "0")
+        self.metro_key = s("metro", "api_key")
+        self.metro_station = s("metro", "station")
+        self.metro_poll = max(10.0, num("metro", "poll_seconds", 10))
 
     @property
     def planes_ready(self):
@@ -426,10 +431,10 @@ class Model:
     """Everything on screen, shared by the workers, the HTTP server and the renderer."""
 
     def __init__(self, cfg, state, spotify_ready, bambu_ready=False, planes_ready=False,
-                 f1_ready=False):
+                 f1_ready=False, metro_ready=False):
         self.cfg, self.state = cfg, state
         self.ready = {"usage": True, "spotify": spotify_ready, "bambu": bambu_ready,
-                      "planes": planes_ready, "f1": f1_ready}
+                      "planes": planes_ready, "f1": f1_ready, "metro": metro_ready}
         self.lock = threading.Lock()
         saved = state.get("mode")
         self.mode = saved if self.ready.get(saved) else "usage"
@@ -453,6 +458,8 @@ class Model:
         self.planes_status = None
         self.f1 = None             # the F1 screen: see f1_worker
         self.f1_status = None
+        self.metro = {}            # the Metro screen: see metro_worker
+        self.metro_status = None
         self.remote_sessions = {}  # sender -> (monotonic time, [session summaries])
 
         self.last_beacon = 0.0     # monotonic time of the last "thinking" ping, 0 = off
@@ -464,6 +471,7 @@ class Model:
         self.bambu_wake = threading.Event()
         self.planes_wake = threading.Event()
         self.f1_wake = threading.Event()
+        self.metro_wake = threading.Event()
 
     # -- beacons: "thinking" is sticky between on and off; the TTL is a backstop
     def thinking(self, now=None):
@@ -493,6 +501,8 @@ class Model:
                 self.planes_status = ("looking for planes...", COL_DIM)
             if mode == "f1" and self.f1 is None:
                 self.f1_status = ("loading the F1 season...", COL_DIM)
+            if mode == "metro" and not self.metro.get("trains_at"):
+                self.metro_status = ("finding the trains...", COL_DIM)
         self.state.put("mode", mode)
         if mode == "spotify":
             self.spotify_wake.set()
@@ -502,6 +512,8 @@ class Model:
             self.planes_wake.set()
         elif mode == "f1":
             self.f1_wake.set()
+        elif mode == "metro":
+            self.metro_wake.set()
         else:  # back on the usage screen: refresh numbers gone stale off-screen
             now = time.monotonic()
             if now >= self.backoff_until and now - self.usage_ok_at > self.cfg.usage_poll:
@@ -579,6 +591,33 @@ class Model:
         with self.lock:
             self.f1_status = (text, color)
 
+    def set_metro(self, **changes):
+        with self.lock:
+            self.metro = dict(self.metro, **changes)
+
+    def set_metro_status(self, text, color):
+        with self.lock:
+            self.metro_status = (text, color)
+
+    def metro_station(self):
+        """Your station's map node: picked on the /metro page, else config.ini's."""
+        net = self.metro.get("net")
+        if net is None:
+            return None
+        picked = self.state.get("metro_station")
+        return picked if picked in net.lines_at else net.find(self.cfg.metro_station)
+
+    def choose_metro_station(self, text):
+        """Make a station (code or name) yours; its name, or None if unknown."""
+        net = self.metro.get("net")
+        node = net and net.find(urllib.parse.unquote_plus(text))
+        if not node or node not in net.lines_at:
+            return None
+        self.state.put("metro_station", node)
+        self.set_metro(predictions=None)
+        self.metro_wake.set()  # its trains now, not at the next poll
+        return net.names[node]
+
     def drop_plane_photo(self):
         with self.lock:
             if self.sky and self.sky.get("photo"):
@@ -614,6 +653,7 @@ class Model:
 
     def snapshot(self):
         now = time.monotonic()
+        station = self.metro_station() if self.mode == "metro" else None
         with self.lock:
             flash = self.flash_msg if self.flash_msg and self.flash_msg[2] > now else None
             return SimpleNamespace(
@@ -625,8 +665,9 @@ class Model:
                 printer_name=self.cfg.bambu_name or "3D printer",
                 sky=self.sky, planes_status=self.planes_status,
                 f1=self.f1, f1_status=self.f1_status,
+                metro=self.metro, metro_status=self.metro_status, metro_station=station,
                 thinking=self.thinking(now), flash=flash and flash[:2],
-                host=self.host, ip=self.ip, mono=now)
+                host=self.host, ip=self.ip, port=self.cfg.port, mono=now)
 
     def usage_json(self):
         """GET /usage - the numbers on screen, for the tray helper and friends."""
@@ -1328,7 +1369,7 @@ def airline_code(callsign):
     return callsign[:3] if re.match(r"^[A-Z]{3}\d", callsign or "") else ""
 
 
-def cached_download(url, name, max_age=30 * 86400):
+def cached_download(url, name, max_age=30 * 86400, headers=None):
     """A reference file, kept in CACHE_DIR and fetched again once it's a
     month old - a stale copy beats none when the fetch fails."""
     path = os.path.join(CACHE_DIR, name)
@@ -1338,7 +1379,8 @@ def cached_download(url, name, max_age=30 * 86400):
         fresh = None  # no copy yet
     if not fresh:
         try:
-            code, raw, _ = http(url, headers={"User-Agent": PLANES_USER_AGENT}, timeout=20)
+            code, raw, _ = http(url, headers={"User-Agent": PLANES_USER_AGENT, **(headers or {})},
+                                timeout=20)
             if code != 200 or not raw:
                 raise OSError(f"{name}: HTTP {code}")
             os.makedirs(CACHE_DIR, exist_ok=True)
@@ -2857,6 +2899,335 @@ def f1_follow_live(model, event, session, track, base):
     return ("live", last["tower"]) if last and last["tower"] else None
 
 
+# ---------------------------------------------------------------- wmata metro
+#
+# Washington's Metrorail, from WMATA's own API (a free key from
+# developer.wmata.com). The stations and each line's "standard route" - every
+# track circuit along it in order, the stations among them - make the map;
+# TrainPositions says which circuit each train is on, fresh about every 10 s.
+# Your station's next trains are the predictions the platform signs show.
+
+WMATA_API = "https://api.wmata.com/"
+WMATA_STATIONS = WMATA_API + "Rail.svc/json/jStations"
+WMATA_ROUTES = WMATA_API + "TrainPositions/StandardRoutes?contentType=json"
+WMATA_TRAINS = WMATA_API + "TrainPositions/TrainPositions?contentType=json"
+WMATA_PREDICTIONS = WMATA_API + "StationPrediction.svc/json/GetPrediction/{codes}"
+WMATA_INCIDENTS = WMATA_API + "Incidents.svc/json/Incidents"
+# in the order they sit side by side where they share track
+METRO_LINES = {"RD": ("Red", (191, 13, 62)), "OR": ("Orange", (237, 139, 0)),
+               "SV": ("Silver", (178, 186, 186)), "BL": ("Blue", (0, 156, 222)),
+               "YL": ("Yellow", (255, 209, 0)), "GR": ("Green", (0, 177, 64))}
+METRO_CENTER = (38.8983, -77.0281)  # Metro Center, the middle of the map
+METRO_FISHEYE_KM = 1.5  # downtown is magnified, the ends of the lines pulled in
+METRO_PREDICT_SECS = 20   # the signs' predictions change about this often
+METRO_INCIDENT_SECS = 120
+
+
+def wmata_get(url, key, timeout=10):
+    """(status, parsed JSON or None) from WMATA's API. Network errors raise."""
+    code, raw, _ = http(url, headers={"api_key": key, "Accept": "application/json",
+                                      "User-Agent": PLANES_USER_AGENT}, timeout=timeout)
+    try:
+        return code, json.loads(raw) if raw else None
+    except ValueError:
+        return code, None
+
+
+class MetroNetwork:
+    """The map: stations (a transfer station's two platforms - Metro Center's
+    A01 and C01 - are one node), each line's stations in order, and where
+    every track circuit sits between them."""
+
+    def __init__(self, stations, routes):
+        self.canon, self.codes, self.names, self.pos = {}, {}, {}, {}
+        for s in stations:
+            code = s.get("Code") if isinstance(s, dict) else None
+            try:
+                lat, lon = float(s["Lat"]), float(s["Lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not code:
+                continue
+            node = min([code] + [c for c in (s.get("StationTogether1"), s.get("StationTogether2")) if c])
+            self.canon[code] = node
+            self.codes.setdefault(node, set()).add(code)
+            self.names.setdefault(node, s.get("Name") or code)
+            if code == node or node not in self.pos:
+                self.pos[node] = (lat, lon)
+        self.routes = {}      # (line, track) -> ([circuit index of each station], [its node])
+        self.circuits = {}    # circuit id -> [(line, track, index)]
+        self.line_nodes = {}  # line -> its stations in order
+        for r in routes:
+            line, track = (r.get("LineCode"), r.get("TrackNum")) if isinstance(r, dict) else (None, None)
+            if line not in METRO_LINES:
+                continue
+            circuits = sorted((c for c in r.get("TrackCircuits") or [] if isinstance(c, dict)),
+                              key=lambda c: c.get("SeqNum") or 0)
+            idx, nodes = [], []
+            for i, c in enumerate(circuits):
+                self.circuits.setdefault(c.get("CircuitId"), []).append((line, track, i))
+                node = self.canon.get(c.get("StationCode"))
+                if node in self.pos and (not nodes or nodes[-1] != node):
+                    idx.append(i)
+                    nodes.append(node)
+            if len(nodes) >= 2:
+                self.routes[(line, track)] = (idx, nodes)
+                if track == 1 or line not in self.line_nodes:
+                    self.line_nodes[line] = nodes
+        if not self.line_nodes:
+            raise ValueError("no lines in the standard routes")
+        self.found = {}     # find()'s answers
+        self.lines_at = {}  # node -> the lines that stop there, in METRO_LINES order
+        for line in METRO_LINES:
+            for node in self.line_nodes.get(line, ()):
+                self.lines_at.setdefault(node, []).append(line)
+
+    def locate(self, circuit, line=None):
+        """(line, track, index) of a track circuit - on the train's own line's
+        route if it's on several - or None off the standard routes (yards)."""
+        spots = [s for s in self.circuits.get(circuit, ()) if s[:2] in self.routes]
+        return next((s for s in spots if s[0] == line), spots[0] if spots else None)
+
+    def stations(self):
+        """[(node, name, lines)] of every station on a line, by name."""
+        return sorted(((n, self.names[n], self.lines_at[n]) for n in self.lines_at),
+                      key=lambda s: s[1].lower())
+
+    def find(self, text):
+        """The station node for a code or (part of) a name, or None."""
+        text = (text or "").strip()
+        if text not in self.found:
+            self.found[text] = self._find(text)
+        return self.found[text]
+
+    def _find(self, text):
+        if text.upper() in self.canon:
+            return self.canon[text.upper()]
+        want = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        if not want:
+            return None
+        norm = [(re.sub(r"[^a-z0-9]+", " ", name.lower()).strip(), node) for node, name, _ in self.stations()]
+        exact = [node for name, node in norm if name == want]
+        hits = exact or sorted((len(name), node) for name, node in norm if want in name)
+        return (hits[0] if exact else hits[0][1]) if hits else None
+
+
+def metro_network(key):
+    """The map, from WMATA's stations and standard routes (cached a month)."""
+    headers = {"api_key": key, "Accept": "application/json"}
+    stations = json.loads(cached_download(WMATA_STATIONS, "wmata_stations.json", headers=headers))
+    routes = json.loads(cached_download(WMATA_ROUTES, "wmata_routes.json", headers=headers))
+    return MetroNetwork(stations.get("Stations") or [], routes.get("StandardRoutes") or [])
+
+
+def metro_trains(data, net):
+    """TrainId -> where the train is, for every train on a line's route."""
+    out = {}
+    for t in (data or {}).get("TrainPositions") or []:
+        if not isinstance(t, dict):
+            continue
+        line = t.get("LineCode") if t.get("LineCode") in METRO_LINES else None
+        spot = net.locate(t.get("CircuitId"), line)
+        if spot:
+            out[str(t.get("TrainId"))] = {
+                "line": line, "route": spot[:2], "idx": spot[2], "cars": t.get("CarCount") or 0,
+                "dest": net.canon.get(t.get("DestinationStationCode")),
+                "service": line is not None and t.get("ServiceType") == "Normal"}
+    return out
+
+
+def metro_project(lat, lon):
+    """Map units - km east and south of Metro Center - through a fisheye, so
+    downtown's tangle gets room and Ashburn doesn't stretch the map."""
+    x = (lon - METRO_CENTER[1]) * 111.32 * math.cos(math.radians(METRO_CENTER[0]))
+    y = (METRO_CENTER[0] - lat) * 110.57
+    r = math.hypot(x, y)
+    k = METRO_FISHEYE_KM * math.log1p(r / METRO_FISHEYE_KM) / r if r > 1e-9 else 1.0
+    return x * k, y * k
+
+
+def metro_glide(prev, trains):
+    """Each train's previous spot, so the map can slide it from there to
+    the new one (a train that changed route, or jumped, just moves)."""
+    for tid, t in trains.items():
+        p = prev.get(tid)
+        t["from"] = p["idx"] if p and p["route"] == t["route"] and abs(p["idx"] - t["idx"]) <= 12 else None
+    return trains
+
+
+def metro_predictions(key, codes):
+    """The next trains at a station (all its platforms), soonest first."""
+    code, data = wmata_get(WMATA_PREDICTIONS.format(codes=",".join(sorted(codes))), key)
+    if code != 200 or not isinstance(data, dict):
+        raise OSError(f"predictions: HTTP {code}")
+    rows = []
+    for t in data.get("Trains") or []:
+        if not isinstance(t, dict) or t.get("Line") not in METRO_LINES:
+            continue  # "No Passenger" and the like
+        m = str(t.get("Min") or "").strip()
+        wait = 0.0 if m == "BRD" else 0.5 if m == "ARR" else int(m) if m.isdigit() else None
+        if wait is None:
+            continue  # "---": on its way, no estimate yet
+        cars = str(t.get("Car") or "").strip()
+        rows.append({"line": t["Line"], "dest": t.get("DestinationName") or t.get("Destination") or "",
+                     "cars": cars if cars.isdigit() else "", "min": m, "wait": wait,
+                     "group": str(t.get("Group") or "")})
+    return sorted(rows, key=lambda r: r["wait"])
+
+
+def metro_incidents(key):
+    """Rail alerts: [{"lines", "text"}]."""
+    code, data = wmata_get(WMATA_INCIDENTS, key)
+    if code != 200 or not isinstance(data, dict):
+        raise OSError(f"incidents: HTTP {code}")
+    return [{"lines": [x for x in re.split(r"[;,\s]+", i.get("LinesAffected") or "") if x in METRO_LINES],
+             "text": re.sub(r"\s+", " ", i.get("Description") or "").strip()}
+            for i in data.get("Incidents") or [] if isinstance(i, dict) and i.get("Description")]
+
+
+def metro_alert(incidents, lines):
+    """The first alert about one of these lines (any alert, with no station)."""
+    return next((i["text"] for i in incidents or () if not lines or set(i["lines"]) & set(lines)), "")
+
+
+def metro_worker(model):
+    """Load the map once, then - while the Metro screen is up - follow the
+    trains, and the next ones at your station."""
+    key = model.cfg.metro_key
+    net = None
+    trains, trains_at = {}, 0.0
+    shown, predicted_at, incidents_at = None, 0.0, 0.0
+    while True:
+        if net is None:
+            try:
+                net = metro_network(key)
+                model.set_metro(net=net)
+                log(f"metro map: {len(net.lines_at)} stations, {len(net.routes)} routes")
+            except Exception as e:
+                log(f"metro map: {e}")
+                refused = "HTTP 401" in str(e)
+                model.set_metro_status("WMATA refused the api key - see [metro] in config.ini"
+                                       if refused else "WMATA unreachable - retrying", COL_RED)
+                model.metro_wake.wait(900 if refused else 60)
+                model.metro_wake.clear()
+                continue
+        if model.mode != "metro":
+            model.metro_wake.wait()
+            model.metro_wake.clear()
+            continue
+        t = time.monotonic()
+        try:
+            code, data = wmata_get(WMATA_TRAINS, key)
+            if code != 200:
+                raise OSError(f"train positions: HTTP {code}")
+            trains = metro_glide(trains, metro_trains(data, net))
+            model.set_metro(trains=trains, trains_at=t, glide=min(30.0, max(2.0, t - trains_at)))
+            trains_at = t
+            running = sum(1 for tr in trains.values() if tr["service"])
+            model.set_metro_status(f"{running} train{'s' if running != 1 else ''} running  ·  data: WMATA",
+                                   COL_GREEN)
+        except Exception as e:
+            log(f"metro trains: {e}")
+            model.set_metro_status("WMATA refused the api key - see [metro] in config.ini" if "401" in str(e)
+                                   else "train positions unreachable - retrying", COL_RED)
+        station = model.metro_station()
+        if station and (station != shown or t - predicted_at >= METRO_PREDICT_SECS):
+            try:
+                model.set_metro(predictions=(station, metro_predictions(key, net.codes[station])))
+                shown, predicted_at = station, t
+            except Exception as e:
+                log(f"metro predictions: {e}")
+                predicted_at = t - METRO_PREDICT_SECS / 2  # try again in 10 s
+        if t - incidents_at >= METRO_INCIDENT_SECS:
+            try:
+                model.set_metro(incidents=metro_incidents(key))
+            except Exception as e:
+                log(f"metro incidents: {e}")
+            incidents_at = t
+        model.metro_wake.wait(max(0.0, model.cfg.metro_poll - (time.monotonic() - t)))
+        model.metro_wake.clear()
+
+
+def metro_page_html(net, current, error=""):
+    """GET /metro: pick the display's station from any phone or computer."""
+    esc = html.escape
+    out = ['<!doctype html><html><head><meta charset="utf-8">',
+           '<meta name="viewport" content="width=device-width, initial-scale=1">',
+           "<title>Metro station</title><style>",
+           ":root{color-scheme:dark}body{background:#121212;color:#e6e6e6;margin:24px;",
+           "font:16px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;max-width:560px}",
+           "h1{font-size:22px;margin:0 0 4px}p{color:#8a8a8a;margin:0 0 16px}",
+           ".now{color:#e6e6e6;font-weight:600}.err{color:#e6514a}",
+           "input,button{font:inherit;color:inherit;background:#1e1e1e;border:1px solid #3a3a3a;",
+           "border-radius:8px;padding:10px 12px}input{width:100%;box-sizing:border-box;margin-bottom:12px}",
+           "ul{list-style:none;padding:0;margin:0}li{margin:0 0 6px}",
+           "button{width:100%;text-align:left;cursor:pointer;display:flex;align-items:center;gap:10px}",
+           "button:hover{border-color:#777}button.on{border-color:#e6e6e6}",
+           ".dot{width:12px;height:12px;border-radius:50%;display:inline-block;flex:none}",
+           ".dots{display:flex;gap:4px;margin-left:auto}</style></head><body>",
+           "<h1>Metro: your station</h1>"]
+    if net is None:
+        out.append("<p>The display hasn't loaded the Metro map yet - check the [metro] api_key "
+                   "in its config.ini.</p></body></html>")
+        return "".join(out)
+    now = f'<span class="now">{esc(net.names[current])}</span>' if current else "none yet"
+    out.append(f"<p>The display shows the next trains at: {now}. Tap a station to change it.</p>")
+    if error:
+        out.append(f'<p class="err">{esc(error)}</p>')
+    out.append('<input id="q" placeholder="Search stations" autocomplete="off" autofocus>'
+               '<form method="post" action="/metro/station"><ul id="list">')
+    for node, name, lines in net.stations():
+        dots = "".join(f'<span class="dot" style="background:rgb{METRO_LINES[l][1]}" '
+                       f'title="{METRO_LINES[l][0]}"></span>' for l in lines)
+        on = ' class="on"' if node == current else ""
+        out.append(f'<li><button name="station" value="{esc(node)}"{on}>{esc(name)}'
+                   f'<span class="dots">{dots}</span></button></li>')
+    out.append("</ul></form><script>const q=document.getElementById('q');"
+               "q.addEventListener('input',()=>{const w=q.value.toLowerCase();"
+               "for(const li of document.querySelectorAll('#list li'))"
+               "li.style.display=li.textContent.toLowerCase().includes(w)?'':'none'});"
+               "</script></body></html>")
+    return "\n".join(out)
+
+
+def setup_metro(config_path):
+    """--setup-metro: the WMATA api key and your station."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "server"))
+    from device_login import save_to_config
+
+    print("The Metro screen needs a free WMATA api key:")
+    print("  1. sign up at https://developer.wmata.com")
+    print("  2. Products > subscribe to 'Default Tier'")
+    print("  3. Profile > copy the Primary key")
+    key = input("WMATA api key: ").strip()
+    if not key:
+        sys.exit("No key given.")
+    try:
+        net = metro_network(key)
+    except Exception as e:
+        sys.exit(f"Couldn't load the Metro map with that key ({e}).")
+    print(f"Key works: {len(net.lines_at)} stations.")
+    station = ""
+    while True:
+        text = input("Your station (part of its name; Enter to skip): ").strip()
+        if not text:
+            break
+        want = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+        hits = [s for s in net.stations() if want in re.sub(r"[^a-z0-9]+", " ", s[1].lower())]
+        if not hits:
+            print("  no station matches that")
+            continue
+        for i, (_, name, lines) in enumerate(hits[:12], 1):
+            print(f"  {i}. {name} ({', '.join(METRO_LINES[l][0] for l in lines)})")
+        pick = input("Which one? [1]: ").strip() or "1"
+        if pick.isdigit() and 1 <= int(pick) <= min(12, len(hits)):
+            station = hits[int(pick) - 1][1]
+            break
+    save_to_config(config_path, "metro", {"api_key": key, "station": station})
+    print(f"Saved to [metro] in {config_path}. Restart the display, then tap through to it.")
+    print("Change the station any time from a browser: http://<the display>:8080/metro")
+
+
 # ---------------------------------------------------------------- demo data
 
 def demo_art():
@@ -2962,9 +3333,123 @@ def demo_f1_track():
                      "corners": [{}] * 14, "pitLoss": {"normal": "20.5"}})
 
 
+# --demo's Metro: the real stations (positions to a few hundred metres) and
+# lines, so the screen can be tried without a WMATA key.
+DEMO_METRO_STATIONS = """
+A01 Metro Center 38.8983 -77.0281|A02 Farragut North 38.9032 -77.0397|A03 Dupont Circle 38.9096 -77.0434
+A04 Woodley Park-Zoo/Adams Morgan 38.9250 -77.0525|A05 Cleveland Park 38.9347 -77.0580
+A06 Van Ness-UDC 38.9431 -77.0630|A07 Tenleytown-AU 38.9479 -77.0795|A08 Friendship Heights 38.9601 -77.0856
+A09 Bethesda 38.9843 -77.0941|A10 Medical Center 38.9999 -77.0969|A11 Grosvenor-Strathmore 39.0294 -77.1040
+A12 North Bethesda 39.0481 -77.1131|A13 Twinbrook 39.0624 -77.1210|A14 Rockville 39.0843 -77.1461
+A15 Shady Grove 39.1199 -77.1646|B01 Gallery Place 38.8983 -77.0219|B02 Judiciary Square 38.8960 -77.0166
+B03 Union Station 38.8977 -77.0074|B35 NoMa-Gallaudet U 38.9070 -77.0030|B04 Rhode Island Ave 38.9210 -76.9959
+B05 Brookland-CUA 38.9332 -76.9945|B06 Fort Totten 38.9519 -77.0022|B07 Takoma 38.9757 -77.0181
+B08 Silver Spring 38.9939 -77.0310|B09 Forest Glen 39.0150 -77.0429|B10 Wheaton 39.0384 -77.0507
+B11 Glenmont 39.0619 -77.0535|C01 Metro Center 38.8983 -77.0281|C02 McPherson Square 38.9014 -77.0336
+C03 Farragut West 38.9013 -77.0419|C04 Foggy Bottom-GWU 38.9009 -77.0505|C05 Rosslyn 38.8966 -77.0717
+C06 Arlington Cemetery 38.8845 -77.0632|C07 Pentagon 38.8694 -77.0537|C08 Pentagon City 38.8629 -77.0596
+C09 Crystal City 38.8579 -77.0511|C10 Ronald Reagan Washington National Airport 38.8534 -77.0441
+C11 Potomac Yard 38.8334 -77.0463|C12 Braddock Road 38.8141 -77.0539|C13 King St-Old Town 38.8065 -77.0609
+C14 Eisenhower Avenue 38.8003 -77.0710|C15 Huntington 38.7939 -77.0752|D01 Federal Triangle 38.8932 -77.0282
+D02 Smithsonian 38.8881 -77.0282|D03 L'Enfant Plaza 38.8849 -77.0214|D04 Federal Center SW 38.8850 -77.0158
+D05 Capitol South 38.8850 -77.0051|D06 Eastern Market 38.8841 -76.9956|D07 Potomac Ave 38.8812 -76.9855
+D08 Stadium-Armory 38.8866 -76.9772|D09 Minnesota Ave 38.8993 -76.9467|D10 Deanwood 38.9078 -76.9355
+D11 Cheverly 38.9166 -76.9157|D12 Landover 38.9338 -76.8906|D13 New Carrollton 38.9480 -76.8720
+E01 Mt Vernon Sq 7th St-Convention Center 38.9055 -77.0219|E02 Shaw-Howard U 38.9135 -77.0219
+E03 U Street 38.9170 -77.0282|E04 Columbia Heights 38.9285 -77.0327|E05 Georgia Ave-Petworth 38.9368 -77.0237
+E06 Fort Totten 38.9519 -77.0022|E07 West Hyattsville 38.9551 -76.9694|E08 Hyattsville Crossing 38.9656 -76.9563
+E09 College Park-U of Md 38.9785 -76.9281|E10 Greenbelt 39.0110 -76.9112|F01 Gallery Place 38.8983 -77.0219
+F02 Archives 38.8938 -77.0219|F03 L'Enfant Plaza 38.8849 -77.0214|F04 Waterfront 38.8765 -77.0175
+F05 Navy Yard-Ballpark 38.8766 -77.0051|F06 Anacostia 38.8629 -76.9953|F07 Congress Heights 38.8455 -76.9884
+F08 Southern Avenue 38.8410 -76.9751|F09 Naylor Road 38.8513 -76.9562|F10 Suitland 38.8440 -76.9320
+F11 Branch Ave 38.8264 -76.9115|G01 Benning Road 38.8903 -76.9380|G02 Capitol Heights 38.8894 -76.9115
+G03 Addison Road 38.8867 -76.8938|G04 Morgan Boulevard 38.8937 -76.8680|G05 Downtown Largo 38.9008 -76.8446
+J02 Van Dorn Street 38.7994 -77.1291|J03 Franconia-Springfield 38.7665 -77.1680|K01 Court House 38.8908 -77.0843
+K02 Clarendon 38.8866 -77.0958|K03 Virginia Square-GMU 38.8834 -77.1029|K04 Ballston-MU 38.8821 -77.1116
+K05 East Falls Church 38.8859 -77.1568|K06 West Falls Church 38.9006 -77.1891|K07 Dunn Loring 38.8835 -77.2289
+K08 Vienna 38.8779 -77.2711|N01 McLean 38.9243 -77.2104|N02 Tysons 38.9207 -77.2227
+N03 Greensboro 38.9210 -77.2342|N04 Spring Hill 38.9290 -77.2419|N06 Wiehle-Reston East 38.9478 -77.3401
+N07 Reston Town Center 38.9528 -77.3601|N08 Herndon 38.9530 -77.3854|N09 Innovation Center 38.9601 -77.4151
+N10 Washington Dulles International Airport 38.9559 -77.4481|N11 Loudoun Gateway 38.9924 -77.4602
+N12 Ashburn 39.0056 -77.4910"""
+DEMO_METRO_TOGETHER = {"A01": "C01", "B01": "F01", "D03": "F03", "B06": "E06"}
+DEMO_METRO_LINES = {
+    "RD": "A15 A14 A13 A12 A11 A10 A09 A08 A07 A06 A05 A04 A03 A02 A01 B01 B02 B03 B35 B04 B05 B06 "
+          "B07 B08 B09 B10 B11",
+    "OR": "K08 K07 K06 K05 K04 K03 K02 K01 C05 C04 C03 C02 C01 D01 D02 D03 D04 D05 D06 D07 D08 D09 "
+          "D10 D11 D12 D13",
+    "SV": "N12 N11 N10 N09 N08 N07 N06 N04 N03 N02 N01 K05 K04 K03 K02 K01 C05 C04 C03 C02 C01 D01 "
+          "D02 D03 D04 D05 D06 D07 D08 G01 G02 G03 G04 G05",
+    "BL": "J03 J02 C13 C12 C11 C10 C09 C08 C07 C06 C05 C04 C03 C02 C01 D01 D02 D03 D04 D05 D06 D07 "
+          "D08 G01 G02 G03 G04 G05",
+    "YL": "C15 C14 C13 C12 C11 C10 C09 C08 C07 F03 F02 F01 E01",
+    "GR": "F11 F10 F09 F08 F07 F06 F05 F04 F03 F02 F01 E01 E02 E03 E04 E05 E06 E07 E08 E09 E10"}
+DEMO_METRO_GAP = 4  # track circuits between stations
+
+
+def demo_metro_network():
+    """The Metro in WMATA's JSON shapes, so the real parsing runs on it."""
+    stations = []
+    for item in DEMO_METRO_STATIONS.replace("\n", "|").split("|"):
+        if item.strip():
+            head, lat, lon = item.strip().rsplit(" ", 2)
+            code, name = head.split(" ", 1)
+            together = DEMO_METRO_TOGETHER.get(code) or next(
+                (a for a, b in DEMO_METRO_TOGETHER.items() if b == code), "")
+            stations.append({"Code": code, "Name": name, "Lat": float(lat), "Lon": float(lon),
+                             "StationTogether1": together})
+    routes, circuit = [], 1000
+    for line, codes in DEMO_METRO_LINES.items():
+        codes = codes.split()
+        for track in (1, 2):
+            seq = []
+            for i, code in enumerate(codes if track == 1 else codes[::-1]):
+                if i:
+                    for _ in range(DEMO_METRO_GAP):
+                        seq.append({"SeqNum": len(seq), "CircuitId": circuit, "StationCode": None})
+                        circuit += 1
+                seq.append({"SeqNum": len(seq), "CircuitId": circuit, "StationCode": code})
+                circuit += 1
+            routes.append({"LineCode": line, "TrackNum": track, "TrackCircuits": seq})
+    return MetroNetwork(stations, routes)
+
+
+def demo_metro(model, t, start, net, prev):
+    """--demo: trains every few stations on every line, rolling along; made-up
+    arrivals at your station. Returns the trains, for the next call's glide."""
+    trains = {}
+    for (line, track), (idx, nodes) in net.routes.items():
+        n = idx[-1] + 1
+        for k in range(0, n, 3 * (DEMO_METRO_GAP + 1)):
+            i = int(k + (t - start) / 4) % n  # a circuit every 4 s
+            trains[f"{line}{track}-{k}"] = {"line": line, "route": (line, track), "idx": i, "cars": 8,
+                                            "dest": nodes[-1], "service": k != 15}
+    trains = metro_glide(prev, trains)
+    mono = time.monotonic()
+    model.set_metro(net=net, trains=trains, glide=max(1.0, mono - model.metro.get("trains_at", mono - 1)),
+                    trains_at=mono)
+    station = model.metro_station()
+    if station:
+        rows = []
+        for j, line in enumerate(net.lines_at[station]):
+            ends = net.line_nodes[line][0], net.line_nodes[line][-1]
+            for d, end in enumerate(e for e in ends if e != station):
+                for lap in range(2):
+                    wait = int((j * 3 + d * 5 + lap * 9 - (t - start) / 20) % 18)
+                    rows.append({"line": line, "dest": net.names[end], "cars": "8" if lap else "6",
+                                 "min": "BRD" if wait == 0 else "ARR" if wait == 1 else str(wait - 1),
+                                 "wait": max(0, wait - 1) + (0.5 if wait == 1 else 0), "group": str(d + 1)})
+        model.set_metro(predictions=(station, sorted(rows, key=lambda r: r["wait"])))
+    model.set_metro(incidents=[{"lines": ["RD"], "text": "Red Line: trains single tracking between "
+                                "Grosvenor and Twinbrook for scheduled track work. Expect delays."}])
+    model.set_metro_status(f"{sum(tr['service'] for tr in trains.values())} trains running  ·  data: demo",
+                           COL_GREEN)
+    return trains
+
+
 def demo_worker(model):
     """--demo: moving numbers, a thinking spinner every other 8s, a fake song,
-    a fake print and a fake plane."""
+    a fake print, a fake plane, a race and the Metro."""
     art = demo_art()
     model.set_art("demo:art", art)
     photo = demo_plane_photo()
@@ -2973,12 +3458,16 @@ def demo_worker(model):
     today = datetime.datetime.now().astimezone()
     f1_event = {"key": 0, "name": "Demo Grand Prix", "location": "Demo City", "country": "", "circuit": "Demo",
                 "circuit_key": 0, "year": today.year, "start": today, "end": today, "sessions": []}
+    metro_net, metro_trains_now, metro_step = demo_metro_network(), {}, None
     start = time.time()
     while True:
         t = time.time()
         now = datetime.datetime.now().astimezone()
         demo_sky(model, t, start, photo, liveries)
         model.set_f1(demo_f1(t, start, f1_track_map, f1_event))
+        if metro_step != int((t - start) / 4):  # the trains move a circuit every 4 s
+            metro_step = int((t - start) / 4)
+            metro_trains_now = demo_metro(model, t, start, metro_net, metro_trains_now)
         done = ((t - start) / 600) % 1.0  # a 10-minute "print" on loop
         model.update_printer({
             "gcode_state": "RUNNING", "subtask_name": "Articulated Dragon.3mf",
@@ -3058,6 +3547,9 @@ class BeaconHandler(BaseHTTPRequestHandler):
                                 "python3 pi/claude_display.py --setup-planes\n")
             elif want == "f1":
                 self._send(409, "the F1 screen is turned off ([f1] enabled in config.ini)\n")
+            elif want == "metro":
+                self._send(409, "metro screen not set up - run "
+                                "python3 pi/claude_display.py --setup-metro\n")
             else:
                 self._send(409, "printer not configured - run "
                                 "python3 pi/claude_display.py --setup-bambu\n")
@@ -3067,6 +3559,27 @@ class BeaconHandler(BaseHTTPRequestHandler):
             self._send(200, planes_log_html(read_plane_log(PLANES_LOG)), "text/html; charset=utf-8")
         elif path == "/planes/log.csv":
             self._send(200, planes_log_csv(read_plane_log(PLANES_LOG)), "text/csv; charset=utf-8")
+        elif path == "/metro":
+            self._send(200, metro_page_html(m.metro.get("net"), m.metro_station()),
+                       "text/html; charset=utf-8")
+        elif path == "/metro/station" and self.command == "POST":  # the /metro page's form
+            picked = urllib.parse.parse_qs(self.body.decode(errors="replace")).get("station", [""])[0]
+            if m.choose_metro_station(picked):
+                self._redirect("/metro")
+            else:
+                self._send(400, metro_page_html(m.metro.get("net"), m.metro_station(),
+                                                f"no station called {picked!r}"), "text/html; charset=utf-8")
+        elif path.startswith("/metro/station/"):
+            name = m.choose_metro_station(path[len("/metro/station/"):])
+            if name:
+                self._send(200, name + "\n")
+            else:
+                self._send(404, "no such station\n")
+        elif path == "/metro/stations":
+            net = m.metro.get("net")
+            self._send(200, json.dumps([{"code": n, "name": name, "lines": lines}
+                                        for n, name, lines in (net.stations() if net else [])]) + "\n",
+                       "application/json")
         elif path == "/":
             self._send(200, ROOT_TEXT)
         else:
@@ -3079,6 +3592,12 @@ class BeaconHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _redirect(self, where):
+        self.send_response(303)
+        self.send_header("Location", where)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def log_message(self, *args):
         pass
@@ -3132,6 +3651,7 @@ class Renderer:
         self.photo_img = None
         self.qr_link = self.qr_grid = self.qr_key = self.qr_surf = None  # its page, as a QR
         self.plane_art_key = self.plane_art_img = None  # the plane's illustration, scaled
+        self.metro_geo = None  # (key, where the Metro map's stations and strands go)
         self.font_paths = fonts
         self.fonts = {}
         self.text_cache = {}
@@ -3448,6 +3968,10 @@ class Renderer:
             ev = f.get("event") or {}
             return key + ("off", ev.get("key"), repr(f.get("results")), repr(f.get("next")),
                           repr(f.get("facts")), id(f.get("track")), snap.f1_status, snap.thinking)
+        if snap.mode == "metro":  # (the trains move on their own: see car_frame)
+            m = snap.metro
+            return key + (id(m.get("net")), snap.metro_station, repr(m.get("predictions")),
+                          self.metro_alert_text(snap), snap.metro_status, snap.port, snap.thinking)
         if snap.mode == "bambu":
             # only what's drawn, so fan speeds and wifi strength don't cause redraws
             v = printer_view(snap.printer, now)
@@ -3473,7 +3997,7 @@ class Renderer:
         status = snap.flash or {"usage": snap.usage_status, "spotify": snap.sp_status,
                                 "bambu": snap.printer_status,
                                 "planes": snap.planes_status,
-                                "f1": snap.f1_status}[snap.mode]
+                                "f1": snap.f1_status, "metro": snap.metro_status}[snap.mode]
         if self.working_note(snap):
             # Only the usage screen has the big spinner, so on the others Claude
             # working shows up here - the Pi's stand-in for the ESP32's LED.
@@ -3677,6 +4201,9 @@ class Renderer:
         elif brand == "f1":
             self.text(surf, "F1", 34, 66, 44, COL_F1, bold=True)
             title, color, sub = "Formula 1", COL_F1, subtitle
+        elif brand == "metro":
+            self.metro_logo(surf, 34, 26, 52)
+            title, color, sub = "Metro", COL_TEXT, subtitle
         else:
             self.mascot(surf, 32, 28, 6)
             title, color, sub = "Claude Code", COL_ORANGE, "usage monitor"
@@ -4452,7 +4979,13 @@ class Renderer:
         return img
 
     def car_frame(self, snap):
-        """The cars' animation step while they're on the map, else -1."""
+        """The cars' (or trains') animation step while they're on the map, else -1."""
+        if snap.mode == "metro":
+            m = snap.metro
+            if not m.get("trains"):
+                return -1
+            # 5 steps a second while the trains slide to their new spots, then still
+            return int(snap.mono * 5) if self.metro_glide_k(snap) < 1 else round(m["trains_at"] * 10)
         f = snap.f1 or {}
         if snap.mode != "f1" or f.get("phase") != "live" or not (f.get("cars") or {}).get("cars"):
             return -1
@@ -4698,6 +5231,278 @@ class Renderer:
             self.f1_panel_right(surf, f, now, 24, 296, 880, 20, 28, 1, 10)
         self._clock_strip(surf, now)
 
+    # -- the Metro screen: every line with its trains moving along it | your
+    # station and its next trains
+    METRO_MAP = {"landscape": (20, 112, 424, 322), "portrait": (8, 54, 164, 118),
+                 "bar": (16, 12, 420, 272), "strip": (16, 196, 288, 340)}
+    METRO_LABEL = {"landscape": 13, "portrait": 8, "bar": 15, "strip": 14}
+
+    def metro_geometry(self, net, rect):
+        """Where it all goes, in pixels: each station, each line's strand
+        through it (lines sharing track run side by side), and the line width."""
+        key = (id(net), tuple(rect))
+        if self.metro_geo and self.metro_geo[0] == key:
+            return self.metro_geo[1]
+        proj = {n: metro_project(*p) for n, p in net.pos.items()}
+        shown = [proj[n] for n in net.lines_at]
+        x0, x1 = min(p[0] for p in shown), max(p[0] for p in shown)
+        y0, y1 = min(p[1] for p in shown), max(p[1] for p in shown)
+        w = max(1.5, rect.h / 90)  # line width, px
+        m = w * 3
+        k = min((rect.w - 2 * m) / max(1e-6, x1 - x0), (rect.h - 2 * m) / max(1e-6, y1 - y0))
+        ox = rect.x + (rect.w - (x1 - x0) * k) / 2 - x0 * k
+        oy = rect.y + (rect.h - (y1 - y0) * k) / 2 - y0 * k
+        at = {n: (x * k + ox, y * k + oy) for n, (x, y) in proj.items()}
+        order = list(METRO_LINES)
+        shared = {}  # station pair -> (the lines between them, which way the first runs)
+        for line in sorted(net.line_nodes, key=order.index):
+            nodes = net.line_nodes[line]
+            for a, b in zip(nodes, nodes[1:]):
+                shared.setdefault(frozenset((a, b)), ((a, b), []))[1].append(line)
+        offsets = {}
+        for (a, b), lines in shared.values():
+            (ax, ay), (bx, by) = at[a], at[b]
+            d = math.hypot(bx - ax, by - ay) or 1.0
+            nx, ny = -(by - ay) / d, (bx - ax) / d
+            for i, line in enumerate(lines):
+                o = (i - (len(lines) - 1) / 2) * w * 1.1
+                for node in (a, b):
+                    offsets.setdefault((line, node), []).append((nx * o, ny * o))
+        strand = {}
+        for (line, node), offs in offsets.items():
+            x, y = at[node]
+            strand[(line, node)] = (x + sum(o[0] for o in offs) / len(offs),
+                                    y + sum(o[1] for o in offs) / len(offs))
+        geo = SimpleNamespace(at=at, strand=strand, w=w)
+        self.metro_geo = (key, geo)
+        return geo
+
+    @staticmethod
+    def metro_train_xy(net, geo, route, fidx):
+        """Pixel spot of circuit `fidx` (fractional while gliding) along a route."""
+        idx, nodes = net.routes[route]
+        pt = lambda i: geo.strand.get((route[0], nodes[i])) or geo.at[nodes[i]]
+        if fidx <= idx[0]:
+            return pt(0)
+        if fidx >= idx[-1]:
+            return pt(-1)
+        j = bisect.bisect_right(idx, fidx) - 1
+        t = (fidx - idx[j]) / (idx[j + 1] - idx[j])
+        (x0, y0), (x1, y1) = pt(j), pt(j + 1)
+        return x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
+
+    def metro_map_surface(self, net, geo, rect):
+        """The lines and stations, drawn once, anti-aliased."""
+        key = ("metro-map", id(net), tuple(rect))
+        img = self.shape_cache.get(key)
+        if img is None:
+            big = pygame.Surface((rect.w * SS, rect.h * SS), pygame.SRCALPHA, 32)
+            big.fill((*COL_BG, 0))  # (see _ss: an opaque box would show)
+            p = lambda q: ((q[0] - rect.x) * SS, (q[1] - rect.y) * SS)
+            w = geo.w * SS
+            for line in METRO_LINES:
+                nodes = net.line_nodes.get(line)
+                if not nodes:
+                    continue
+                pts = [p(geo.strand.get((line, n)) or geo.at[n]) for n in nodes]
+                pygame.draw.lines(big, METRO_LINES[line][1], False, pts, max(1, round(w)))
+                for q in pts:  # round the joins
+                    pygame.draw.circle(big, METRO_LINES[line][1], q, w / 2)
+            for node, lines in net.lines_at.items():
+                r = w * (0.4 if len(lines) == 1 else 0.55 * len(lines))
+                x, y = p(geo.at[node])
+                if len(lines) > 1:
+                    pygame.draw.circle(big, COL_BG, (x, y), r + w * 0.3)
+                pygame.draw.circle(big, COL_TEXT, (x, y), r)
+            img = pygame.transform.smoothscale(big, rect.size)
+            self.shape_cache[key] = img
+        return img
+
+    def metro_glide_k(self, snap):
+        """How far the trains have slid from their last spots to the new ones."""
+        m = snap.metro
+        return min(1.0, max(0.0, (snap.mono - m.get("trains_at", 0)) / (m.get("glide") or 10.0)))
+
+    def draw_metro_map(self, surf, snap):
+        """The map with the trains where they are; returns its rect (only this
+        is repainted while they move)."""
+        mx, my, mw, mh = self.METRO_MAP[self.layout]
+        rect = self.rect(mx, my, mw, mh)
+        surf.fill(COL_BG, rect)
+        m = snap.metro
+        net = m.get("net")
+        if not net:
+            self.text(surf, "loading the map...", mx + mw / 2, my + mh / 2, self.METRO_LABEL[self.layout],
+                      COL_DIM, align="c")
+            return rect
+        geo = self.metro_geometry(net, rect)
+        surf.blit(self.metro_map_surface(net, geo, rect), rect.topleft)
+        clip = surf.get_clip()
+        surf.set_clip(rect.clip(clip))
+        try:
+            k = self.metro_glide_k(snap)
+            # passenger trains over the rest: each a bead in its line's colour,
+            # ringed dark; trains not in service are small dark ones
+            for tr in sorted((m.get("trains") or {}).values(), key=lambda t: t["service"]):
+                fidx = tr["idx"] if tr["from"] is None else tr["from"] + (tr["idx"] - tr["from"]) * k
+                x, y = self.metro_train_xy(net, geo, tr["route"], fidx)
+                color = METRO_LINES[tr["line"]][1] if tr["service"] else (84, 84, 88)
+                r = max(2, round(geo.w * (1.2 if tr["service"] else 0.8)))
+
+                def bead(big, s, c=color):
+                    mid = big.get_width() / 2
+                    pygame.draw.circle(big, COL_BG, (mid, mid), (r + 1) * s)
+                    pygame.draw.circle(big, c, (mid, mid), r * s)
+                surf.blit(self._ss(("metro-train", color, r), 2 * r + 2, 2 * r + 2, bead),
+                          (round(x) - r - 1, round(y) - r - 1))
+            node = snap.metro_station
+            if node in net.lines_at:  # your station: a ring and its name
+                x, y = geo.at[node]
+                ring = geo.w * (0.55 * len(net.lines_at[node]) + 1.6)
+                pygame.draw.circle(surf, COL_TEXT, (round(x), round(y)), round(ring), max(1, round(geo.w * 0.6)))
+                size = self.METRO_LABEL[self.layout]
+                name = net.names[node]
+                lx, ly = (x - self.ox) / self.s, (y - self.oy) / self.s
+                gap = ring / self.s + size * 0.3
+                right = lx + gap + self.width(name, size, True) < mx + mw
+                self.text(surf, name, lx + gap if right else lx - gap, ly + size * 0.35, size, COL_TEXT,
+                          bold=True, align="l" if right else "r")
+        finally:
+            surf.set_clip(clip)
+        return rect
+
+    def draw_live_map(self, surf, snap):
+        """Whichever map is moving: the F1 cars or the Metro trains."""
+        return self.draw_metro_map(surf, snap) if snap.mode == "metro" else self.draw_f1_map(surf, snap)
+
+    def metro_logo(self, surf, x, y, size):
+        """A white M on a bronze square, like the station pylons."""
+        px = self.n(size)
+        surf.blit(self._ss(("metro-logo",), px, px,
+                           lambda big, k: pygame.draw.rect(big, (96, 70, 54), big.get_rect(),
+                                                           border_radius=round(px * k * 0.2))),
+                  (self.x(x), self.y(y)))
+        m = self.font(size * 0.74, True).render("M", True, COL_TEXT)
+        surf.blit(m, (self.x(x) + (px - m.get_width()) // 2, self.y(y) + (px - m.get_height()) // 2))
+
+    def metro_line_dots(self, surf, lines, x, cy, r):
+        for i, line in enumerate(lines):
+            d = self.n(2 * r)
+            dot = self._ss(("metro-dot", line, d), d, d, lambda big, k, c=METRO_LINES[line][1]:
+                           pygame.draw.circle(big, c, (d * k / 2, d * k / 2), d * k / 2))
+            surf.blit(dot, (self.x(x + i * r * 2.7), self.y(cy) - d // 2))
+
+    def metro_station_head(self, surf, snap, x0, x1, top, size):
+        """A label, your station's name, big, and its lines' colours; returns
+        the baseline below them."""
+        net, node = snap.metro.get("net"), snap.metro_station
+        self.text(surf, "YOUR STATION", x0, top, size * 0.46, COL_DIM, bold=True)
+        if not net or not node:
+            return top
+        name = net.names[node]
+        big = self.fit_size(name, x1 - x0, size, bold=True, smallest=size * 0.6)
+        base = top + size * 1.2
+        self.text(surf, self.fit(name, x1 - x0, big, bold=True), x0, base, big, COL_TEXT, bold=True)
+        lines, r = net.lines_at[node], size * 0.17
+        self.metro_line_dots(surf, lines, x0, base + size * 0.55, r)
+        names = " · ".join(METRO_LINES[l][0] for l in lines) + (" line" if len(lines) == 1 else "")
+        nx = x0 + len(lines) * r * 2.7 + r * 0.6
+        self.text(surf, self.fit(names, x1 - nx, size * 0.5), nx, base + size * 0.72, size * 0.5, COL_SUB)
+        return base + size * 0.75
+
+    def metro_row(self, surf, x0, x1, base, row, size):
+        """One train: its line's colour, where it's going, cars, minutes."""
+        surf.fill(METRO_LINES[row["line"]][1],
+                  self.rect(x0, base - size * 0.78, max(2, size * 0.3), size * 0.92))
+        soon = row["wait"] < 1
+        when = row["min"] if soon else f"{row['min']} min"
+        self.text(surf, when, x1, base, size, COL_GREEN if soon else COL_TEXT, bold=True, align="r")
+        right, dx = x1 - self.width("88 min", size, True) - size * 0.5, x0 + size * 0.75
+        cars = self.width("8 car", size * 0.72) + size * 0.5
+        # the car count, while there's room for it and the whole destination
+        if row["cars"] and self.width(row["dest"], size) <= right - cars - dx:
+            self.text(surf, f"{row['cars']} car", right, base, size * 0.72, COL_DIM, align="r")
+            right -= cars
+        self.text(surf, self.fit(row["dest"], right - dx, size), dx, base, size, COL_TEXT)
+
+    def metro_next(self, surf, snap, x0, x1, top, step, size, rows):
+        """The next trains at your station, or how to pick one."""
+        m, node = snap.metro, snap.metro_station
+        if not m.get("net"):
+            self.text(surf, "loading the map...", x0, top, size * 0.85, COL_DIM)
+            return
+        if not node:
+            self.text(surf, "Pick it from any browser:", x0, top, size * 0.85, COL_SUB)
+            addr = f"{snap.host}.local:{snap.port}/metro"
+            self.text(surf, self.fit(addr, x1 - x0, size * 0.85, bold=True), x0, top + step, size * 0.85,
+                      COL_TEXT, bold=True)
+            return
+        pred = m.get("predictions")
+        if not pred or pred[0] != node:
+            self.text(surf, "loading the next trains...", x0, top, size * 0.85, COL_DIM)
+        elif not pred[1]:
+            self.text(surf, "no trains due", x0, top, size * 0.85, COL_DIM)
+        for i, row in enumerate(pred[1][:rows] if pred and pred[0] == node else ()):
+            self.metro_row(surf, x0, x1, top + i * step, row, size)
+
+    @staticmethod
+    def metro_alert_text(snap):
+        """WMATA's alert about your station's lines (any alert, with no station)."""
+        net, node = snap.metro.get("net"), snap.metro_station
+        return metro_alert(snap.metro.get("incidents"), net.lines_at.get(node, ()) if net and node else ())
+
+    def metro_alert(self, surf, snap, x0, x1, base, size, lines=2):
+        """The alert, in yellow, on up to two lines."""
+        text = self.metro_alert_text(snap)
+        if text:
+            l1, l2 = self.wrap2(text, x1 - x0, size) if lines > 1 else (self.fit(text, x1 - x0, size), "")
+            self.text(surf, l1, x0, base, size, COL_YELLOW)
+            self.text(surf, l2, x0, base + size * 1.3, size, COL_YELLOW)
+
+    def _metro_landscape(self, surf, snap, now):
+        self._header_landscape(surf, now, "metro", "Washington Metrorail")
+        self.draw_metro_map(surf, snap)
+        surf.fill(COL_CARD, self.rect(460, 124, 2, 300))
+        x0, x1 = 484, 768
+        y = self.metro_station_head(surf, snap, x0, x1, 142, 28)
+        alert = bool(self.metro_alert_text(snap))
+        self.metro_next(surf, snap, x0, x1, y + 36, 30, 19, rows=5 if alert else 6)
+        self.metro_alert(surf, snap, x0, x1, 404, 14)
+
+    def _metro_portrait(self, surf, snap, now):
+        self.metro_logo(surf, 12, 12, 30)
+        self.text(surf, "Metro", 50, 28, 16, COL_TEXT, bold=True)
+        net, node = snap.metro.get("net"), snap.metro_station
+        self.text(surf, self.fit(net.names[node] if net and node else "Washington Metrorail", 118, 11),
+                  50, 44, 11, COL_SUB)
+        self.draw_metro_map(surf, snap)
+        alert = bool(self.metro_alert_text(snap))
+        self.metro_next(surf, snap, 12, 168, 192, 21, 12, rows=4 if alert else 5)
+        self.metro_alert(surf, snap, 12, 168, 290, 9, lines=1)
+
+    def _metro_bar(self, surf, snap, now):
+        self.draw_metro_map(surf, snap)
+        surf.fill(COL_CARD, self.rect(452, 40, 2, 196))
+        self.metro_logo(surf, 478, 30, 44)
+        self.text(surf, "Metro", 536, 66, 30, COL_TEXT, bold=True)
+        y = self.metro_station_head(surf, snap, 478, 900, 124, 40)
+        self.metro_alert(surf, snap, 478, 900, max(y + 30, 226), 18)
+        surf.fill(COL_CARD, self.rect(924, 40, 2, 196))
+        self.text(surf, "NEXT TRAINS", 950, 50, 15, COL_DIM, bold=True)
+        self.metro_next(surf, snap, 950, 1452, 92, 38, 25, rows=5)
+        self._clock_bar(surf, now)
+
+    def _metro_strip(self, surf, snap, now):
+        self.metro_logo(surf, 132, 42, 56)
+        self.text(surf, "Metro", 160, 148, 34, COL_TEXT, bold=True, align="c")
+        self.text(surf, "Washington Metrorail", 160, 176, 18, COL_DIM, align="c")
+        self.draw_metro_map(surf, snap)
+        y = self.metro_station_head(surf, snap, 24, 296, 580, 30)
+        alert = bool(self.metro_alert_text(snap))
+        self.metro_next(surf, snap, 24, 296, y + 44, 46, 22, rows=8 if alert else 10)
+        self.metro_alert(surf, snap, 24, 296, 1112, 16)
+        self._clock_strip(surf, now)
+
 
 
 # ---------------------------------------------------------------- main
@@ -4751,10 +5556,15 @@ def main():
                     help="set your location for the planes-overhead screen")
     ap.add_argument("--setup-bambu", action="store_true",
                     help="find your Bambu Lab printer, ask for its access code, save it")
+    ap.add_argument("--setup-metro", action="store_true",
+                    help="your WMATA api key and Metro station, for the Metro screen")
     args = ap.parse_args()
 
     if args.setup_planes:
         setup_planes(args.config)
+        return
+    if args.setup_metro:
+        setup_metro(args.config)
         return
     if args.setup_bambu:
         setup_bambu(args.config)
@@ -4773,8 +5583,11 @@ def main():
         cfg.bambu_name = "demo P1S"
     if args.demo and not cfg.planes_ready:
         cfg.planes_lat, cfg.planes_lon = 40.70, -73.86  # between JFK and LGA
+    if args.demo and not cfg.metro_station:
+        cfg.metro_station = "Dupont Circle"
     model = Model(cfg, state, spotify_ready, bambu_ready=args.demo or cfg.bambu_ready,
-                  planes_ready=cfg.planes_ready, f1_ready=cfg.f1_enabled)
+                  planes_ready=cfg.planes_ready, f1_ready=cfg.f1_enabled,
+                  metro_ready=args.demo or bool(cfg.metro_key))
     model.ip = local_ip()
 
     BeaconHandler.model = model
@@ -4804,6 +5617,8 @@ def main():
             forever(planes_worker, model)
         if cfg.f1_enabled:
             forever(f1_worker, model)
+        if cfg.metro_key:
+            forever(metro_worker, model)
 
     try:
         screen = open_screen(args, cfg)
@@ -4875,7 +5690,7 @@ def main():
                     rects += renderer.draw_activity(canvas, snap)
                 if cars != last_cars:
                     last_cars = cars
-                    rects.append(renderer.draw_f1_map(canvas, snap))
+                    rects.append(renderer.draw_live_map(canvas, snap))
                 if rects:
                     present(*rects)
             clock.tick(60 if moving else 30 if frame >= 0 or cars >= 0 else 10)

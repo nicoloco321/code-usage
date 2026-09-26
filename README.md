@@ -496,6 +496,40 @@ the screen from its own Power port.
 
   The screen only fetches while it's showing. Turn it off with
   `enabled = no` under `[f1]` in config.ini.
+- **Washington Metro.** A sixth screen follows WMATA's Metrorail:
+  - **Left:** a map of every line, drawn from where the stations really are,
+    with the middle of the city magnified so downtown has room. Lines that
+    share track run side by side. Every train is a dot in its line's colour,
+    sliding along the track as it moves (trains not carrying passengers are
+    small grey dots). Your station has a ring round it.
+  - **Right:** your station, its lines, and the next trains to arrive:
+    line, destination, 6 or 8 cars, and minutes (`ARR` / `BRD` as on the
+    platform signs). A WMATA alert about your station's lines shows in
+    yellow below them.
+
+  It needs a free WMATA api key. Sign up at
+  [developer.wmata.com](https://developer.wmata.com), subscribe to
+  **Default Tier** under Products, and copy the **Primary key** from your
+  profile. Then run this on the Pi:
+
+  ```bash
+  python3 pi/claude_display.py --setup-metro
+  ```
+
+  It checks the key and asks for your station. **Anyone on your network can
+  change the station** from a phone or computer at
+  `http://claude-display.local:8080/metro` (search, tap a station; the
+  Windows tray's **Metro station...** opens the same page), or with
+  `curl -X POST http://claude-display.local:8080/metro/station/dupont`.
+  That choice sticks across restarts.
+
+  Train positions come from WMATA's TrainPositions feed, which says which
+  track circuit (a stretch of track a few hundred metres long) each train is
+  on, fresh about every 10 s. The map places the train along its line from
+  that, and slides it to each new spot. The station list and track layout are
+  fetched once a month. The screen only polls while it's showing: every 10 s
+  for trains, 20 s for arrivals, 2 min for alerts. That's about 14,000 calls
+  a day if it's on screen all day; the free tier allows 50,000.
 - Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
   `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
   `rotate` for a monitor mounted on its side. Apply changes with
@@ -524,7 +558,8 @@ Windows notification area, next to the clock:
   times.
 - Clawd **walks** while Claude is working, on any of your machines.
 - **Left-click** cycles the display through its screens (usage, Spotify,
-  3D printer, planes overhead, F1); the menu lists them all.
+  3D printer, planes overhead, F1, Metro); the menu lists them all, and
+  **Metro station...** opens the page for picking your station.
 - **Track Claude with hooks (exact)** installs or removes the
   [Claude Code hooks](#option-a--claude-code-hooks-recommended). While they're
   installed, the tray runs their watcher: it catches Esc interrupts and keeps
