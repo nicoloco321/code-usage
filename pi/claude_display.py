@@ -1239,6 +1239,7 @@ def parse_plane(a, home_lat, home_lon):
         "icao": not raw_hex.startswith("~"),  # "~" marks an address that isn't an ICAO hex
         "callsign": text("flight").upper(), "reg": text("r").upper(), "type": text("t").upper(),
         "desc": text("desc"), "year": text("year"),  # these two only from adsb.fi
+        "category": text("category").upper(),  # A1 light, A2 small (bizjets), A3+ airliners
         "lat": lat, "lon": lon,
         "alt": None if alt is None else max(0, int(alt)),  # baro reads < 0 on a high-pressure day
         "gs": num("gs"), "track": num("track", "true_heading", "mag_heading"),
@@ -1423,19 +1424,61 @@ def livery_brand(callsign, photo_link=""):
     return REGIONAL_BRANDS.get(code, code)
 
 
+# Close relatives, nearest first: with no art of the exact type, the airline's
+# livery on a sister type (a United MAX 8 in its MAX 9 art) beats a blank.
+SISTER_TYPES = {
+    "B37M": ("B38M", "B737"), "B38M": ("B39M", "B738", "B37M"), "B39M": ("B38M", "B739"),
+    "B3XM": ("B39M", "B739"), "B736": ("B737",), "B737": ("B738", "B38M"),
+    "B738": ("B38M", "B737", "B739"), "B739": ("B738", "B39M"),
+    "B752": ("B753",), "B753": ("B752",), "B762": ("B763",), "B763": ("B764", "B762"),
+    "B764": ("B763",), "B772": ("B77W", "B77L"), "B77L": ("B772", "B77W"), "B77W": ("B772", "B77L"),
+    "B788": ("B789", "B78X"), "B789": ("B788", "B78X"), "B78X": ("B789", "B788"),
+    "B744": ("B748",), "B748": ("B744",),
+    "A318": ("A319",), "A319": ("A320", "A19N"), "A19N": ("A20N", "A319"), "A320": ("A319", "A20N", "A321"),
+    "A20N": ("A320", "A21N"), "A321": ("A21N", "A320"), "A21N": ("A321", "A20N"),
+    "A332": ("A333", "A339"), "A333": ("A332", "A339"), "A338": ("A339", "A332"), "A339": ("A333", "A338"),
+    "A359": ("A35K",), "A35K": ("A359",), "BCS1": ("BCS3",), "BCS3": ("BCS1",),
+    "CRJ1": ("CRJ2",), "CRJ2": ("CRJ7",), "CRJ7": ("CRJ9", "CRJ2"), "CRJ9": ("CRJ7", "CRJX"),
+    "CRJX": ("CRJ9",), "E135": ("E145", "E45X"), "E145": ("E45X", "E135"), "E45X": ("E145", "E135"),
+    "E170": ("E75L", "E75S"), "E75L": ("E75S", "E170"), "E75S": ("E75L", "E170"),
+    "E190": ("E195", "E290"), "E195": ("E190", "E295"), "E290": ("E295", "E190"), "E295": ("E290", "E195"),
+    "GLEX": ("GL5T", "GL7T"), "GL5T": ("GLEX",), "GA6C": ("GLF6",), "GA5C": ("GLF6",),
+    "GLF6": ("GA6C",), "LJ40": ("LJ45",), "LJ75": ("LJ45",), "B350": ("BE20",), "BE30": ("BE20",),
+}
+
+
 def plane_art_for(liveries, brand, type_code):
-    """The illustration for this plane: its airline's livery on this exact
-    type, else the type unpainted - {"path", "kind"} - or None, and it's the
-    planespotters photo instead."""
+    """The illustration for this plane, best first: its airline's livery on
+    this exact type, on a sister type, the type blank, a sister type's blank.
+    {"path", "kind", "type"} - or None, and it's the planespotters photo."""
     if not liveries or not type_code:
         return None
-    entry, kind = (liveries["liveries"].get(brand) or {}).get(type_code) if brand else None, "livery"
-    if not entry:
-        entry, kind = liveries["blanks"].get(type_code), "blank"
-    if not isinstance(entry, dict) or not entry.get("file"):
-        return None
-    path = os.path.join(liveries["dir"], os.path.basename(entry["file"]))
-    return {"path": path, "kind": kind} if os.path.exists(path) else None
+    sisters = SISTER_TYPES.get(type_code, ())
+    theirs = (liveries["liveries"].get(brand) or {}) if brand else {}
+    tries = [("livery", theirs, type_code)] + [("sister", theirs, t) for t in sisters]
+    tries += [("blank", liveries["blanks"], type_code)] + [("sister blank", liveries["blanks"], t) for t in sisters]
+    for kind, table, t in tries:
+        entry = table.get(t)
+        if isinstance(entry, dict) and entry.get("file"):
+            path = os.path.join(liveries["dir"], os.path.basename(entry["file"]))
+            if os.path.exists(path):
+                return {"path": path, "kind": kind, "type": t}
+    return None
+
+
+# A high-wing single seen from the side, nose left, in units of its length -
+# the placeholder for light aircraft that have neither art nor a photo.
+LIGHT_PLANE_SIDE = [(0.02, 0.01), (0.07, -0.035), (0.17, -0.05), (0.24, -0.105), (0.43, -0.105),
+                    (0.52, -0.075), (0.84, -0.03), (0.9, -0.2), (0.97, -0.2), (0.985, -0.02),
+                    (0.99, 0.01), (0.86, 0.015), (0.5, 0.045), (0.3, 0.07), (0.08, 0.06), (0.03, 0.04)]
+
+
+def light_plane(plane):
+    """A small piston / light aircraft? (the feed's category A1, or its type)"""
+    t = (plane or {}).get("type") or ""
+    return (plane or {}).get("category") == "A1" or t.startswith(
+        ("C15", "C17", "C18", "C72", "C82", "C20", "C21", "P28", "P32", "PA2", "PA3", "SR2", "BE33",
+         "BE35", "BE36", "M20", "DA4", "DA2", "RV", "BL8", "AA5", "C77", "CH7", "J3", "PA18"))
 
 
 def photo_key(plane):
@@ -1477,8 +1520,22 @@ def download_photo(info):
 # art can be filled: GET /planes/log is the summary, /planes/log.csv the lot.
 PLANES_LOG = os.path.join(os.path.dirname(STATE_PATH), "planes_log.csv")
 PLANES_LOG_FIELDS = ["time", "hex", "callsign", "reg", "type", "model", "livery", "airline",
-                     "picture", "art", "from", "to"]
-PICTURE_WORDS = {"livery": "its livery", "blank": "blank livery", "photo": "photo", "none": "nothing"}
+                     "picture", "art", "from", "to", "category"]
+PICTURE_WORDS = {"livery": "its livery", "sister": "livery, sister type", "blank": "blank livery",
+                 "sister blank": "blank, sister type", "photo": "photo", "none": "nothing"}
+# light aircraft and business jets: their paint is the owner's, so no airline livery to find
+PRIVATE_TYPE_PREFIXES = ("C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "P28", "P32", "P46", "PA",
+                         "SR2", "S22", "BE", "M20", "DA", "RV", "BL8", "AA5", "GLF", "GA", "GL",
+                         "CL30", "CL35", "CL60", "LJ", "FA", "F2TH", "F900", "E50P", "E55P", "E35L",
+                         "E545", "E550", "PC12", "PC24", "HDJT", "TBM", "EA50", "SF50", "H25")
+
+
+def private_type(type_code, category=""):
+    """Light aircraft or a business jet (by the feed's category, or the type)."""
+    if category in ("A1", "A2"):
+        return True
+    return bool(type_code) and type_code.startswith(PRIVATE_TYPE_PREFIXES) and \
+        type_code not in ("C130", "C17", "C5M")  # (military transports, not Cessnas)
 
 
 def log_plane(path, row):
@@ -1488,13 +1545,24 @@ def log_plane(path, row):
         if not new and os.path.getsize(path) > 4_000_000:
             os.replace(path, path + ".old")
             new = True
+        if not new:  # a log from before a column was added: same rows, the new header
+            with open(path, newline="", encoding="utf-8", errors="replace") as f:
+                reader = csv.DictReader(f)
+                old = (None if reader.fieldnames == PLANES_LOG_FIELDS
+                       else [{k: v for k, v in r.items() if k} for r in reader])
+            if old is not None:
+                with open(path + ".tmp", "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, PLANES_LOG_FIELDS, extrasaction="ignore")
+                    w.writeheader()
+                    w.writerows(old)
+                os.replace(path + ".tmp", path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, PLANES_LOG_FIELDS, extrasaction="ignore")
             if new:
                 w.writeheader()
             w.writerow(row)
-    except OSError as e:
+    except (OSError, csv.Error) as e:
         log(f"planes log: {e}")
 
 
@@ -1545,6 +1613,7 @@ def planes_log_html(rows):
            "code{color:#b5c7d6;white-space:nowrap}.tag{padding:1px 8px;border-radius:9px;font-size:12px;white-space:nowrap}",
            ".livery{background:#1d3a22;color:#86d392}.blank{background:#3a3220;color:#e3c565}",
            ".photo{background:#3d2420;color:#ec9478}.none{background:#2e2e2e;color:#aaa}",
+           ".sister{background:#1f3140;color:#8cc4ee}",
            "@media(max-width:700px){.wide{display:none}}</style></head><body>",
            "<h1>Planes overhead: the log</h1>"]
     if not rows:
@@ -1554,23 +1623,28 @@ def planes_log_html(rows):
     out.append(f"<p>{len(rows)} sightings of {len(hexes)} planes since {when(rows[0].get('time'))}"
                ' &middot; <a href="/planes/log.csv">download the CSV</a></p>')
     groups = plane_log_groups(rows, ("livery", "type"))
-    blank = [g for g in groups if g.get("picture") == "blank" and g.get("livery")]  # (private: blank is right)
-    out.append(f"<h2>Blank livery shown: no art of the airline's livery on this type ({len(blank)})</h2>"
+    # airliners whose airline has no art of this exact type (private and
+    # charter jets are left out: they wear their owners' paint)
+    blank = [g for g in groups if g.get("picture") in ("blank", "sister", "sister blank")
+             and g.get("livery") and not private_type(g.get("type"), g.get("category", ""))]
+    out.append(f"<h2>Missing the airline's livery on this type ({len(blank)})</h2>"
                "<p>Add these to LIVERIES in pi/build_liveries.py as (livery, type).</p>")
     out.append("<table><tr><th>Seen</th><th>(livery, type)</th><th>Airline</th><th>Aircraft</th>"
-               '<th class="wide">Last seen</th><th class="wide">For example</th></tr>' if blank else
-               "<p><i>None so far.</i></p><table>")
+               '<th>Showing</th><th class="wide">Last seen</th><th class="wide">For example</th></tr>'
+               if blank else "<p><i>None so far.</i></p><table>")
     for g in blank:
         out.append(f'<tr><td class="n">{g["seen"]}</td><td><code>("{esc(g.get("livery"))}", '
                    f'"{esc(g.get("type"))}")</code></td><td>{esc(", ".join(g["airlines"]) or "-")}</td>'
-                   f'<td>{esc(g.get("model"))}</td><td class="wide">{when(g["last"])}</td>'
+                   f'<td>{esc(g.get("model"))}</td><td>{tag(g.get("picture"))}</td>'
+                   f'<td class="wide">{when(g["last"])}</td>'
                    f'<td class="wide">{esc(", ".join(g["examples"]))}</td></tr>')
     out.append("</table>")
+    no_type_art = ("photo", "none", "sister blank")
     latest = {r.get("type"): r.get("picture") for r in rows}  # (art may have been added since)
-    missing = [g for g in plane_log_groups([r for r in rows if r.get("picture") in ("photo", "none")],
+    missing = [g for g in plane_log_groups([r for r in rows if r.get("picture") in no_type_art],
                                            ("type",))
-               if latest.get(g.get("type")) in ("photo", "none")]
-    out.append(f"<h2>No illustration of the type at all ({len(missing)})</h2>"
+               if latest.get(g.get("type")) in no_type_art]
+    out.append(f"<h2>No illustration of the exact type ({len(missing)})</h2>"
                "<p>Add these to BLANKS (or LIVERIES) in pi/build_liveries.py.</p>")
     out.append("<table><tr><th>Seen</th><th>Type</th><th>Aircraft</th><th>Showed</th><th>Airlines</th>"
                '<th class="wide">Last seen</th><th class="wide">For example</th></tr>' if missing else
@@ -1740,7 +1814,8 @@ def planes_worker(model):
                         "airline": ((refs["airlines"] or {}).get(airline_code(cs)) or {}).get("name")
                         or (route or {}).get("airline") or "",
                         "picture": picture, "art": os.path.basename(art["path"]) if art else "",
-                        "from": v.origin if v else "", "to": v.dest if v else ""})
+                        "from": v.origin if v else "", "to": v.dest if v else "",
+                        "category": current.get("category") or ""})
                     logged = current["hex"]
         model.planes_wake.wait(cfg.planes_poll)
         model.planes_wake.clear()
@@ -4033,12 +4108,30 @@ class Renderer:
 
         rect = empty or rect
 
+        light = light_plane(sky.get("focus"))
+
         def draw(big, k):
             pygame.draw.rect(big, COL_CARD, big.get_rect(), border_radius=int(rect.h * k * 0.05))
             w, h = big.get_size()
-            self.plane_icon(big, w / 2, h / 2, h * 0.34, 90, COL_DIM)
+            if light:  # a little high-wing single, side on
+                L = min(w * 0.7, h * 1.9)
+                x0, y0 = (w - L) / 2, h / 2
+                pts = [(x0 + x * L, y0 + y * L) for x, y in LIGHT_PLANE_SIDE]
+                pygame.draw.polygon(big, COL_DIM, pts)
+                pygame.draw.rect(big, COL_DIM, (x0 + 0.2 * L, y0 - 0.125 * L, 0.26 * L, 0.03 * L))  # wing
+                pygame.draw.line(big, COL_DIM, (x0 + 0.3 * L, y0 - 0.1 * L), (x0 + 0.37 * L, y0 + 0.04 * L),
+                                 max(2, int(0.012 * L)))  # strut
+                pygame.draw.rect(big, COL_DIM, (x0 + 0.8 * L, y0 - 0.04 * L, 0.2 * L, 0.02 * L))  # tailplane
+                for gx, r_ in ((0.1, 0.028), (0.36, 0.034)):  # fixed gear
+                    pygame.draw.line(big, COL_DIM, (x0 + gx * L, y0 + 0.04 * L), (x0 + gx * L, y0 + 0.11 * L),
+                                     max(2, int(0.01 * L)))
+                    pygame.draw.circle(big, COL_DIM, (x0 + gx * L, y0 + 0.12 * L), r_ * L)
+                pygame.draw.line(big, COL_DIM, (x0 + 0.01 * L, y0 - 0.09 * L), (x0 + 0.01 * L, y0 + 0.1 * L),
+                                 max(2, int(0.012 * L)))  # the prop
+            else:
+                self.plane_icon(big, w / 2, h / 2, h * 0.34, 90, COL_DIM)
 
-        surf.blit(self._ss(("photo-placeholder",), rect.w, rect.h, draw), rect.topleft)
+        surf.blit(self._ss(("photo-placeholder", light), rect.w, rect.h, draw), rect.topleft)
         return 0
 
     def radar(self, surf, sky, cx, cy, r, label=16):
@@ -4201,8 +4294,9 @@ class Renderer:
         sky = sky or {}
         x, base, w, size = credit
         if self.plane_art(surf, art, sky):
-            text = ("illustration © Norebbo" if sky["art"]["kind"] == "livery"
-                    else "blank livery · illustration © Norebbo")
+            text = {"livery": "", "sister": "sister type · ", "blank": "blank livery · ",
+                    "sister blank": "blank, sister type · "}.get(sky["art"]["kind"], "")
+            text += "illustration © Norebbo"
             self.text(surf, self.fit(text, w, size), x, base, size, COL_DIM)
             return
         qr = self.plane_photo(surf, photo, sky, qr_at=qr_at, empty=empty)

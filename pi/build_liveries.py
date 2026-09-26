@@ -16,10 +16,35 @@ output folder is gitignored). Downloads are cached in <out>/.cache, so a
 re-run only fetches what's new.
 
 The display picks the art in this order (see plane_art_for in claude_display.py):
-the airline's livery on this exact type, else the blank of the type, else the
+the airline's livery on this exact type, on a sister type (a MAX 8 in the
+airline's MAX 9 art), the type blank, a sister type's blank, and last the
 planespotters photo.
+
+Art you've bought (NorebboStock's livery illustrations are the same style,
+as transparent PNGs of the same gear-up / gear-down pair) goes in a folder of
+its own, each file named for what it is - <livery>_<TYPE>.png, or
+blank_<TYPE>.png - and is cut out the same way:
+
+    python3 pi/build_liveries.py out/liveries --extra ~/Pictures/liveries
+
+The planes log (http://claude-display.local:8080/planes/log) lists what's
+missing as those same (livery, TYPE) keys. Ones NorebboStock has that the
+log turned up missing (Sept 2026), with the file name to give each:
+    Southwest Airlines Boeing 737 MAX 8                  SWA_B38M.png
+    United Airlines 737-8 MAX                            UAL_B38M.png
+    United Airlines Boeing 787-9 (2019 Livery)           UAL_B789.png
+    United Airlines Boeing 767-424/ER (2019 Livery)      UAL_B764.png
+    United Express Bombardier CRJ-550/700 (2019 Livery)  united-express_CRJ7.png
+    Delta Air Lines Boeing 717-2BD                       DAL_B712.png
+    Delta Connection Bombardier CRJ-900 / CRJ-700        delta-connection_CRJ9.png / _CRJ7.png
+    American Eagle Bombardier CRJ-900 / CRJ-700          american-eagle_CRJ9.png / _CRJ7.png
+    American Eagle Embraer 145                           american-eagle_E145.png
+    Air Canada Express Bombardier CRJ-900                JZA_CRJ9.png
+    Air France Boeing 777-328ER                          AFR_B77W.png
+    Aer Lingus Airbus A321-253NX                         EIN_A21N.png
+    Frontier Airlines Airbus A321-211 (Cali the Mountain Lion)  FFT_A321.png
 """
-import argparse, json, os, sys, time, urllib.request
+import argparse, json, os, re, sys, time, urllib.request
 
 UPLOADS = "https://www.norebbo.com/wp-content/uploads/"
 USER_AGENT = "claude-usage-display/1.0 (+https://github.com/nicoloco321/code-usage)"
@@ -245,7 +270,15 @@ def gear_up_plane(path):
     from PIL import Image
     from scipy import ndimage
 
-    rgb = np.asarray(Image.open(path).convert("RGB")).astype(np.float32)
+    src = Image.open(path)
+    if src.mode in ("RGBA", "LA", "P"):  # a transparent PNG: onto white, like the site's JPEGs
+        src = src.convert("RGBA")
+        white = Image.new("RGBA", src.size, (255, 255, 255, 255))
+        white.alpha_composite(src)
+        src = white
+    if src.width > 2048:  # bought art is 5000 px wide - plenty at 2048, and far quicker
+        src = src.resize((2048, round(src.height * 2048 / src.width)), Image.LANCZOS)
+    rgb = np.asarray(src.convert("RGB")).astype(np.float32)
     h, w, _ = rgb.shape
     lo = rgb.min(axis=2)
     ink = lo < 240
@@ -301,6 +334,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("out", help="output folder, e.g. out/liveries")
     ap.add_argument("--only", help="just these files (comma-separated source names), for testing")
+    ap.add_argument("--extra", help="a folder of art you've bought, named <livery>_<TYPE>.png "
+                                    "or blank_<TYPE>.png (these win over the site's)")
     args = ap.parse_args()
     cache = os.path.join(args.out, ".cache")
     os.makedirs(cache, exist_ok=True)
@@ -328,6 +363,24 @@ def main():
         else:
             index["blanks"][t] = entry
         print(name)
+    for name in sorted(os.listdir(args.extra)) if args.extra else []:
+        m = re.match(r"^(.+)_([A-Z0-9]{2,4})\.(png|jpe?g|webp)$", name, re.I)
+        if not m:
+            print(f"skipped {name}: name it <livery>_<TYPE>.png, e.g. SWA_B38M.png", file=sys.stderr)
+            continue
+        liv, t = m.group(1), m.group(2).upper()
+        out = f"{liv}_{t}.png"
+        try:
+            gear_up_plane(os.path.join(args.extra, name)).save(os.path.join(args.out, out), optimize=True)
+        except Exception as e:
+            print(f"skipped {name}: {e}", file=sys.stderr)
+            continue
+        entry = {"file": out, "source": "bought: " + name}
+        if liv.lower() == "blank":
+            index["blanks"][t] = entry
+        else:
+            index["liveries"].setdefault(liv, {})[t] = entry
+        print(out, "(yours)")
     with open(os.path.join(args.out, "index.json"), "w") as f:
         json.dump(index, f, indent=1, sort_keys=True)
     print(f"{sum(map(len, index['liveries'].values()))} liveries, {len(index['blanks'])} blanks "
