@@ -3072,7 +3072,14 @@ def metro_predictions(key, codes):
         rows.append({"line": t["Line"], "dest": t.get("DestinationName") or t.get("Destination") or "",
                      "cars": cars if cars.isdigit() else "", "min": m, "wait": wait,
                      "group": str(t.get("Group") or "")})
-    return sorted(rows, key=lambda r: r["wait"])
+    # At the end of a line the train about to leave is listed once per
+    # platform track; two real trains never share line, destination and minute.
+    seen, out = set(), []
+    for r in sorted(rows, key=lambda r: r["wait"]):
+        if (r["line"], r["dest"], r["min"]) not in seen:
+            seen.add((r["line"], r["dest"], r["min"]))
+            out.append(r)
+    return out
 
 
 def metro_incidents(key):
@@ -5273,7 +5280,14 @@ class Renderer:
             x, y = at[node]
             strand[(line, node)] = (x + sum(o[0] for o in offs) / len(offs),
                                     y + sum(o[1] for o in offs) / len(offs))
-        geo = SimpleNamespace(at=at, strand=strand, w=w)
+        busy = []  # points along every line, and the stations (twice over), for placing the name tag
+        for line, nodes in net.line_nodes.items():
+            pts = [strand.get((line, n)) or at[n] for n in nodes]
+            for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+                steps = max(1, int(math.hypot(bx - ax, by - ay) / 2))
+                busy += [(ax + (bx - ax) * i / steps, ay + (by - ay) * i / steps) for i in range(steps)]
+        busy += [at[n] for n in net.lines_at] * 2
+        geo = SimpleNamespace(at=at, strand=strand, w=w, busy=busy, spots={})
         self.metro_geo = (key, geo)
         return geo
 
@@ -5356,20 +5370,76 @@ class Renderer:
                 surf.blit(self._ss(("metro-train", color, r), 2 * r + 2, 2 * r + 2, bead),
                           (round(x) - r - 1, round(y) - r - 1))
             node = snap.metro_station
-            if node in net.lines_at:  # your station: a ring and its name
+            if node in net.lines_at:  # your station: a ring, and its name on a tag
                 x, y = geo.at[node]
                 ring = geo.w * (0.55 * len(net.lines_at[node]) + 1.6)
-                pygame.draw.circle(surf, COL_TEXT, (round(x), round(y)), round(ring), max(1, round(geo.w * 0.6)))
-                size = self.METRO_LABEL[self.layout]
-                name = net.names[node]
-                lx, ly = (x - self.ox) / self.s, (y - self.oy) / self.s
-                gap = ring / self.s + size * 0.3
-                right = lx + gap + self.width(name, size, True) < mx + mw
-                self.text(surf, name, lx + gap if right else lx - gap, ly + size * 0.35, size, COL_TEXT,
-                          bold=True, align="l" if right else "r")
+                surf.blit(self.metro_ring(ring, geo.w), (round(x - ring) - 3, round(y - ring) - 3))
+                tag = self.metro_tag(net.names[node], self.METRO_LABEL[self.layout])
+                box = pygame.Rect(self.metro_tag_spot(geo, rect, node, tag.get_size(), ring), tag.get_size())
+                # a leader from the ring to the tag's nearest edge, when there's a gap to bridge
+                nx, ny = min(max(x, box.left), box.right), min(max(y, box.top), box.bottom)
+                gap = math.hypot(nx - x, ny - y)
+                if gap > ring + 4:
+                    k = (ring + 2) / gap
+                    pygame.draw.aaline(surf, (96, 96, 102), (x + (nx - x) * k, y + (ny - y) * k), (nx, ny))
+                surf.blit(tag, box.topleft)
         finally:
             surf.set_clip(clip)
         return rect
+
+    def metro_ring(self, radius, width):
+        """The ring round your station: white, with a dark edge so it reads over the lines."""
+        d = round(2 * radius) + 6
+
+        def draw(big, k):
+            c = big.get_width() / 2
+            ring = max(1.5, width * 0.75)
+            pygame.draw.circle(big, COL_BG, (c, c), (radius + 2) * k, round((ring + 3) * k))
+            pygame.draw.circle(big, COL_TEXT, (c, c), (radius + 0.5) * k, round(ring * k))
+        return self._ss(("metro-ring", radius, width), d, d, draw)
+
+    def metro_tag(self, name, size):
+        """A station's name, bold, on a dark rounded tag with a light edge."""
+        f = self.font(size, bold=True)
+        key = ("metro-tag", name, id(f))
+        img = self.shape_cache.get(key)
+        if img is None:
+            text = f.render(name, True, COL_TEXT)
+            padx, pady = round(f.get_height() * 0.45), max(1, round(f.get_height() * 0.08))
+            w, h = text.get_width() + 2 * padx, text.get_height() + 2 * pady
+            edge = max(1, round(self.s))
+
+            def draw(big, k):
+                r = big.get_rect()
+                pygame.draw.rect(big, (96, 96, 102), r, border_radius=h * k // 2)
+                pygame.draw.rect(big, (30, 30, 33), r.inflate(-2 * edge * k, -2 * edge * k),
+                                 border_radius=h * k // 2 - edge * k)
+            img = self._ss(("metro-tag-bg", w, h), w, h, draw).copy()
+            img.blit(text, (padx, pady))
+            self.shape_cache[key] = img
+        return img
+
+    @staticmethod
+    def metro_tag_spot(geo, rect, node, size, ring):
+        """Top-left of the name tag: of the spots round the station, the one
+        inside the map that covers the fewest lines and stations (the right
+        side on a tie). Worked out once per station."""
+        key = (node, size)
+        if key not in geo.spots:
+            x, y = geo.at[node]
+            w, h = size
+            g = ring + max(3.0, geo.w)
+            d = g * 0.75
+            spots = [(x + g, y - h / 2), (x - g - w, y - h / 2), (x - w / 2, y - g - h), (x - w / 2, y + g),
+                     (x + d, y - d - h), (x + d, y + d), (x - d - w, y - d - h), (x - d - w, y + d)]
+            room = rect.inflate(-4, -4)
+
+            def cost(spot):
+                r = pygame.Rect(round(spot[0]), round(spot[1]), w, h)
+                return (not room.contains(r), sum(1 for p in geo.busy if r.collidepoint(p)))
+            best = pygame.Rect(*map(round, min(spots, key=cost)), w, h).clamp(room)
+            geo.spots[key] = best.topleft
+        return geo.spots[key]
 
     def draw_live_map(self, surf, snap):
         """Whichever map is moving: the F1 cars or the Metro trains."""
