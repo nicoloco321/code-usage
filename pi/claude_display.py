@@ -171,6 +171,7 @@ class Config:
     """config.ini, with defaults for anything missing (a missing file is fine)."""
 
     def __init__(self, path):
+        self.path = path
         cp = configparser.ConfigParser(interpolation=None)
         cp.read(path, encoding="utf-8")
 
@@ -1027,12 +1028,39 @@ def bambu_worker(model):
             delay = 60
         except (OSError, ConnectionError) as e:
             log(f"printer connection: {e}")
-            model.set_printer_status("printer unreachable - retrying", COL_RED)
+            if bambu_moved(model):
+                delay = 0  # found it at a new address: straight back in
+            else:
+                model.set_printer_status("printer unreachable - retrying", COL_RED)
         finally:
             client.close()
         if delay:
             model.bambu_wake.wait(delay)
             model.bambu_wake.clear()
+
+
+def bambu_moved(model):
+    """The router may have given the printer a new address: listen for its
+    announcement, and if it's elsewhere now, use (and save) that. True if so."""
+    cfg = model.cfg
+    model.set_printer_status("printer unreachable - looking for it on the network...", COL_YELLOW)
+    try:
+        found = find_bambu(12, serial=cfg.bambu_serial)  # it announces itself every few seconds
+    except OSError as e:  # port 2021 taken
+        log(f"printer search: {e}")
+        return False
+    host = next((p["host"] for p in found if p["serial"] == cfg.bambu_serial), None)
+    if not host or host == cfg.bambu_host:
+        return False
+    log(f"printer moved from {cfg.bambu_host} to {host}")
+    cfg.bambu_host = host
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "server"))
+        from device_login import save_to_config
+        save_to_config(cfg.path, "bambu", {"host": host})
+    except Exception as e:  # still fine for this run
+        log(f"could not save the printer's new address: {e}")
+    return True
 
 
 BAMBU_STATES = {  # gcode_state -> (what the screen says, colour)
@@ -1086,9 +1114,10 @@ def printer_view(p, now):
                            has_job=state in ("RUNNING", "PAUSE", "PREPARE", "FINISH", "FAILED"))
 
 
-def find_bambu(seconds=8):
-    """Bambu printers announce themselves on UDP 2021 (SSDP-style); listen."""
-    found = {}
+def find_bambu(seconds=8, serial=None):
+    """Bambu printers announce themselves on UDP 2021 (SSDP-style); listen
+    (stopping early once `serial` is heard, if given)."""
+    found, want = {}, serial
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("", 2021))
@@ -1110,6 +1139,8 @@ def find_bambu(seconds=8):
                 found[serial] = {"serial": serial, "host": head.get("location") or addr[0],
                                  "name": head.get("devname.bambu.com", ""),
                                  "model": head.get("devmodel.bambu.com", "")}
+            if want and want in found:
+                break
     finally:
         s.close()
     return list(found.values())
