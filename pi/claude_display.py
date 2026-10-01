@@ -58,6 +58,7 @@ import signal
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -467,6 +468,9 @@ class Model:
         self.addons = ScreenStore()  # add-on screens: see ScreenStore
         self.addons.load_all()
         self.pairing = Pairing(state)
+        self.hidden = set(state.get("hidden_modes") or [])  # built-ins left out of the taps
+        self.restart = False       # new settings in config.ini: main() starts the app afresh
+        self.version = display_version()
         saved = state.get("mode")
         self.mode = saved if self.is_ready(saved) else "usage"
 
@@ -573,7 +577,71 @@ class Model:
         """The screen after this one, skipping any that aren't set up."""
         modes = self.modes()
         i = modes.index(self.mode) if self.mode in modes else 0
-        return next((m for m in modes[i + 1:] + modes[:i] if self.is_ready(m)), self.mode)
+        return next((m for m in modes[i + 1:] + modes[:i]
+                     if self.is_ready(m) and m not in self.hidden), self.mode)
+
+    def set_hidden(self, mode, hidden):
+        """Leave a built-in screen out of the screens you tap through (or put it back)."""
+        with self.lock:
+            (self.hidden.add if hidden else self.hidden.discard)(mode)
+            self.state.put("hidden_modes", sorted(self.hidden))
+
+    def builtin_info(self):
+        """The built-in screens for GET /screens: set up or not, shown or not,
+        and their settings (secrets only as set / not set)."""
+        c = self.cfg
+        values = {
+            "planes": {"lat": c.planes_lat, "lon": c.planes_lon, "radius_nm": c.planes_radius},
+            "metro": {"api_key": bool(c.metro_key), "station": c.metro_station},
+            "bambu": {"host": c.bambu_host, "serial": c.bambu_serial,
+                      "access_code": bool(c.bambu_code), "name": c.bambu_name},
+            "f1": {"enabled": c.f1_enabled},
+        }
+        if self.mode == "metro" or self.metro.get("net"):
+            node = self.metro_station()
+            net = self.metro.get("net")
+            if node and net:
+                values["metro"]["station"] = net.names[node]
+        return [{"id": m, "ready": bool(self.ready.get(m)) and not (m == "usage" and not c.refresh_token),
+                 "hidden": m in self.hidden, "settings": values.get(m, {}),
+                 "setup": BUILTIN_SETUP.get(m, "")} for m in MODES]
+
+    def configure_builtin(self, mode, settings):
+        """Save a built-in screen's settings to config.ini. Returns (restart
+        needed, error). A new station takes at once; the rest needs a restart."""
+        section, kinds = BUILTIN_SETTINGS[mode]
+        values = {}
+        for key, kind in kinds.items():
+            if key not in settings:
+                continue
+            v = settings[key]
+            if kind == "secret" and not v:
+                continue  # blank = keep the one saved
+            if kind == "number":
+                try:
+                    v = f"{float(v):g}" if v not in (None, "") else ""
+                except (TypeError, ValueError):
+                    return False, f"{key} must be a number"
+            elif kind == "boolean":
+                v = "yes" if v in (True, "true", "yes", "on", "1", 1) else "no"
+            else:
+                v = str(v).strip()
+                if "\n" in v or "\r" in v:
+                    return False, f"{key} can't have line breaks"
+            values[key] = v
+        if mode == "metro" and "station" in values and self.metro.get("net") \
+                and set(values) == {"station"}:
+            if not self.choose_metro_station(values["station"]):
+                return False, f"no station called {values['station']!r}"
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "server"))
+        from device_login import save_to_config
+        save_to_config(self.cfg.path, section, values)
+        log(f"config: [{section}] {', '.join(values)} changed from the marketplace")
+        self.set_hidden(mode, False)
+        restart = set(values) != {"station"} or not self.metro.get("net")
+        if restart:
+            self.state.put("mode", mode)  # come back up on the screen just set up
+        return restart, None
 
     def toggle_mode(self):
         nxt = self.next_mode()
@@ -3537,6 +3605,32 @@ SCREEN_MAX_BYTES = 4 * 1024 * 1024  # one install, all files together
 PAIR_SECS = 180
 PAIR_TRIES = 5
 
+# The built-in screens' settings a paired marketplace may change: screen ->
+# (config.ini section, {key: kind}). "secret" values are never sent back out,
+# only whether they're set. Spotify and the usage screen need an OAuth login
+# on the Pi itself, so they're not here.
+BUILTIN_SETTINGS = {
+    "planes": ("planes", {"lat": "number", "lon": "number", "radius_nm": "number"}),
+    "metro": ("metro", {"api_key": "secret", "station": "text"}),
+    "bambu": ("bambu", {"host": "text", "serial": "text", "access_code": "secret", "name": "text"}),
+    "f1": ("f1", {"enabled": "boolean"}),
+}
+BUILTIN_SETUP = {  # what to run on the Pi when a screen can't be set up remotely
+    "usage": "python3 server/device_login.py --config ~/.config/claude-display/config.ini",
+    "spotify": "python3 server/spotify_login.py --config ~/.config/claude-display/config.ini",
+}
+
+
+def display_version():
+    """The code-usage commit this display runs (empty outside a git checkout)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(["git", "-C", here, "log", "-1", "--format=%h %cs"],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
 
 def parse_color(value, default=COL_ORANGE):
     """'#d97757', 'd97757' or [217, 119, 87] -> an RGB tuple."""
@@ -4534,7 +4628,8 @@ class BeaconHandler(BaseHTTPRequestHandler):
         if path == "/screens" and self.command == "GET":
             r = Renderer.LAYOUTS
             self._json(200, {
-                "api": SCREEN_API, "host": m.host, "ip": m.ip, "mode": m.mode,
+                "api": SCREEN_API, "version": m.version, "builtin_screens": m.builtin_info(),
+                "host": m.host, "ip": m.ip, "mode": m.mode,
                 "layout": m.layout, "design_size": r.get(m.layout),
                 "builtin": [x for x in MODES if m.ready.get(x)],
                 "installed": [a.summary() for a in map(m.addons.get, m.addons.ids()) if a],
@@ -4584,6 +4679,29 @@ class BeaconHandler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "screen": screen.summary()})
             return
         parts = path.split("/")  # ["", "screens", id, action]
+        if len(parts) == 5 and parts[2] == "builtin" and parts[3] in MODES:
+            mode, action = parts[3], parts[4]
+            if action in ("enable", "disable"):
+                if action == "disable" and mode == "usage":
+                    self._json(400, {"error": "the usage screen can't be left out"})
+                    return
+                m.set_hidden(mode, action == "disable")
+                if action == "disable" and m.mode == mode:
+                    m.set_mode("usage")
+                self._json(200, {"ok": True})
+                return
+            if action == "settings" and mode in BUILTIN_SETTINGS:
+                try:
+                    restart, err = m.configure_builtin(mode, body.get("settings") or {})
+                except OSError as e:
+                    restart, err = False, f"couldn't save config.ini: {e}"
+                if err:
+                    self._json(400, {"error": err})
+                    return
+                self._json(200, {"ok": True, "restarting": restart})
+                if restart:
+                    m.restart = True
+                return
         if len(parts) == 4 and m.addons.get(parts[2]):
             sid, action = parts[2], parts[3]
             if action == "uninstall":
@@ -7023,6 +7141,12 @@ def main():
                             model.spotify_control(button)
                     else:
                         model.toggle_mode()
+
+            if model.restart:  # new settings in config.ini: start again with them
+                log("restarting with the new settings")
+                time.sleep(0.5)  # let the HTTP reply go out
+                pygame.quit()
+                os.execv(sys.executable, [sys.executable] + sys.argv)
 
             mono = time.monotonic()
             if mono - last_ip_check > 10:  # DHCP may hand us a new address

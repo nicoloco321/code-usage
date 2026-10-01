@@ -558,6 +558,10 @@ the screen from its own Power port.
   them from the browser; see the
   [Screen Market's README](https://github.com/nicoloco321/screen-market#writing-a-screen).
   Installed screens join the ones you tap through and answer `POST /mode/<id>`.
+  The marketplace also lists the built-in screens: from there you can leave
+  one out of the screens you tap through, or set up the planes, Metro, 3D
+  printer and F1 screens without SSH (the display saves the settings to
+  config.ini and restarts itself).
 - Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
   `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
   `rotate` for a monitor mounted on its side. Apply changes with
