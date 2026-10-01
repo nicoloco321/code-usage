@@ -4,7 +4,9 @@
 The display can switch between Claude usage and a Spotify now-playing screen
 (the /switch Claude Code command, or POST /mode/spotify). For that it needs its
 own Spotify authorization, minted once here - the device turns it into
-short-lived access tokens on its own, exactly like the Anthropic login.
+short-lived access tokens on its own, exactly like the Anthropic login. It
+also allows playback control, for the Raspberry Pi app's previous / play /
+pause / next buttons (Spotify only takes those from Premium accounts).
 
 One-time Spotify app setup (free, any account):
 
@@ -42,7 +44,7 @@ import webbrowser
 AUTH_URL  = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 NOW_URL   = "https://api.spotify.com/v1/me/player/currently-playing"
-SCOPES    = "user-read-currently-playing user-read-playback-state"
+SCOPES    = "user-read-currently-playing user-read-playback-state user-modify-playback-state"
 PORT      = 8898  # must match the Redirect URI registered on the Spotify app
 REDIRECT  = f"http://127.0.0.1:{PORT}/callback"
 
@@ -223,6 +225,9 @@ def main():
     if "user-read-currently-playing" not in scope:
         print("WARNING: user-read-currently-playing was NOT granted - "
               "the now-playing fetch will 403.")
+    if "user-modify-playback-state" not in scope:
+        print("WARNING: user-modify-playback-state was NOT granted - "
+              "the Spotify screen's buttons won't work.")
 
     # Prove the token works before flashing. 204 = authorized, nothing playing.
     ureq = urllib.request.Request(NOW_URL, headers={"Authorization": "Bearer " + access})

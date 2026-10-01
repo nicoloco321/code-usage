@@ -290,11 +290,12 @@ at session start, so restart it once after copying.)
 [pi/claude_display.py](pi/claude_display.py) is the same display as a
 fullscreen app for a Raspberry Pi (built for a **Pi 2**, fine on anything
 newer) on an HDMI monitor or TV, or the official touchscreen. It has the same
-screens (usage with the thinking spinner; Spotify now playing, with album art)
-and speaks the same HTTP API on port 8080, so the hooks, `beacon.py`,
-`find_display.py` and `/switch` work unchanged. The layout follows the
-screen's shape: landscape screens get a wide layout with a clock, portrait
-ones the ESP32's stacked layout, and long bar panels their own (below).
+screens (usage with the thinking spinner; Spotify now playing, with album art,
+playback buttons and the queue) and speaks the same HTTP API on port 8080, so
+the hooks, `beacon.py`, `find_display.py` and `/switch` work unchanged. The
+layout follows the screen's shape: landscape screens get a wide layout with a
+clock, portrait ones the ESP32's stacked layout, and long bar panels their own
+(below).
 
 **Long bar screens** like the Waveshare 11.9" (320×1480) get two dedicated
 layouts. On its side, a **bar** shows two rows of long meters. Standing up, a
@@ -302,7 +303,7 @@ layouts. On its side, a **bar** shows two rows of long meters. Standing up, a
 portrait out of the box. To lay it on its side, either rotate it in
 **Screen Configuration → HDMI-A-1 → Orientation** on the desktop edition
 (this turns touch too), or set `rotate = 90` in config.ini (works on Lite too;
-taps anywhere switch screens, so touch doesn't need turning). Preview it on
+the app turns taps to match, so touch doesn't need turning). Preview it on
 any PC with `--demo --windowed 1480x320`.
 
 ```
@@ -375,6 +376,24 @@ the screen from its own Power port.
   the bar and landscape layouts.
 - The Pi has no status LED, so while Claude works the Spotify and printer
   screens' status line shows a small spinner and "Claude is working...".
+- **Spotify screen.** The album art, the song and a progress bar, with
+  **previous**, **play/pause** and **next** buttons under it. Play/pause
+  shows pause while music plays and play while it's paused. Previous
+  restarts the song if it's more than 3 seconds in, like Spotify's own apps;
+  tap it again to go back a song. **Up next** lists the next songs in your
+  queue, refreshed when the song changes and every 30 s for songs you queue
+  from your phone. On a long bar screen the **queue button** at the bottom
+  right slides it in from the right: the progress bar shrinks and the
+  buttons move over to make room, and another tap slides it away (it stays
+  how you left it). The landscape and standing-strip layouts always show the
+  queue, and the portrait one has no room for it. A tap anywhere but the
+  buttons still switches screens. Previous, play/pause and next need
+  **Spotify Premium** (Spotify only takes playback commands from Premium
+  accounts) and a Spotify login made since they were added. If the status
+  line says "the buttons need a new spotify login", run
+  `python3 server/spotify_login.py --config ~/.config/claude-display/config.ini`
+  again (over SSH, see **Spotify login over SSH** below) and restart the
+  display.
 - **3D printer screen (Bambu Lab).** A third screen follows a print on a
   Bambu Lab printer on your network: print name, a progress bar with the
   percentage, layer count, time left and when it'll finish, and
@@ -634,6 +653,9 @@ changes it later (and re-points the hooks). Windows often resolves
 | `/mode/spotify` answers 409 / "spotify not set up" | Spotify isn't configured: run `python3 server/spotify_login.py`, paste both `#define`s into config.h, reflash |
 | "spotify auth failed" | Refresh token revoked or wrong client id — re-run `spotify_login.py`. A persistent 403 usually means your account isn't added to the Spotify app (Dashboard → your app → User Management) |
 | "nothing playing" but music is on | Spotify only reports an *active* device; start playback from any Spotify app and it appears within one poll (~5 s) |
+| Pi: "the buttons need a new spotify login" | The Spotify login predates the buttons, so it can't control playback. Re-run `python3 server/spotify_login.py --config ~/.config/claude-display/config.ini`, then restart the display |
+| Pi: "the buttons need Spotify Premium" | Spotify only takes playback commands from Premium accounts. Now playing and the queue still work |
+| Pi: "no active Spotify device" | Spotify has nothing to send the command to, e.g. playback was paused long ago. Start playing on any device, then the buttons work |
 | Pi: blank screen, service keeps restarting | `journalctl -u claude-display -e`. "could not open the screen" on Lite means no KMS driver: `/boot/firmware/config.txt` needs `dtoverlay=vc4-kms-v3d` (the default). Re-run `bash pi/install.sh` to fix group access |
 | Pi: picture has black borders or is cut off | Turn off overscan (`sudo raspi-config` → Display Options), or force a mode with `size = WxH` in config.ini |
 | Tray icon is grey / "Display not reachable" | Set the right address with **Display address…** in the tray menu (the IP from the display's status line always works) |

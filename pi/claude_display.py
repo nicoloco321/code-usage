@@ -31,6 +31,8 @@ pi/install.sh sets everything up to start fullscreen on boot. Needs pygame 2
 (sudo apt install python3-pygame); everything else is the standard library.
 
 Keys: tap / click / space switches screens, Ctrl+Q quits (Esc too, windowed).
+On the Spotify screen a tap on previous / play-pause / next presses it instead,
+and the queue button slides the queue open.
 """
 
 import argparse
@@ -81,8 +83,15 @@ OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code's public
 USER_AGENT = "claude-usage-display/1.0"  # Cloudflare 1010-blocks urllib's default UA
 
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_NOW_URL = ("https://api.spotify.com/v1/me/player/currently-playing"
-                   "?additional_types=episode")
+SPOTIFY_PLAYER_URL = "https://api.spotify.com/v1/me/player"
+SPOTIFY_NOW_URL = SPOTIFY_PLAYER_URL + "/currently-playing?additional_types=episode"
+SPOTIFY_QUEUE_URL = SPOTIFY_PLAYER_URL + "/queue"
+# What the Spotify screen's buttons send: (method, path under SPOTIFY_PLAYER_URL).
+SPOTIFY_COMMANDS = {"play": ("PUT", "/play"), "pause": ("PUT", "/pause"),
+                    "next": ("POST", "/next"), "previous": ("POST", "/previous"),
+                    "restart": ("PUT", "/seek?position_ms=0")}
+SPOTIFY_RESTART_MS = 3000  # previous past this far into a song restarts it, like Spotify's apps
+QUEUE_REFRESH = 30         # seconds: re-read the queue for songs queued from elsewhere
 
 ROOT_TEXT = ("Claude Code usage display (Raspberry Pi). POST /thinking/on while "
              "working, /thinking/off when done. POST /mode/usage, /mode/spotify, "
@@ -252,10 +261,10 @@ class StateFile:
 SSL_CTX = ssl.create_default_context()
 
 
-def http(url, data=None, headers=None, timeout=10):
+def http(url, data=None, headers=None, timeout=10, method=None):
     """(status, body, headers). HTTP errors come back as a status; network
     errors raise (URLError / OSError)."""
-    req = urllib.request.Request(url, data=data, headers=headers or {})
+    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
             return r.status, r.read(), r.headers
@@ -408,6 +417,18 @@ def fmt_ms(ms):
     return f"{s // 60}:{s % 60:02d}"
 
 
+def np_progress(np, np_at, mono):
+    """How far into the song we are at `mono`: where it was at np_at (monotonic
+    time), run on while it plays - the progress bar ticks between polls."""
+    est = np["progress_ms"] + (int((mono - np_at) * 1000) if np["playing"] else 0)
+    return min(est, np["duration_ms"]) if np["duration_ms"] else est
+
+
+def smootherstep(t):
+    """Eases 0 -> 1 with zero speed and acceleration at both ends."""
+    return t * t * t * (t * (t * 6 - 15) + 10)
+
+
 def bar_color(pct):
     if pct is None or pct < 50:
         return COL_GREEN
@@ -452,6 +473,13 @@ class Model:
         self.sp_status = None
         self.art = None            # (url, image bytes) of the latest album art
         self.art_px = 300          # art size on screen, so we fetch a sharp enough variant
+        self.queue = None          # Spotify's up next: {"for": uri playing, "items": [...]}
+        self.queue_open = bool(state.get("spotify_queue"))  # slid open with the queue button
+        self.thumbs = {}           # the queue's covers: url -> image bytes (replaced, never edited)
+        self.thumb_px = 0          # their size on screen; 0 = this layout shows no queue
+        self.queue_version = 0
+        self.sp_commands = []      # taps on the Spotify buttons, for spotify_worker to send
+        self.sp_taps = 0           # counts those taps: a poll begun before the latest is stale
 
         self.printer = None        # Bambu "print" report, merged update by update
         self.printer_status = None
@@ -549,12 +577,18 @@ class Model:
         with self.lock:
             self.usage_status = (text, color)
 
-    def set_now_playing(self, np):
+    def set_now_playing(self, np, taps=None):
+        """A fresh now playing. With `taps` (sp_taps when the commands sent so
+        far were taken), it's dropped if a button was tapped since: the screen
+        already shows that tap, and the worker sends it and polls again."""
         with self.lock:
+            if taps is not None and taps != self.sp_taps:
+                return False
             self.np = np
             self.np_at = time.monotonic()
             self.sp_status = ("spotify ok", COL_GREEN)
             self.np_version += 1
+            return True
 
     def set_sp_status(self, text, color):
         with self.lock:
@@ -563,6 +597,55 @@ class Model:
     def set_art(self, url, data):
         with self.lock:
             self.art = (url, data)
+
+    def set_queue(self, queue):
+        with self.lock:
+            self.queue = queue
+            keep = {item["art_url"] for item in queue["items"]}
+            self.thumbs = {url: data for url, data in self.thumbs.items() if url in keep}
+            self.queue_version += 1
+
+    def set_thumb(self, url, data):
+        with self.lock:
+            self.thumbs = {**self.thumbs, url: data}
+            self.queue_version += 1
+
+    def spotify_control(self, button):
+        """A tap on the Spotify screen's "previous", "toggle" (play / pause) or
+        "next" button. Play / pause and a restart show at once; spotify_worker
+        sends the command to Spotify and polls for the result."""
+        now = time.monotonic()
+        with self.lock:
+            np = self.np
+            if not np or not np.get("has_track"):
+                return
+            pos = np_progress(np, self.np_at, now)
+            if button == "toggle":
+                command = "pause" if np["playing"] else "play"
+                shown = dict(np, playing=not np["playing"], progress_ms=pos)
+            elif button == "previous" and pos > SPOTIFY_RESTART_MS:
+                command, shown = "restart", dict(np, progress_ms=0)
+            else:
+                command, shown = button, None  # the next song shows once Spotify has moved on
+            if shown:
+                self.np, self.np_at = shown, now
+                self.np_version += 1
+            self.sp_commands.append((command, np.get("uri"), pos))
+            self.sp_taps += 1
+        self.spotify_wake.set()
+
+    def take_sp_commands(self):
+        """The taps not yet sent, and sp_taps as of them (see set_now_playing)."""
+        with self.lock:
+            commands, self.sp_commands = self.sp_commands, []
+            return commands, self.sp_taps
+
+    def toggle_queue(self):
+        """The Spotify screen's queue button: slide the queue open or shut.
+        Remembered across restarts, like the screen."""
+        with self.lock:
+            self.queue_open = not self.queue_open
+        self.state.put("spotify_queue", self.queue_open)
 
     def update_printer(self, report):
         """Merge one Bambu report - P1/A1 printers only send what changed."""
@@ -661,6 +744,8 @@ class Model:
                 mode=self.mode, usage=self.usage, usage_version=self.usage_version,
                 usage_status=self.usage_status, np=self.np, np_at=self.np_at,
                 np_version=self.np_version, sp_status=self.sp_status, art=self.art,
+                queue=self.queue, thumbs=self.thumbs, queue_version=self.queue_version,
+                queue_open=self.queue_open,
                 printer=self.printer, printer_status=self.printer_status,
                 sessions=self.sessions_now(now),
                 printer_name=self.cfg.bambu_name or "3D printer",
@@ -776,6 +861,24 @@ def pick_art(images, want_px):
     return (min(big) if big else max(imgs))[1]
 
 
+QUEUE_ROWS = 6  # the most songs any layout lists under "up next"
+
+
+def spotify_item(item, art_px):
+    """A track or podcast episode, as the screen shows it."""
+    album = item.get("album") or {}
+    artists = ", ".join(a["name"] for a in item.get("artists") or [] if a.get("name"))
+    if not artists:  # podcast episodes have a show, not artists
+        artists = (item.get("show") or {}).get("name", "")
+    return {
+        "uri": item.get("uri") or "",
+        "track": item.get("name") or "",
+        "artist": artists,
+        "album": album.get("name") or "",
+        "art_url": pick_art(album.get("images") or item.get("images") or [], art_px),
+    }
+
+
 def spotify_request(access, art_px):
     """One GET to currently-playing -> (status, retry_after, now_playing or None).
     204 means nothing is playing - a success, just an empty one."""
@@ -788,49 +891,146 @@ def spotify_request(access, art_px):
     item = raw.get("item")
     if not item:
         return 200, 0, {"has_track": False}
-    album = item.get("album") or {}
-    artists = ", ".join(a["name"] for a in item.get("artists") or [] if a.get("name"))
-    if not artists:  # podcast episodes have a show, not artists
-        artists = (item.get("show") or {}).get("name", "")
-    return 200, 0, {
-        "has_track": True,
-        "playing": bool(raw.get("is_playing")),
-        "progress_ms": int(raw.get("progress_ms") or 0),
-        "duration_ms": int(item.get("duration_ms") or 0),
-        "track": item.get("name") or "",
-        "artist": artists,
-        "album": album.get("name") or "",
-        "art_url": pick_art(album.get("images") or item.get("images") or [], art_px),
-    }
+    return 200, 0, dict(spotify_item(item, art_px), has_track=True,
+                        playing=bool(raw.get("is_playing")),
+                        progress_ms=int(raw.get("progress_ms") or 0),
+                        duration_ms=int(item.get("duration_ms") or 0))
 
 
-def fetch_now_playing(login, art_px):
+def queue_request(access, thumb_px):
+    """One GET to the queue -> (status, retry_after, {"for": the uri of what's
+    playing, "items": what's up next} or None)."""
+    code, body, headers = http(SPOTIFY_QUEUE_URL, headers={"Authorization": "Bearer " + access})
+    if code != 200:
+        return code, (retry_after(headers) if code == 429 else 0), None
+    raw = json.loads(body or b"{}")
+    items = [spotify_item(item, thumb_px) for item in (raw.get("queue") or [])[:QUEUE_ROWS + 1]
+             if isinstance(item, dict)]
+    return 200, 0, {"for": (raw.get("currently_playing") or {}).get("uri") or "", "items": items}
+
+
+def command_request(access, command):
+    """Send one of SPOTIFY_COMMANDS -> (status, retry_after, Spotify's error or None)."""
+    method, path = SPOTIFY_COMMANDS[command]
+    code, body, headers = http(SPOTIFY_PLAYER_URL + path, data=b"", method=method, headers={
+        "Authorization": "Bearer " + access, "Content-Type": "application/json"})
+    if 200 <= code < 300:
+        return code, 0, None
+    try:
+        err = json.loads(body or b"{}").get("error")
+    except (ValueError, AttributeError):
+        err = None
+    return code, (retry_after(headers) if code == 429 else 0), \
+        err if isinstance(err, dict) else {"message": str(err or "")}
+
+
+def spotify_call(login, request, *args):
+    """request(access token, *args) with a fresh token; a 401 means it went
+    stale mid-flight, so refresh once and retry. -3 = no valid token could be
+    obtained."""
     if not login.ensure():
         return -3, 0, None
-    code, retry, np = spotify_request(login.access, art_px)
-    if code == 401:
+    result = request(login.access, *args)
+    if result[0] == 401:
         login.invalidate()
         if login.ensure():
-            code, retry, np = spotify_request(login.access, art_px)
-    return code, retry, np
+            result = request(login.access, *args)
+    return result
+
+
+def command_error(command, code, err):
+    """The status line for a button whose command Spotify turned down, or
+    None when there's nothing worth saying."""
+    message, reason = str((err or {}).get("message") or ""), (err or {}).get("reason")
+    if code in (401, -3):
+        return "spotify auth failed - spotify_login.py", COL_RED
+    if code == -1:
+        return "couldn't reach spotify - try again", COL_RED
+    if "scope" in message.lower():  # a login minted before the buttons existed
+        return "the buttons need a new spotify login - run spotify_login.py", COL_YELLOW
+    if reason == "PREMIUM_REQUIRED":
+        return "the buttons need Spotify Premium", COL_YELLOW
+    if code == 404 or reason == "NO_ACTIVE_DEVICE":
+        return "no active Spotify device - play something on one first", COL_YELLOW
+    if code == 429:
+        return "spotify rate limited - try again in a moment", COL_YELLOW
+    if command in ("play", "pause") and "restriction" in message.lower():
+        return None  # already that way (changed elsewhere since the last poll), as asked
+    message = re.sub(r"^player command failed:\s*", "", message, flags=re.I)
+    verb = {"next": "skip", "previous": "go back", "restart": "restart the song"}.get(command, command)
+    return f"spotify can't {verb} right now: {message or code}", COL_YELLOW
+
+
+def landed(command, uri, pos):
+    """A test for a poll: does it show this command done? (Spotify can take a
+    moment, and a poll from before then would undo what the screen shows.)"""
+    if command == "play":
+        return lambda np: np["has_track"] and np["playing"]
+    if command == "pause":
+        return lambda np: not (np["has_track"] and np["playing"])
+    if command == "restart":
+        return lambda np: np["has_track"] and np["progress_ms"] < pos
+    return lambda np: np.get("uri") != uri  # next / previous: another song
+
+
+def send_spotify_commands(model, login, commands):
+    """Send the taps' commands in order. Returns (deadline, test): until the
+    deadline, a poll that fails test(now playing) predates them."""
+    test = None
+    for command, uri, pos in commands:
+        try:
+            code, _, err = spotify_call(login, command_request, command)
+        except Exception as e:
+            log(f"spotify {command} error: {e}")
+            code, err = -1, None
+        if not 200 <= code < 300:
+            log(f"spotify {command} failed: HTTP {code} {err}")
+            say = command_error(command, code, err)
+            if say:
+                model.flash(*say, secs=6)
+            return None  # skip the rest; the next poll puts the screen right
+        test = landed(command, uri, pos)
+    return time.monotonic() + 3, test
+
+
+def fetch_thumbs(model, items):
+    """The queue's covers, each fetched once."""
+    for item in items:
+        url = item["art_url"]
+        if url and url not in model.thumbs:
+            try:
+                status, data, _ = http(url, timeout=8)
+                if status == 200 and len(data) < 1_000_000:
+                    model.set_thumb(url, data)
+            except Exception as e:
+                log(f"queue cover fetch error: {e}")
 
 
 def spotify_worker(model, login):
     art_tried = ""
+    expect = None        # (deadline, test) after a button's command: see landed()
+    settle_until = 0.0   # poll quickly until then, while commands land
+    queue_uri, queue_at, queue_tries = "", 0.0, 0  # the song the queue is for, when, retries
     while True:
-        if model.mode != "spotify":  # sleep until someone switches to Spotify
+        commands, taps = model.take_sp_commands()
+        if commands:
+            expect = send_spotify_commands(model, login, commands)
+            settle_until = time.monotonic() + 4
+        elif model.mode != "spotify":  # sleep until someone switches to Spotify
             model.spotify_wake.wait()
             model.spotify_wake.clear()
             continue
         delay = model.cfg.sp_poll
         try:
-            code, retry, np = fetch_now_playing(login, model.art_px)
+            code, retry, np = spotify_call(login, spotify_request, model.art_px)
         except Exception as e:
             log(f"spotify fetch error: {e}")
             code, retry, np = -1, 0, None
 
-        if code == 200:
-            model.set_now_playing(np)
+        if code == 200 and expect and time.monotonic() < expect[0] and not expect[1](np):
+            pass  # from before the command landed: keep what's on screen, look again soon
+        elif code == 200 and model.set_now_playing(np, taps):
+            expect = None
             url = np.get("art_url") if np["has_track"] else ""
             if url and url != art_tried:
                 art_tried = url  # one attempt per track
@@ -840,10 +1040,29 @@ def spotify_worker(model, login):
                         model.set_art(url, data)
                 except Exception as e:
                     log(f"album art fetch error: {e}")
+            uri, now = np.get("uri") if np["has_track"] else "", time.monotonic()
+            if uri and model.thumb_px and (uri != queue_uri or now - queue_at > QUEUE_REFRESH):
+                queue_at = now
+                try:
+                    qcode, _, queue = spotify_call(login, queue_request, model.thumb_px)
+                except Exception as e:
+                    log(f"spotify queue fetch error: {e}")
+                    qcode, queue = -1, None
+                if qcode != 200:
+                    queue_uri, queue_tries = uri, 0  # try again at the next refresh
+                elif queue["for"] != uri and queue_tries < 2:
+                    queue_tries += 1  # still the last song's queue: Spotify's catching up
+                    delay = 1.0
+                else:
+                    model.set_queue({**queue, "for": uri})
+                    queue_uri, queue_tries = uri, 0
+                    fetch_thumbs(model, queue["items"])
             if np["has_track"] and np["playing"] and np["duration_ms"]:
                 # poll right as the track ends to catch the next one
                 left = (np["duration_ms"] - np["progress_ms"]) / 1000
                 delay = max(1.0, min(delay, left + 0.5))
+        elif code == 200:
+            pass  # a button was tapped mid-poll: go round, send it, poll again
         elif code in (401, 403, -3):
             # 403 usually means the Spotify app doesn't include this account
             # (Dashboard -> your app -> User Management).
@@ -854,6 +1073,8 @@ def spotify_worker(model, login):
         elif time.monotonic() - model.np_at > 30:
             model.set_sp_status("network down - retrying" if code == -1
                                 else f"spotify fetch failed ({code})", COL_RED)
+        if code != 429 and time.monotonic() < settle_until:
+            delay = min(delay, 0.7)
         model.spotify_wake.wait(delay)
         model.spotify_wake.clear()
 
@@ -3268,16 +3489,44 @@ def setup_metro(config_path):
 
 # ---------------------------------------------------------------- demo data
 
-def demo_art():
+# The demo's playlist: track, artist, album, seconds, and its cover's colours
+# (gradient top, bottom, disc).
+DEMO_SONGS = [
+    ("A Demo Track With a Title Long Enough to Wrap Onto Two Lines", "The Placeholders",
+     "Sample Sessions (Deluxe)", 214, ((40, 30, 90), (139, 30, 164), COL_ORANGE)),
+    ("Lorem Ipsum", "Dolor & the Sit Amets", "Consectetur", 187,
+     ((20, 70, 90), (40, 160, 150), (240, 220, 120))),
+    ("Hello, World", "The Printfs", "Standard Output", 162,
+     ((90, 20, 30), (200, 70, 60), (250, 230, 210))),
+    ("Off by One", "Fencepost Error", "Zero Indexed", 233,
+     ((15, 40, 25), (60, 140, 80), (230, 240, 230))),
+    ("Undefined Behavior", "The Segfaults", "Core Dumped", 201,
+     ((30, 30, 30), (110, 110, 120), (250, 200, 40))),
+    ("Merge Conflict", "Rebase & the Cherry-Picks", "HEAD Detached", 196,
+     ((60, 20, 80), (230, 120, 170), (30, 20, 50))),
+    ("Fourteen Minutes of Fan Noise", "Server Room", "Uptime", 840,
+     ((10, 30, 60), (40, 90, 160), (120, 200, 255))),
+]
+
+
+def demo_art(cover=DEMO_SONGS[0][4], px=300):
     """A stand-in album cover, encoded like a download would be."""
-    s = pygame.Surface((300, 300))
-    for y in range(300):
-        pygame.draw.line(s, (40 + y // 3, 30, 90 + y // 4), (0, y), (299, y))
-    pygame.draw.circle(s, COL_ORANGE, (150, 150), 90)
-    pygame.draw.circle(s, (40, 30, 90), (150, 150), 30)
+    top, bottom, disc = cover
+    s = pygame.Surface((px, px))
+    for y in range(px):
+        k = y / (px - 1)
+        pygame.draw.line(s, [round(a + (b - a) * k) for a, b in zip(top, bottom)], (0, y), (px - 1, y))
+    pygame.draw.circle(s, disc, (px // 2, px // 2), round(px * 0.3))
+    pygame.draw.circle(s, top, (px // 2, px // 2), round(px * 0.1))
     buf = io.BytesIO()
     pygame.image.save(s, buf, "art.png")
     return buf.getvalue()
+
+
+def demo_song(i):
+    track, artist, album, _, _ = DEMO_SONGS[i]
+    return {"uri": f"demo:{i}", "track": track, "artist": artist, "album": album,
+            "art_url": f"demo:{i}"}
 
 
 def demo_plane_photo():
@@ -3486,10 +3735,10 @@ def demo_metro(model, t, start, net, prev):
 
 
 def demo_worker(model):
-    """--demo: moving numbers, a thinking spinner every other 8s, a fake song,
-    a fake print, a fake plane, a race and the Metro."""
-    art = demo_art()
-    model.set_art("demo:art", art)
+    """--demo: moving numbers, a thinking spinner every other 8s, a fake
+    playlist (the Spotify buttons work), a fake print, a fake plane, a race
+    and the Metro."""
+    song, playing, pos, played_at, shown = 0, True, 0.0, time.time(), None  # the demo's player
     photo = demo_plane_photo()
     liveries = load_liveries(model.cfg.planes_liveries)
     f1_track_map = demo_f1_track()
@@ -3521,15 +3770,32 @@ def demo_worker(model):
             model.beacon_on()
         else:
             model.beacon_off()
-        pos = int((t - start) * 1000) % 214000
-        if pos < 2000 or model.np is None:
-            model.set_now_playing({
-                "has_track": True, "playing": int(t / 20) % 4 != 3,
-                "progress_ms": pos, "duration_ms": 214000,
-                "track": "A Demo Track With a Title Long Enough to Wrap Onto Two Lines",
-                "artist": "The Placeholders", "album": "Sample Sessions (Deluxe)",
-                "art_url": "demo:art"})
-        time.sleep(1)
+
+        commands, taps = model.take_sp_commands()  # the Spotify screen's buttons
+        if playing:
+            pos += (t - played_at) * 1000
+        played_at = t
+        for command, _, _ in commands:
+            if command in ("play", "pause"):
+                playing = command == "play"
+            elif command == "restart":
+                pos = 0
+            else:
+                song, pos = (song + (1 if command == "next" else -1)) % len(DEMO_SONGS), 0
+        if pos >= DEMO_SONGS[song][3] * 1000:
+            song, pos = (song + 1) % len(DEMO_SONGS), 0
+        if song != shown:
+            shown = song
+            model.set_art(f"demo:{song}", demo_art(DEMO_SONGS[song][4]))
+            up = [(song + k) % len(DEMO_SONGS) for k in range(1, len(DEMO_SONGS))]
+            model.set_queue({"for": f"demo:{song}", "items": [demo_song(i) for i in up]})
+            for i in up:
+                model.set_thumb(f"demo:{i}", demo_art(DEMO_SONGS[i][4], 64))
+        model.set_now_playing(dict(demo_song(song), has_track=True, playing=playing,
+                                   progress_ms=int(pos), duration_ms=DEMO_SONGS[song][3] * 1000),
+                              taps)
+        model.spotify_wake.wait(1)  # or sooner, when a Spotify button is tapped
+        model.spotify_wake.clear()
 
 
 # ---------------------------------------------------------------- http server
@@ -3666,7 +3932,9 @@ class Renderer:
 
     LAYOUTS = {"landscape": (800, 480), "portrait": (180, 320),
                "bar": (1480, 320), "strip": (320, 1480)}
-    ART_SIZE = {"landscape": 232, "portrait": 84, "bar": 236, "strip": 272}
+    ART_SIZE = {"landscape": 232, "portrait": 72, "bar": 236, "strip": 272}
+    THUMB_SIZE = {"landscape": 34, "portrait": 0, "bar": 44, "strip": 54}  # the queue's covers (0: no queue)
+    PRESS_SECS = 0.25  # how long a tapped button stays lit
 
     def __init__(self, size, fonts):
         self.W, self.H = size
@@ -3682,6 +3950,13 @@ class Renderer:
         self.ox = (self.W - bw * self.s) / 2
         self.oy = (self.H - bh * self.s) / 2
         self.art_px = self.n(self.ART_SIZE[self.layout])  # so we fetch sharp enough art
+        thumb = self.THUMB_SIZE[self.layout]
+        self.thumb_px = self.n(thumb) if thumb else 0
+        self.thumb_cache = {}  # (url, px) -> a queue cover, decoded and scaled
+        self.buttons = (None, [])  # (screen, [(rect, button)]) as last drawn: see button_at
+        self.lit = (None, 0.0)     # (button, until): the one just tapped
+        self.queue_anim = None     # the Spotify queue: 0 shut, 1 slid open; None before the first frame
+        self.fit_cache = {}        # fit()'s answers: a slide asks the same ones every frame
         self.anim = 0.0      # 0 = usage bars full width, 1 = session panel open
         self.anim_at = 0.0
         self.spin_cache = {}  # (frame, px) -> the spark, drawn once
@@ -3744,12 +4019,18 @@ class Renderer:
 
     def fit(self, s, max_w, size, bold=False):
         """Shorten s with an ellipsis until it fits in max_w design units."""
-        f, limit = self.font(size, bold), max_w * self.s
-        if f.size(s)[0] <= limit:
-            return s
-        while s and f.size(s + "\u2026")[0] > limit:
-            s = s[:-1]
-        return s.rstrip() + "\u2026"
+        key = (s, max_w, size, bold)
+        out = self.fit_cache.get(key)
+        if out is None:
+            f, limit, out = self.font(size, bold), max_w * self.s, s
+            if f.size(s)[0] > limit:
+                while s and f.size(s + "\u2026")[0] > limit:
+                    s = s[:-1]
+                out = s.rstrip() + "\u2026"
+            if len(self.fit_cache) > 600:
+                self.fit_cache.clear()
+            self.fit_cache[key] = out
+        return out
 
     def wrap2(self, s, max_w, size, bold=False):
         """Break s at a word boundary so line one fits; line two is ellipsized.
@@ -3932,21 +4213,139 @@ class Renderer:
             self._logo(big, c, c, big.get_width() * 0.18, COL_DIM, COL_CARD)
         surf.blit(self._ss(("art",), rect.w, rect.h, draw), rect.topleft)
 
-    def play_state(self, surf, cx, top, h, playing):
-        """No font has a reliable play / pause glyph, so draw them (firmware shapes)."""
-        wpx, hpx = self.n(h * 16 / 14), self.n(h)
-        color = COL_SPOTIFY if playing else COL_DIM
-
-        def draw(big, k):
-            u, c = hpx * k / 14.0, wpx * k / 2
-            if playing:
-                pygame.draw.polygon(big, color, [(c - 5 * u, 0), (c - 5 * u, 14 * u), (c + 7 * u, 7 * u)])
+    # -- the Spotify screen's buttons. No font has reliable play / pause / skip
+    # glyphs, so they're drawn.
+    @staticmethod
+    def _transport(big, kind, color, lit):
+        """One button on the square `big`: "play" / "pause" a disc with the
+        glyph cut out of it, "previous" / "next" a triangle into a bar - on a
+        grey disc while lit."""
+        s = big.get_width()
+        c = s / 2
+        if kind in ("play", "pause"):
+            pygame.draw.circle(big, color, (c, c), c)
+            if kind == "pause":
+                w, h = s * 0.11, s * 0.38
+                for x in (c - w * 1.45, c + w * 0.45):
+                    pygame.draw.rect(big, COL_BG, pygame.Rect(round(x), round(c - h / 2), round(w), round(h)),
+                                     border_radius=round(w * 0.3))
             else:
-                for x0 in (-8, 3):
-                    pygame.draw.rect(big, color, pygame.Rect(c + x0 * u, 0, 5 * u, 14 * u),
-                                     border_radius=int(u))
+                h = s * 0.4
+                x0 = c - h * 0.29  # puts the triangle's centre of mass, not its box, in the middle
+                pygame.draw.polygon(big, COL_BG, [(x0, c - h / 2), (x0, c + h / 2), (x0 + h * 0.87, c)])
+            return
+        if lit:
+            pygame.draw.circle(big, COL_CARD, (c, c), c)
+        h = s * 0.36
+        left = c - h * 0.48
+        side = (lambda x: x) if kind == "next" else (lambda x: s - x)  # previous: mirrored
+        pygame.draw.polygon(big, color, [(side(left), c - h / 2), (side(left), c + h / 2),
+                                         (side(left + h * 0.8), c)])
+        bar_x = side(left + h * 0.8) if kind == "next" else side(left + h * 0.96)
+        pygame.draw.rect(big, color, pygame.Rect(round(bar_x), round(c - h / 2), round(h * 0.16), round(h)),
+                         border_radius=round(h * 0.05))
 
-        surf.blit(self._ss(("play", playing), wpx, hpx, draw), (self.x(cx) - wpx // 2, self.y(top)))
+    def controls(self, surf, snap, cx, cy, d, gap):
+        """Previous, play / pause and next, centred on (cx, cy): play / pause a
+        d-wide disc, the skips `gap` either side of it. It shows pause while
+        playing and play while paused. Each is a button (see button_at), lit
+        green for a moment when tapped."""
+        px, lit = self.n(d), self.lit_button(snap)
+        for button, x in (("previous", cx - gap), ("toggle", cx), ("next", cx + gap)):
+            kind = ("pause" if snap.np["playing"] else "play") if button == "toggle" else button
+            on = button == lit
+            color = COL_SPOTIFY if on else COL_TEXT if button == "toggle" else COL_SUB
+            img = self._ss(("transport", kind, color, on), px, px,
+                           lambda big, k, kind=kind, color=color, on=on:
+                           self._transport(big, kind, color, on))
+            surf.blit(img, (self.x(x) - px // 2, self.y(cy) - px // 2))
+            reach = d * 1.6  # taller than the drawing, for a fingertip
+            self.buttons[1].append((self.rect(x - gap / 2, cy - reach / 2, gap, reach), button))
+
+    @staticmethod
+    def _queue_icon(big, color, on, lit):
+        """The queue button on the square `big`: the song playing (a rounded
+        box) over the songs up next (two lines), with a dot under it while the
+        queue is open and a grey disc behind it while lit."""
+        s = big.get_width()
+        c, g = s / 2, s * 0.45  # centre, the glyph's size
+        t = max(1, round(g * 0.12))  # stroke
+        if lit:
+            pygame.draw.circle(big, COL_CARD, (c, c), c)
+        left, top = round(c - g / 2), round(c - g / 2)
+        pygame.draw.rect(big, color, pygame.Rect(left, top, round(g), round(g * 0.44)), width=t,
+                         border_radius=round(t * 1.4))
+        for y in (0.68, 0.94):
+            pygame.draw.rect(big, color, pygame.Rect(left, round(top + g * y - t / 2), round(g), t),
+                             border_radius=round(t / 2))
+        if on:
+            pygame.draw.circle(big, color, (c, c + g * 0.5 + s * 0.11), s * 0.045)
+
+    def queue_button(self, surf, snap, cx, cy, d):
+        """The queue toggle, a d-wide square centred on (cx, cy): green with a
+        dot while the queue is open."""
+        px, on, lit = self.n(d), snap.queue_open, self.lit_button(snap) == "queue"
+        color = COL_SPOTIFY if on else COL_SUB
+        img = self._ss(("queue", color, on, lit), px, px,
+                       lambda big, k: self._queue_icon(big, color, on, lit))
+        surf.blit(img, (self.x(cx) - px // 2, self.y(cy) - px // 2))
+        self.buttons[1].append((self.rect(cx - 40, cy - 48, 80, 96), "queue"))
+
+    def press(self, button, mono):
+        self.lit = (button, mono + self.PRESS_SECS)
+
+    def lit_button(self, snap):
+        return self.lit[0] if snap.mono < self.lit[1] else None
+
+    def button_at(self, pos, mode):
+        """The button at canvas pixel `pos`, as the `mode` screen was last drawn."""
+        screen, buttons = self.buttons
+        return next((b for rect, b in buttons if rect.collidepoint(pos)), None) if screen == mode else None
+
+    @staticmethod
+    def queue_rows(snap):
+        """What's up after the song on screen; None while that isn't known."""
+        q, np = snap.queue, snap.np
+        if not q or not np or not np.get("has_track"):
+            return None
+        if q["for"] == np.get("uri"):
+            return q["items"]
+        if q["items"] and q["items"][0]["uri"] == np.get("uri"):
+            return q["items"][1:]  # it's moved on a song; the new queue is on its way
+        return None
+
+    def up_next(self, surf, snap, x0, x1, top, step, thumb, size, rows):
+        """Spotify's queue, a song a row: its cover, name and artist."""
+        items = self.queue_rows(snap)
+        if not items:
+            self.text(surf, "loading..." if items is None else "nothing queued",
+                      x0, top + thumb * 0.6, size * 0.85, COL_DIM)
+            return
+        tx = x0 + thumb * 1.3
+        for i, item in enumerate(items[:rows]):
+            y = top + i * step
+            self.queue_cover(surf, item["art_url"], snap.thumbs, self.rect(x0, y, thumb, thumb))
+            self.text(surf, self.fit(item["track"], x1 - tx, size), tx, y + thumb * 0.43, size, COL_TEXT)
+            self.text(surf, self.fit(item["artist"], x1 - tx, size * 0.8), tx, y + thumb * 0.9,
+                      size * 0.8, COL_DIM)
+
+    def queue_cover(self, surf, url, thumbs, rect):
+        key = (url, rect.size)
+        img = self.thumb_cache.get(key)
+        if img is None and url in thumbs:
+            try:
+                img = pygame.transform.smoothscale(
+                    pygame.image.load(io.BytesIO(thumbs[url]), "cover.jpg").convert(), rect.size)
+            except Exception as e:
+                log(f"could not decode a queue cover: {e}")
+                img = False
+            if len(self.thumb_cache) > 40:
+                self.thumb_cache.clear()
+            self.thumb_cache[key] = img
+        if img:
+            surf.blit(img, rect.topleft)
+        else:
+            surf.fill(COL_CARD, rect)
 
     def album_art(self, surf, rect, snap):
         np = snap.np
@@ -3967,9 +4366,7 @@ class Renderer:
     # -- scene
     @staticmethod
     def progress_ms(snap):
-        np = snap.np
-        est = np["progress_ms"] + (int((snap.mono - snap.np_at) * 1000) if np["playing"] else 0)
-        return min(est, np["duration_ms"]) if np["duration_ms"] else est
+        return np_progress(snap.np, snap.np_at, snap.mono)
 
     def scene_key(self, snap, now):
         """Everything but the spinner's animation that changes the picture -
@@ -4015,13 +4412,21 @@ class Renderer:
             v = printer_view(snap.printer, now)
             return key + (snap.printer is None, v.word, v.job, v.pct, v.left, v.eta, v.layers,
                           v.temps, snap.printer_status, snap.thinking)
+        if 0 < self.queue_t < 1:
+            # Mid-slide, draw_slide repaints everything right of the art each
+            # frame - song, progress, buttons, queue: only what's outside it
+            # (the art, the status line) is worth stopping the slide for.
+            return key + ("sliding", snap.sp_status, snap.art and snap.art[0],
+                          snap.np.get("art_url"), snap.thinking)
         playing = snap.np is not None and snap.np.get("has_track")
         return key + (snap.np_version, snap.sp_status, snap.art and snap.art[0], snap.thinking,
-                      self.progress_ms(snap) // 1000 if playing else -1)
+                      self.progress_ms(snap) // 1000 if playing else -1,
+                      snap.queue_version, self.lit_button(snap), self.queue_t)
 
     def draw(self, surf, snap, now):
         if snap.mode != "planes" and self.photo_img is not None:
             self.photo_url = self.photo_img = None  # planespotters: only while it's on screen
+        self.buttons = (snap.mode, [])  # the screen's drawing adds its own
         surf.fill(COL_BG)
         getattr(self, f"_{snap.mode}_{self.layout}")(surf, snap, now)
         self._status(surf, snap)
@@ -4075,32 +4480,57 @@ class Renderer:
     def session_open(self, snap):
         return self.layout in self.PANEL_LAYOUTS and (snap.thinking or bool(snap.sessions))
 
+    # -- the Spotify screen's queue: its button slides it in from the right.
+    QUEUE_ANIM_SECS = 0.6
+    QUEUE_SLIDES = ("bar",)  # the other layouts always show their queue, or have no room for one
+
     def advance(self, snap):
-        """Step the open / close slide toward where it should be; True while it moves."""
-        target = 1.0 if self.session_open(snap) else 0.0
+        """Step the slides - the usage screen's session panel, the Spotify
+        screen's queue - toward where they should be; True while one moves."""
         dt = min(0.05, snap.mono - self.anim_at) if self.anim_at else 0.0
         self.anim_at = snap.mono
+        target = 1.0 if self.session_open(snap) else 0.0
         if snap.mode != "usage":
             # Only the usage screen has the slide: elsewhere, just be where it
             # should be. (Sliding here would paint the usage bars' slide frames
             # over the other screen, and coming back finds the panel as it was.)
             self.anim = target
-            return False
-        if self.anim == target:
-            return False
-        step = dt / self.ANIM_SECS
-        self.anim = min(target, self.anim + step) if target > self.anim else max(target, self.anim - step)
-        return True
+        elif self.anim != target:
+            self.anim = self._step(self.anim, target, dt / self.ANIM_SECS)
+            return True
+        target = 1.0 if snap.queue_open else 0.0
+        if (self.queue_anim is None or snap.mode != "spotify" or self.layout not in self.QUEUE_SLIDES
+                or not (snap.np and snap.np.get("has_track"))):
+            self.queue_anim = target  # likewise: it only slides where you can see it
+        elif self.queue_anim != target:
+            self.queue_anim = self._step(self.queue_anim, target, dt / self.QUEUE_ANIM_SECS)
+            return True
+        return False
+
+    @staticmethod
+    def _step(value, target, step):
+        return min(target, value + step) if target > value else max(target, value - step)
 
     @property
     def eased(self):
-        t = self.anim  # smootherstep: zero speed and acceleration at both ends
-        return t * t * t * (t * (t * 6 - 15) + 10)
+        return smootherstep(self.anim)
+
+    @property
+    def queue_t(self):
+        """How far open the Spotify queue is, 0 to 1."""
+        return self.queue_anim or 0.0
 
     SLIDE_REGION = {"bar": (350, 28, 1130, 232), "landscape": (298, 110, 502, 292)}
+    QUEUE_SLIDE_REGION = (284, 22, 1196, 256)  # bar: right of the art, above the status line
 
     def draw_slide(self, surf, snap, now):
         """Mid-slide frame: repaint only the moving region, return its rect."""
+        if snap.mode == "spotify":
+            rect = self.rect(*self.QUEUE_SLIDE_REGION)
+            surf.fill(COL_BG, rect)
+            self.buttons = (snap.mode, [])  # they move, so they're drawn - and placed - anew
+            self._spotify_bar_player(surf, snap)
+            return rect
         rect = self.rect(*self.SLIDE_REGION[self.layout])
         surf.fill(COL_BG, rect)
         getattr(self, f"_slide_{self.layout}")(surf, snap, now)
@@ -4303,22 +4733,26 @@ class Renderer:
                       COL_DIM, align="c")
             return
         self.album_art(surf, self.rect(32, 130, 232, 232), snap)
-        x0, x1 = 300, 768
-        l1, l2 = self.wrap2(np["track"], x1 - x0, 34, bold=True)
-        y = 166
-        self.text(surf, l1, x0, y, 34, COL_TEXT, bold=True)
+        x0, x1 = 288, 548
+        l1, l2 = self.wrap2(np["track"], x1 - x0, 26, bold=True)
+        y = 154
+        self.text(surf, l1, x0, y, 26, COL_TEXT, bold=True)
         if l2:
-            y += 42
-            self.text(surf, l2, x0, y, 34, COL_TEXT, bold=True)
-        y += 40
-        self.text(surf, self.fit(np["artist"], x1 - x0, 24), x0, y, 24, COL_SUB)
-        self.text(surf, self.fit(np["album"], x1 - x0, 18), x0, y + 30, 18, COL_DIM)
+            y += 32
+            self.text(surf, l2, x0, y, 26, COL_TEXT, bold=True)
+        y += 32
+        self.text(surf, self.fit(np["artist"], x1 - x0, 19), x0, y, 19, COL_SUB)
+        self.text(surf, self.fit(np["album"], x1 - x0, 15), x0, y + 24, 15, COL_DIM)
 
         ms, dur = self.progress_ms(snap), np["duration_ms"]
-        self.bar(surf, self.rect(x0, 322, x1 - x0, 12), ms / dur if dur else 0, COL_SPOTIFY, 6)
-        self.text(surf, fmt_ms(ms), x0, 360, 16, COL_DIM)
-        self.text(surf, fmt_ms(dur), x1, 360, 16, COL_DIM, align="r")
-        self.play_state(surf, (x0 + x1) / 2, 344, 18, np["playing"])
+        self.bar(surf, self.rect(x0, 266, x1 - x0, 10), ms / dur if dur else 0, COL_SPOTIFY, 5)
+        self.text(surf, fmt_ms(ms), x0, 296, 14, COL_DIM)
+        self.text(surf, fmt_ms(dur), x1, 296, 14, COL_DIM, align="r")
+        self.controls(surf, snap, (x0 + x1) / 2, 332, 52, 84)
+
+        surf.fill(COL_CARD, self.rect(570, 128, 2, 234))
+        self.text(surf, "UP NEXT", 592, 144, 13, COL_DIM, bold=True)
+        self.up_next(surf, snap, 592, 768, 160, 51, 34, 16, rows=4)
 
     def _spotify_portrait(self, surf, snap, now):
         self.spotify_logo(surf, 34, 32, 20)
@@ -4340,12 +4774,12 @@ class Renderer:
         self.text(surf, self.fit(np["artist"], 156, 12), 12, y, 12, COL_SUB)
         self.text(surf, self.fit(np["album"], 156, 10), 12, y + 15, 10, COL_DIM)
 
-        self.album_art(surf, self.rect(48, 148, 84, 84), snap)
+        self.album_art(surf, self.rect(54, 144, 72, 72), snap)
         ms, dur = self.progress_ms(snap), np["duration_ms"]
-        self.text(surf, fmt_ms(ms), 12, 250, 10, COL_DIM)
-        self.text(surf, fmt_ms(dur), 168, 250, 10, COL_DIM, align="r")
-        self.bar(surf, self.rect(12, 256, 156, 8), ms / dur if dur else 0, COL_SPOTIFY, 4)
-        self.play_state(surf, 90, 272, 14, np["playing"])
+        self.text(surf, fmt_ms(ms), 12, 233, 10, COL_DIM)
+        self.text(surf, fmt_ms(dur), 168, 233, 10, COL_DIM, align="r")
+        self.bar(surf, self.rect(12, 239, 156, 8), ms / dur if dur else 0, COL_SPOTIFY, 4)
+        self.controls(surf, snap, 90, 274, 30, 52)
 
     # -- bar: 1480x320. Two rows - brand + 5-hour, activity + weekly - with
     # long meters, so it reads left to right at a glance.
@@ -4412,19 +4846,39 @@ class Renderer:
             self.text(surf, "nothing playing" if np else "loading...", 300, 160, 34, COL_DIM)
             return
         self.album_art(surf, art, snap)
-        x0, x1 = 300, 1452
-        self.spotify_logo(surf, 1428, 54, 24)
-        width = 1380 - x0  # leave the logo its corner
-        self.text(surf, self.fit(np["track"], width, 44, bold=True), x0, 82, 44,
+        self._spotify_bar_player(surf, snap)
+
+    def _spotify_bar_player(self, surf, snap):
+        """Everything right of the album art: what moves when the queue
+        button slides the queue in from the right. The progress bar shrinks
+        and the buttons move over to make room for it."""
+        np, e = snap.np, smootherstep(self.queue_t)
+        x0, x1 = 300, 1452 - 452 * e  # the song's side, narrowing as the queue opens
+        # Till the queue's all the way open the text keeps the full width, and
+        # the queue slides over it: no reflowing mid-slide. (1100 leaves the
+        # logo its corner.)
+        width = 700 if self.queue_t == 1 else 1100
+        self.text(surf, self.fit(np["track"], width, 40, bold=True), x0, 74, 40,
                   COL_TEXT, bold=True)
-        self.text(surf, self.fit(np["artist"], width, 28), x0, 126, 28, COL_SUB)
-        self.text(surf, self.fit(np["album"], width, 21), x0, 162, 21, COL_DIM)
+        self.text(surf, self.fit(np["artist"], width, 26), x0, 114, 26, COL_SUB)
+        self.text(surf, self.fit(np["album"], width, 20), x0, 146, 20, COL_DIM)
 
         ms, dur = self.progress_ms(snap), np["duration_ms"]
-        self.bar(surf, self.rect(x0, 192, x1 - x0, 16), ms / dur if dur else 0, COL_SPOTIFY, 8)
-        self.text(surf, fmt_ms(ms), x0, 244, 21, COL_DIM)
-        self.text(surf, fmt_ms(dur), x1, 244, 21, COL_DIM, align="r")
-        self.play_state(surf, (x0 + x1) / 2, 224, 24, np["playing"])
+        self.bar(surf, self.rect(x0, 168, x1 - x0, 12), ms / dur if dur else 0, COL_SPOTIFY, 6,
+                 fast=0 < self.queue_t < 1)
+        self.text(surf, fmt_ms(ms), x0, 206, 20, COL_DIM)
+        self.text(surf, fmt_ms(dur), x1, 206, 20, COL_DIM, align="r")
+        self.controls(surf, snap, (x0 + x1) / 2, 232, 60, 110)
+        self.queue_button(surf, snap, x1 - 12, 232, 48)
+
+        if e > 0:
+            qx = 1024 + 456 * (1 - e)  # the queue's left edge, in from off the screen
+            surf.fill(COL_BG, self.rect(qx - 12, 24, 1480 - qx + 12, 250))  # over the text
+            surf.fill(COL_CARD, self.rect(qx, 40, 2, 224))
+            self.text(surf, "UP NEXT", qx + 26, 50, 15, COL_DIM, bold=True)
+            self.up_next(surf, snap, qx + 26, qx + 428, 70, 50, 44, 20, rows=4)
+        surf.fill(COL_BG, self.rect(1412, 22, 68, 46))  # the logo keeps its corner, the queue slides under
+        self.spotify_logo(surf, 1434, 44, 18)
 
     # -- strip: 320x1480, the bar standing up. Everything stacks, big.
     def _clock_strip(self, surf, now):
@@ -4476,9 +4930,13 @@ class Renderer:
 
         ms, dur = self.progress_ms(snap), np["duration_ms"]
         self.bar(surf, self.rect(24, 730, 272, 12), ms / dur if dur else 0, COL_SPOTIFY, 6)
-        self.text(surf, fmt_ms(ms), 24, 776, 19, COL_DIM)
-        self.text(surf, fmt_ms(dur), 296, 776, 19, COL_DIM, align="r")
-        self.play_state(surf, 160, 756, 24, np["playing"])
+        self.text(surf, fmt_ms(ms), 24, 772, 19, COL_DIM)
+        self.text(surf, fmt_ms(dur), 296, 772, 19, COL_DIM, align="r")
+        self.controls(surf, snap, 160, 840, 76, 96)
+
+        surf.fill(COL_CARD, self.rect(24, 912, 272, 2))
+        self.text(surf, "UP NEXT", 24, 950, 18, COL_DIM, bold=True)
+        self.up_next(surf, snap, 24, 296, 968, 66, 54, 21, rows=3)
 
 
     # -- the Bambu Lab printer screen
@@ -5632,6 +6090,19 @@ def rotate_rect(r, rotate, cw, ch):
     return r
 
 
+def unrotate_point(p, rotate, cw, ch):
+    """Where screen point p (a tap) is on a cw x ch canvas turned `rotate`
+    degrees clockwise onto the screen - rotate_rect backwards."""
+    x, y = p
+    if rotate == 90:
+        return y, ch - 1 - x
+    if rotate == 180:
+        return cw - 1 - x, ch - 1 - y
+    if rotate == 270:
+        return cw - 1 - y, x
+    return x, y
+
+
 def open_screen(args, cfg):
     pygame.display.init()
     pygame.font.init()
@@ -5733,7 +6204,7 @@ def main():
     canvas = pygame.Surface((sh, sw) if rotate in (90, 270) else (sw, sh)).convert() \
         if rotate else screen
     renderer = Renderer(canvas.get_size(), find_fonts())
-    model.art_px = renderer.art_px
+    model.art_px, model.thumb_px = renderer.art_px, renderer.thumb_px
     renderer.warm_spinner()  # draw the spark's frames now, not mid-animation
     log(f"screen {sw}x{sh}, rotate {rotate}, {renderer.layout} layout")
 
@@ -5768,7 +6239,18 @@ def main():
                     if ev.key in (pygame.K_SPACE, pygame.K_TAB, pygame.K_RETURN):
                         model.toggle_mode()
                 elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
-                    model.toggle_mode()  # touchscreens send taps as clicks
+                    # Touchscreens send taps as clicks. A tap on a button
+                    # presses it; anywhere else switches screens.
+                    button = renderer.button_at(unrotate_point(ev.pos, rotate, *canvas.get_size()),
+                                                model.mode)
+                    if button:
+                        renderer.press(button, time.monotonic())
+                        if button == "queue":
+                            model.toggle_queue()
+                        else:
+                            model.spotify_control(button)
+                    else:
+                        model.toggle_mode()
 
             mono = time.monotonic()
             if mono - last_ip_check > 10:  # DHCP may hand us a new address
