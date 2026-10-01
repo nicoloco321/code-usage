@@ -344,7 +344,7 @@ class Model:
     """Everything on screen, shared by the workers, the HTTP server and the
     renderer. The screens add their own state and methods (see NativeScreen)."""
 
-    def __init__(self, cfg, state, demo=False):
+    def __init__(self, cfg, state, demo=False, screens=None):
         self.cfg, self.state, self.demo = cfg, state, demo
         self.lock = threading.Lock()
         self.restart = False       # screens or settings changed: main() starts the app afresh
@@ -356,7 +356,7 @@ class Model:
         self.ip = ""
         self.layout = None         # the renderer's, for GET /screens
         self.pairing = Pairing(state)
-        self.addons = ScreenStore()  # the installed screens: see ScreenStore
+        self.addons = ScreenStore(screens or SCREENS_DIR)  # the installed screens: see ScreenStore
         self.addons.load_all(self)
         saved = state.get("mode")
         self.mode = saved if self.is_ready(saved) else next(
@@ -810,6 +810,7 @@ class NativeScreen:
 
         configure(cfg)               read its config.ini section into cfg attributes
         ready(cfg)                   set up enough to show? NOT_READY says how to
+        needs_setup(cfg)             shows, but isn't set up yet (the usage screen with no login)
         demo_config(cfg)             fill in what --demo needs
         ModelPart, RendererPart      classes whose members join Model / Renderer
         init_model(model), init_renderer(r), on_layout(model, r)
@@ -894,9 +895,10 @@ class NativeScreen:
 
     def summary(self, model):
         m = self.manifest
+        ready = model.demo or self.ready(model.cfg)
         return {"id": self.id, "name": self.name, "version": m.get("version", ""),
-                "author": m.get("author", ""), "kind": "native",
-                "ready": model.demo or self.ready(model.cfg),
+                "author": m.get("author", ""), "kind": "native", "ready": ready,
+                "needs_setup": not model.demo and (not ready or bool(self.hook("needs_setup", model.cfg))),
                 "settings": self.settings_values(model.cfg), "setup": m.get("setup") or None,
                 "status": None, "error": self.draw_error}
 
