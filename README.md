@@ -549,6 +549,15 @@ the screen from its own Power port.
   fetched once a month. The screen only polls while it's showing: every 10 s
   for trains, 20 s for arrivals, 2 min for alerts. That's about 14,000 calls
   a day if it's on screen all day; the free tier allows 50,000.
+- **Add-on screens.** Add more screens from the
+  [**Screen Market**](https://github.com/nicoloco321/screen-market), a web app
+  that runs in Docker (for example on CasaOS). Pair the display once with a code that appears on its screen.
+  After that, picking a screen in the marketplace installs it on the display
+  and switches to it. It ships with weather, a world clock, a countdown,
+  crypto prices and Hacker News. You can write your own in Python and publish
+  them from the browser; see the
+  [Screen Market's README](https://github.com/nicoloco321/screen-market#writing-a-screen).
+  Installed screens join the ones you tap through and answer `POST /mode/<id>`.
 - Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
   `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
   `rotate` for a monitor mounted on its side. Apply changes with

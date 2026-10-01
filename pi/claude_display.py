@@ -13,6 +13,8 @@ official touchscreen:
     progress, the planes flying overhead, Formula 1, and Washington's Metro
     (POST /mode/spotify, /mode/bambu, /mode/planes, /mode/f1, /mode/metro,
     /mode/usage, /mode/toggle - or tap the screen)
+  - add-on screens from the Screen Market (github.com/nicoloco321/screen-market), installed
+    over the network once you've paired it with the display (GET /screens)
 
 It speaks the firmware's HTTP API on the same port, so the hooks, beacon.py,
 find_display.py and the /switch command work unchanged - point them at the Pi.
@@ -44,11 +46,14 @@ import datetime
 import gzip
 import hashlib
 import html
+import importlib.util
 import io
 import json
 import math
 import os
 import re
+import secrets
+import shutil
 import signal
 import socket
 import ssl
@@ -98,6 +103,7 @@ ROOT_TEXT = ("Claude Code usage display (Raspberry Pi). POST /thinking/on while 
              "/mode/bambu, /mode/planes, /mode/f1, /mode/metro or /mode/toggle to switch screens; "
              "GET /mode to ask; GET /planes/log for every plane the planes screen has shown; "
              "GET /metro to pick your Metro station; "
+             "GET /screens for the add-on screens (POST /screens/pair to pair a marketplace); "
              "GET /usage for JSON.\n")
 
 # ---- palette: the firmware's RGB565 colours, in full RGB ----
@@ -458,8 +464,11 @@ class Model:
         self.ready = {"usage": True, "spotify": spotify_ready, "bambu": bambu_ready,
                       "planes": planes_ready, "f1": f1_ready, "metro": metro_ready}
         self.lock = threading.Lock()
+        self.addons = ScreenStore()  # add-on screens: see ScreenStore
+        self.addons.load_all()
+        self.pairing = Pairing(state)
         saved = state.get("mode")
-        self.mode = saved if self.ready.get(saved) else "usage"
+        self.mode = saved if self.is_ready(saved) else "usage"
 
         self.usage = None          # {"five"/"week": (pct or None, reset datetime, iso)}
         self.usage_ok_at = 0.0     # monotonic time of the last good fetch
@@ -495,6 +504,7 @@ class Model:
         self.flash_msg = None      # (text, colour, until): short-lived status override
         self.host = socket.gethostname().split(".")[0]
         self.ip = ""
+        self.layout = None         # the renderer's, for GET /screens
         self.usage_wake = threading.Event()
         self.spotify_wake = threading.Event()
         self.bambu_wake = threading.Event()
@@ -514,9 +524,16 @@ class Model:
         self.last_beacon = 0.0
 
     # -- screen mode (persisted, like the firmware's NVS "mode")
+    def modes(self):
+        """Every screen, built-in first, then the add-ons in install order."""
+        return MODES + self.addons.ids()
+
+    def is_ready(self, mode):
+        return bool(self.ready.get(mode)) or self.addons.get(mode) is not None
+
     def set_mode(self, mode):
         """Switch screens. False if that screen isn't set up."""
-        if not self.ready.get(mode):
+        if not self.is_ready(mode):
             return False
         with self.lock:
             if mode == self.mode:
@@ -533,7 +550,10 @@ class Model:
             if mode == "metro" and not self.metro.get("trains_at"):
                 self.metro_status = ("finding the trains...", COL_DIM)
         self.state.put("mode", mode)
-        if mode == "spotify":
+        addon = self.addons.get(mode)
+        if addon:
+            addon.wake.set()
+        elif mode == "spotify":
             self.spotify_wake.set()
         elif mode == "bambu":
             self.bambu_wake.set()
@@ -551,8 +571,9 @@ class Model:
 
     def next_mode(self):
         """The screen after this one, skipping any that aren't set up."""
-        i = MODES.index(self.mode)
-        return next((m for m in MODES[i + 1:] + MODES[:i] if self.ready[m]), self.mode)
+        modes = self.modes()
+        i = modes.index(self.mode) if self.mode in modes else 0
+        return next((m for m in modes[i + 1:] + modes[:i] if self.is_ready(m)), self.mode)
 
     def toggle_mode(self):
         nxt = self.next_mode()
@@ -738,6 +759,7 @@ class Model:
     def snapshot(self):
         now = time.monotonic()
         station = self.metro_station() if self.mode == "metro" else None
+        addon = self.addons.get(self.mode)
         with self.lock:
             flash = self.flash_msg if self.flash_msg and self.flash_msg[2] > now else None
             return SimpleNamespace(
@@ -752,6 +774,8 @@ class Model:
                 sky=self.sky, planes_status=self.planes_status,
                 f1=self.f1, f1_status=self.f1_status,
                 metro=self.metro, metro_status=self.metro_status, metro_station=station,
+                addon=addon, addon_view=addon.view() if addon else None,
+                pair_code=self.pairing.showing,
                 thinking=self.thinking(now), flash=flash and flash[:2],
                 host=self.host, ip=self.ip, port=self.cfg.port, mono=now)
 
@@ -3487,6 +3511,603 @@ def setup_metro(config_path):
     print("Change the station any time from a browser: http://<the display>:8080/metro")
 
 
+# ---------------------------------------------------------------- add-on screens
+#
+# Screens installed from the Screen Market (github.com/nicoloco321/screen-market), or
+# by hand: each lives in its own folder under SCREENS_DIR with a manifest.json
+# and a screen.py. screen.py defines a class Screen:
+#
+#     class Screen:
+#         def __init__(self, settings): ...       # the manifest's settings, filled in
+#         def fetch(self, ctx): return data       # optional: a worker thread calls it
+#                                                 # every poll_seconds while it's showing
+#         def draw(self, ui, data, now): ...      # paint the screen (see ScreenUI)
+#
+# They show up after the built-in screens when you tap through, and answer
+# POST /mode/<id> like the others. Installing over HTTP (POST /screens/install)
+# needs a token, which you get by pairing: POST /screens/pair puts a code on
+# the screen, and POST /screens/pair/confirm trades that code for the token.
+# A screen is Python running as you on the Pi - only install code you trust.
+
+SCREENS_DIR = os.path.expanduser("~/.local/share/claude-display/screens")
+SCREEN_API = 1
+SCREEN_ID = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
+SCREEN_FILE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
+SCREEN_MAX_BYTES = 4 * 1024 * 1024  # one install, all files together
+PAIR_SECS = 180
+PAIR_TRIES = 5
+
+
+def parse_color(value, default=COL_ORANGE):
+    """'#d97757', 'd97757' or [217, 119, 87] -> an RGB tuple."""
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return tuple(max(0, min(255, int(c))) for c in value)
+    text = str(value or "").lstrip("#")
+    if re.fullmatch(r"[0-9a-fA-F]{6}", text):
+        return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+    return default
+
+
+def screen_settings(manifest, saved):
+    """The manifest's settings with their defaults, overlaid with `saved`,
+    each coerced to its declared type."""
+    out = {}
+    for field in manifest.get("settings") or []:
+        key = field.get("key")
+        if not key:
+            continue
+        kind, value = field.get("type", "text"), saved.get(key, field.get("default"))
+        try:
+            if kind == "number":
+                value = float(value) if value not in (None, "") else None
+                if value is not None and value.is_integer() and not isinstance(field.get("default"), float):
+                    value = int(value)
+            elif kind == "boolean":
+                value = value if isinstance(value, bool) else str(value).lower() in ("1", "true", "yes", "on")
+            elif kind == "select":
+                options = [o["value"] if isinstance(o, dict) else o for o in field.get("options") or []]
+                value = value if value in options else field.get("default")
+            else:
+                value = "" if value is None else str(value)
+        except (TypeError, ValueError):
+            value = field.get("default")
+        out[key] = value
+    return out
+
+
+def check_manifest(manifest):
+    """Why a manifest won't do, or None if it's fine."""
+    if not isinstance(manifest, dict):
+        return "manifest must be a JSON object"
+    sid = manifest.get("id")
+    if not isinstance(sid, str) or not SCREEN_ID.match(sid):
+        return "id must be 2-32 lowercase letters, digits or dashes, starting with a letter"
+    if sid in MODES or sid == "toggle":
+        return f"{sid!r} is a built-in screen's name"
+    if not str(manifest.get("name") or "").strip():
+        return "the screen needs a name"
+    try:
+        api = int(manifest.get("api", SCREEN_API))
+    except (TypeError, ValueError):
+        return "api must be a number"
+    if api > SCREEN_API:
+        return f"this screen needs screen API {api}; this display has {SCREEN_API} - update the display"
+    if not isinstance(manifest.get("settings") or [], list):
+        return "settings must be a list"
+    return None
+
+
+class ScreenContext:
+    """What fetch() gets: settings, the network, and a way to say how it's going."""
+
+    def __init__(self, screen):
+        self._screen = screen
+        self.settings = screen.settings
+        self.folder = screen.folder
+
+    def get(self, url, headers=None, timeout=10):
+        """GET url -> body bytes. Raises on network errors and non-2xx answers."""
+        code, body, _ = http(url, headers={"User-Agent": PLANES_USER_AGENT, **(headers or {})},
+                             timeout=timeout)
+        if not 200 <= code < 300:
+            raise RuntimeError(f"HTTP {code} from {urllib.parse.urlsplit(url).netloc}")
+        return body
+
+    def get_json(self, url, headers=None, timeout=10):
+        return json.loads(self.get(url, {"Accept": "application/json", **(headers or {})}, timeout))
+
+    def status(self, text, color=COL_DIM):
+        """Put a line on the status bar (None to clear it)."""
+        self._screen.set_status(text and (text, parse_color(color, COL_DIM)))
+
+    def log(self, msg):
+        log(f"screen {self._screen.id}: {msg}")
+
+
+class AddonScreen:
+    """One installed screen: its code, its settings, and its fetch worker."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        with open(os.path.join(folder, "manifest.json"), encoding="utf-8") as f:
+            self.manifest = json.load(f)
+        problem = check_manifest(self.manifest)
+        if problem:
+            raise ValueError(problem)
+        self.id = self.manifest["id"]
+        self.name = str(self.manifest["name"])
+        self.color = parse_color(self.manifest.get("color"))
+        self.poll = max(5.0, float(self.manifest.get("poll_seconds") or 300))
+        self.fps = max(0.0, min(10.0, float(self.manifest.get("fps") or 0)))
+        try:
+            with open(os.path.join(folder, "settings.json"), encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            saved = {}
+        self.settings = screen_settings(self.manifest, saved)
+        self.lock = threading.Lock()
+        self.data = None
+        self.version = 0
+        self.status = ("loading...", COL_DIM)
+        self.draw_error = None
+        self.wake = threading.Event()
+        self.alive = True
+        self.obj = self._load()
+        if not callable(getattr(self.obj, "fetch", None)):
+            self.status = None
+
+    def _load(self):
+        path = os.path.join(self.folder, self.manifest.get("entry") or "screen.py")
+        name = f"claude_screen_{self.id.replace('-', '_')}_{time.monotonic_ns()}"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, self.folder)  # so a screen can import its own helper files
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.remove(self.folder)
+        cls = getattr(module, "Screen", None)
+        if cls is None or not callable(getattr(cls, "draw", None)):
+            raise ValueError("screen.py needs a class Screen with a draw(ui, data, now) method")
+        try:
+            return cls(dict(self.settings))
+        except TypeError:
+            return cls()  # one that takes no settings
+
+    def set_status(self, status):
+        with self.lock:
+            self.status = status
+
+    def view(self):
+        with self.lock:
+            return self.data, self.version, self.status
+
+    def worker(self, model):
+        """Fetch while showing, every poll seconds; on a switch to it, at once."""
+        fetch = getattr(self.obj, "fetch", None)
+        if not callable(fetch):
+            return
+        ctx, fetched_at = ScreenContext(self), 0.0
+        while self.alive:
+            showing = model.mode == self.id
+            due = time.monotonic() - fetched_at >= (self.poll if showing else self.poll * OFF_SCREEN_SLOWDOWN)
+            if showing and due:
+                try:
+                    data = fetch(ctx)
+                    with self.lock:
+                        self.data, self.version = data, self.version + 1
+                        if self.status and (self.status[0] == "loading..." or self.status[1] == COL_RED):
+                            self.status = None  # (a status the screen set itself stays)
+                except Exception as e:
+                    log(f"screen {self.id}: fetch failed\n{traceback.format_exc()}")
+                    with self.lock:
+                        self.version += 1
+                        self.status = (f"{self.name}: {e}"[:120], COL_RED)
+                fetched_at = time.monotonic()
+            self.wake.wait(min(self.poll, 30) if showing else 30)
+            self.wake.clear()
+
+    def start(self, model):
+        threading.Thread(target=self.worker, args=(model,), daemon=True,
+                         name=f"screen-{self.id}").start()
+
+    def stop(self):
+        self.alive = False
+        self.wake.set()
+        close = getattr(self.obj, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                log(traceback.format_exc())
+
+    def summary(self):
+        m = self.manifest
+        return {"id": self.id, "name": self.name, "version": m.get("version", ""),
+                "author": m.get("author", ""), "settings": self.settings,
+                "status": self.status[0] if self.status and self.status[0] != "loading..." else None,
+                "error": self.draw_error}
+
+
+class ScreenStore:
+    """The installed add-on screens, in the order they were installed."""
+
+    def __init__(self, folder=SCREENS_DIR):
+        self.folder = folder
+        self.screens = {}
+        self.lock = threading.Lock()
+        self.failed = {}  # id -> why it didn't load
+
+    def load_all(self):
+        try:
+            names = sorted(os.listdir(self.folder),
+                           key=lambda n: os.path.getmtime(os.path.join(self.folder, n, "manifest.json"))
+                           if os.path.exists(os.path.join(self.folder, n, "manifest.json")) else 0)
+        except OSError:
+            return
+        for name in names:
+            path = os.path.join(self.folder, name)
+            if name.startswith(".") or not os.path.isfile(os.path.join(path, "manifest.json")):
+                continue
+            try:
+                screen = AddonScreen(path)
+                self.screens[screen.id] = screen
+                log(f"loaded screen {screen.id} ({screen.name})")
+            except Exception as e:
+                self.failed[name] = str(e)
+                log(f"screen {name} didn't load: {e}\n{traceback.format_exc()}")
+
+    def ids(self):
+        with self.lock:
+            return tuple(self.screens)
+
+    def get(self, sid):
+        with self.lock:
+            return self.screens.get(sid)
+
+    def install(self, manifest, files, settings, model):
+        """Write the screen to disk and load it, replacing any old version.
+        Returns the new AddonScreen; raises ValueError with what's wrong."""
+        problem = check_manifest(manifest)
+        if problem:
+            raise ValueError(problem)
+        sid = manifest["id"]
+        entry = manifest.get("entry") or "screen.py"
+        if not isinstance(files, dict) or entry not in files:
+            raise ValueError(f"the install has no {entry}")
+        blobs, total = {}, 0
+        for name, content in files.items():
+            if not SCREEN_FILE.match(name) or name in ("manifest.json", "settings.json"):
+                raise ValueError(f"bad file name {name!r}")
+            if isinstance(content, dict) and "base64" in content:
+                blob = base64.b64decode(content["base64"])
+            elif isinstance(content, dict) and "text" in content:
+                blob = str(content["text"]).encode()
+            elif isinstance(content, str):
+                blob = content.encode()
+            else:
+                raise ValueError(f"{name}: give its text or base64")
+            total += len(blob)
+            blobs[name] = blob
+        if total > SCREEN_MAX_BYTES:
+            raise ValueError("the screen's files are too big (4 MB at most)")
+
+        os.makedirs(self.folder, exist_ok=True)
+        staging = os.path.join(self.folder, f".{sid}.new")
+        final = os.path.join(self.folder, sid)
+        old_dir = os.path.join(self.folder, f".{sid}.old")
+        for d in (staging, old_dir):
+            if os.path.isdir(d):
+                shutil.rmtree(d)
+        os.makedirs(staging)
+        for name, blob in blobs.items():
+            with open(os.path.join(staging, name), "wb") as f:
+                f.write(blob)
+        with open(os.path.join(staging, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        if settings is None and os.path.isfile(os.path.join(final, "settings.json")):
+            with open(os.path.join(final, "settings.json"), encoding="utf-8") as f:
+                settings = json.load(f)  # an update keeps the settings you had
+        with open(os.path.join(staging, "settings.json"), "w", encoding="utf-8") as f:
+            json.dump(settings or {}, f, indent=2)
+
+        try:
+            screen = AddonScreen(staging)  # does it even load? (before touching the old one)
+        except Exception as e:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise ValueError(f"the screen didn't load: {type(e).__name__}: {e}")
+        screen.stop()
+
+        with self.lock:
+            old = self.screens.pop(sid, None)
+            if old:
+                old.stop()
+            if os.path.isdir(final):
+                os.replace(final, old_dir)
+            os.replace(staging, final)
+            shutil.rmtree(old_dir, ignore_errors=True)
+            screen = AddonScreen(final)  # load it from where it lives now
+            self.screens[sid] = screen
+            self.failed.pop(sid, None)
+        screen.start(model)
+        log(f"installed screen {sid} ({screen.name} {manifest.get('version', '')})")
+        return screen
+
+    def uninstall(self, sid):
+        with self.lock:
+            screen = self.screens.pop(sid, None)
+        if screen:
+            screen.stop()
+        path = os.path.join(self.folder, sid)
+        if not SCREEN_ID.match(sid) or not os.path.isdir(path):
+            return screen is not None
+        shutil.rmtree(path, ignore_errors=True)
+        log(f"uninstalled screen {sid}")
+        return True
+
+    def configure(self, sid, settings, model):
+        """New settings for an installed screen: saved, then the screen reloaded."""
+        screen = self.get(sid)
+        if not screen:
+            return None
+        merged = {**screen.settings, **(settings or {})}
+        with open(os.path.join(screen.folder, "settings.json"), "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2)
+        fresh = AddonScreen(screen.folder)
+        with self.lock:
+            screen.stop()
+            self.screens[sid] = fresh
+        fresh.start(model)
+        return fresh
+
+
+class Pairing:
+    """Pairing a marketplace with the display, like a Bluetooth keyboard: the
+    display shows a code, you type it in, and the marketplace gets a token."""
+
+    def __init__(self, state):
+        self.state = state
+        self.lock = threading.Lock()
+        self.code = None
+        self.until = 0.0
+        self.tries = 0
+
+    def start(self):
+        with self.lock:
+            if not self.code or time.monotonic() > self.until:
+                self.code = f"{secrets.randbelow(1000000):06d}"
+                self.tries = 0
+            self.until = time.monotonic() + PAIR_SECS
+            return self.code
+
+    def confirm(self, code, client):
+        with self.lock:
+            if not self.code or time.monotonic() > self.until:
+                return None, "no pairing in progress - start again"
+            if str(code).strip().replace(" ", "") != self.code:
+                self.tries += 1
+                if self.tries >= PAIR_TRIES:
+                    self.code = None
+                    return None, "too many wrong codes - start again"
+                return None, "that's not the code on the screen"
+            self.code = None
+        token = secrets.token_urlsafe(32)
+        tokens = dict(self.state.get("screen_tokens") or {})
+        tokens[hashlib.sha256(token.encode()).hexdigest()] = {
+            "client": str(client or "marketplace")[:60], "at": int(time.time())}
+        self.state.put("screen_tokens", tokens)
+        return token, None
+
+    def allowed(self, header):
+        token = (header or "").removeprefix("Bearer ").strip()
+        if not token:
+            return False
+        return hashlib.sha256(token.encode()).hexdigest() in (self.state.get("screen_tokens") or {})
+
+    @property
+    def showing(self):
+        with self.lock:
+            return self.code if self.code and time.monotonic() <= self.until else None
+
+
+class ScreenUI:
+    """What an add-on screen draws with. Coordinates are design units for the
+    current layout (ui.w x ui.h: 800x480 landscape, 180x320 portrait, 1480x320
+    bar, 320x1480 strip), scaled to the real screen for you; y on text() is the
+    baseline. ui.top / ui.bottom bound the room left between the header and
+    the status line."""
+
+    BG, CARD, TEXT, DIM, SUB = COL_BG, COL_CARD, COL_TEXT, COL_DIM, COL_SUB
+    ORANGE, GREEN, YELLOW, RED = COL_ORANGE, COL_GREEN, COL_YELLOW, COL_RED
+    # room under the status line, per layout
+    BOTTOM = {"landscape": 428, "portrait": 300, "bar": 276, "strip": 1384}
+
+    def __init__(self, renderer, surf, screen):
+        self.r, self.surface, self.screen = renderer, surf, screen
+        self.layout = renderer.layout
+        self.w, self.h = Renderer.LAYOUTS[self.layout]
+        self.accent = screen.color
+        self.settings = screen.settings
+        self.top = 0
+        self.bottom = self.BOTTOM[self.layout]
+        self.pygame = pygame
+
+    # -- text
+    def text(self, s, x, y, size=20, color=COL_TEXT, bold=False, align="l"):
+        """Draw s with its baseline at y; x is its left / centre / right edge
+        for align l / c / r. The background shows through, so text works on cards."""
+        s = str(s)
+        if not s:
+            return
+        r, f, color = self.r, self.r.font(size, bold), parse_color(color, COL_TEXT)
+        key = ("alpha", s, id(f), color)
+        img = r.text_cache.get(key)
+        if img is None:
+            if len(r.text_cache) > 400:
+                r.text_cache.clear()
+            img = r.text_cache[key] = f.render(s, True, color)
+        px = r.x(x)
+        if align == "c":
+            px -= img.get_width() // 2
+        elif align == "r":
+            px -= img.get_width()
+        self.surface.blit(img, (px, r.y(y) - f.get_ascent()))
+
+    def width(self, s, size=20, bold=False):
+        return self.r.width(str(s), size, bold)
+
+    def fit(self, s, max_w, size=20, bold=False):
+        return self.r.fit(str(s), max_w, size, bold)
+
+    def fit_size(self, s, max_w, size, bold=False, smallest=10):
+        return self.r.fit_size(str(s), max_w, size, bold, smallest)
+
+    def wrap(self, s, max_w, size=20, bold=False, lines=2):
+        """Break s at spaces into at most `lines` lines that fit max_w; the last
+        one is ellipsized if the text runs on."""
+        words, out, line = str(s).split(), [], ""
+        for i, word in enumerate(words):
+            trial = f"{line} {word}" if line else word
+            if not line or self.width(trial, size, bold) <= max_w:
+                line = trial  # (an overlong single word is ellipsized below)
+                continue
+            out.append(line)
+            line = word
+            if len(out) == lines - 1:
+                line = " ".join(words[i:])
+                break
+        if line:
+            out.append(line)
+        return [self.fit(t, max_w, size, bold) for t in out[:lines]]
+
+    # -- shapes
+    def _px(self, x, y):
+        return self.r.x(x), self.r.y(y)
+
+    def rect(self, x, y, w, h, color=COL_CARD, radius=0, width=0):
+        pygame.draw.rect(self.surface, parse_color(color, COL_CARD), self.r.rect(x, y, w, h),
+                         width=self.r.n(width) if width else 0,
+                         border_radius=self.r.n(radius) if radius else 0)
+
+    def bar(self, x, y, w, h, frac, color=None, radius=None):
+        """A rounded progress bar, like the usage screen's (frac 0..1, None = empty)."""
+        self.r.bar(self.surface, self.r.rect(x, y, w, h), frac,
+                   parse_color(color, self.accent) if color is not None else self.accent,
+                   h / 2 if radius is None else radius)
+
+    def line(self, x1, y1, x2, y2, color=COL_CARD, width=1):
+        pygame.draw.line(self.surface, parse_color(color, COL_CARD), self._px(x1, y1),
+                         self._px(x2, y2), self.r.n(width))
+
+    def lines(self, points, color=COL_TEXT, width=1, closed=False):
+        if len(points) > 1:
+            pygame.draw.lines(self.surface, parse_color(color, COL_TEXT), closed,
+                              [self._px(x, y) for x, y in points], self.r.n(width))
+
+    def circle(self, cx, cy, radius, color=COL_TEXT, width=0):
+        pygame.draw.circle(self.surface, parse_color(color, COL_TEXT), self._px(cx, cy),
+                           self.r.n(radius), self.r.n(width) if width else 0)
+
+    def polygon(self, points, color=COL_TEXT, width=0):
+        pygame.draw.polygon(self.surface, parse_color(color, COL_TEXT),
+                            [self._px(x, y) for x, y in points], self.r.n(width) if width else 0)
+
+    def arc(self, cx, cy, radius, start_deg, end_deg, color=COL_TEXT, width=4):
+        """A thick arc clockwise from start_deg to end_deg (0 = 12 o'clock),
+        `radius` to the middle of the stroke - a ring gauge, say."""
+        steps = max(2, int(abs(end_deg - start_deg) / 3))
+        outer, inner = radius + width / 2, radius - width / 2
+
+        def at(r, deg):
+            a = math.radians(deg)
+            return cx + math.sin(a) * r, cy - math.cos(a) * r
+
+        angles = [start_deg + (end_deg - start_deg) * i / steps for i in range(steps + 1)]
+        self.polygon([at(outer, a) for a in angles] + [at(inner, a) for a in reversed(angles)], color)
+
+    def image(self, data, x, y, w, h, key=None):
+        """Draw an image (bytes of a PNG/JPEG, or a file in the screen's folder)
+        scaled to fit the box, centred. Decoded images are cached."""
+        cache = self.r.addon_images
+        if isinstance(data, str) and not key:
+            key = ("file", self.screen.id, data)
+        key = key or ("bytes", hashlib.sha1(data).hexdigest())
+        box = self.r.rect(x, y, w, h)
+        ck = (key, box.size)
+        img = cache.get(ck)
+        if img is None:
+            if isinstance(data, str):
+                src = pygame.image.load(os.path.join(self.screen.folder, os.path.basename(data)))
+            else:
+                src = pygame.image.load(io.BytesIO(data))
+            iw, ih = src.get_size()
+            k = min(box.w / iw, box.h / ih)
+            img = pygame.transform.smoothscale(src.convert_alpha() if pygame.display.get_init()
+                                               and pygame.display.get_surface() else src,
+                                               (max(1, int(iw * k)), max(1, int(ih * k))))
+            if len(cache) > 40:
+                cache.clear()
+            cache[ck] = img
+        self.surface.blit(img, img.get_rect(center=box.center))
+
+    # -- pieces of the built-in screens
+    def bar_color(self, pct):
+        """Green under 50, yellow under 80, red above - the usage bars' colours."""
+        return bar_color(pct)
+
+    def clock(self, now):
+        return clock_str(now)
+
+    def header(self, title, subtitle="", color=None, icon=None):
+        """The title block the built-in screens have, in the accent colour: a
+        badge with the first letter (or `icon`, a short text), the title and
+        subtitle, and on landscape the clock. Sets and returns ui.top."""
+        color = parse_color(color, self.accent) if color is not None else self.accent
+        badge = str(icon or title[:1]).upper()
+        r, s, now = self.r, self.surface, datetime.datetime.now().astimezone()
+        if self.layout == "landscape":
+            self.rect(32, 26, 58, 58, color, radius=14)
+            self.text(badge, 61, 68, self.fit_size(badge, 46, 34, True, 14), COL_BG, True, "c")
+            self.text(r.fit(title, 440, 30, True), 112, 56, 30, color, bold=True)
+            self.text(r.fit(subtitle, 420, 17), 112, 82, 17, COL_DIM)
+            self.text(clock_str(now), 768, 58, 30, COL_TEXT, align="r")
+            self.text(f"{now.strftime('%a %b')} {now.day}", 768, 82, 17, COL_DIM, align="r")
+            s.fill(COL_CARD, r.rect(32, 104, 736, 2))
+            self.top = 120
+        elif self.layout == "portrait":
+            self.rect(12, 12, 30, 30, color, radius=7)
+            self.text(badge, 27, 34, self.fit_size(badge, 24, 18, True, 8), COL_BG, True, "c")
+            self.text(r.fit(title, 124, 15, True), 50, 26, 15, color, bold=True)
+            self.text(r.fit(subtitle, 124, 10), 50, 40, 10, COL_DIM)
+            s.fill(COL_CARD, r.rect(12, 52, 156, 1))
+            self.top = 62
+        elif self.layout == "bar":
+            self.rect(28, 40, 72, 72, color, radius=16)
+            self.text(badge, 64, 92, self.fit_size(badge, 58, 42, True, 16), COL_BG, True, "c")
+            self.text(r.fit(title, 210, 30, True), 118, 74, 30, color, bold=True)
+            self.text(r.fit(subtitle, 210, 17), 118, 99, 17, COL_DIM)
+            s.fill(COL_CARD, r.rect(346, 40, 2, 196))
+            self.text(clock_str(now), 1452, 300, 22, COL_TEXT, bold=True, align="r")
+            self.top = 40  # bar screens put their content right of x = 370
+        else:  # strip
+            self.rect(110, 60, 100, 100, color, radius=22)
+            self.text(badge, 160, 132, self.fit_size(badge, 80, 58, True, 20), COL_BG, True, "c")
+            self.text(r.fit(title, 272, 34, True), 160, 214, 34, color, bold=True, align="c")
+            self.text(r.fit(subtitle, 272, 20), 160, 246, 20, COL_DIM, align="c")
+            s.fill(COL_CARD, r.rect(24, 276, 272, 2))
+            self.top = 300
+        return self.top
+
+    @property
+    def content_left(self):
+        """Where content starts across: right of the title block on a bar."""
+        return 370 if self.layout == "bar" else {"landscape": 32, "portrait": 12, "strip": 24}[self.layout]
+
+    @property
+    def content_right(self):
+        return {"landscape": 768, "portrait": 168, "bar": 1452, "strip": 296}[self.layout]
+
+
 # ---------------------------------------------------------------- demo data
 
 # The demo's playlist: track, artist, album, seconds, and its cover's colours
@@ -3811,7 +4432,12 @@ class BeaconHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
-        self.body = self.rfile.read(min(length, 65536)) if length else b""
+        limit = SCREEN_MAX_BYTES * 2 if self.path.startswith("/screens/") else 65536
+        if length > limit:
+            self.close_connection = True
+            self._send(413, "too big\n")
+            return
+        self.body = self.rfile.read(length) if length else b""
         self._route()
 
     def _take_sessions(self):
@@ -3837,7 +4463,9 @@ class BeaconHandler(BaseHTTPRequestHandler):
             self._send(200, "off\n")
         elif path == "/mode":
             self._send(200, m.mode + "\n")
-        elif path.startswith("/mode/") and path[6:] in MODES + ("toggle",):
+        elif path.startswith("/screens"):
+            self._screens(path)
+        elif path.startswith("/mode/") and path[6:] in m.modes() + ("toggle",):
             want = path[6:]
             if want == "toggle":
                 want = m.next_mode()
@@ -3888,6 +4516,94 @@ class BeaconHandler(BaseHTTPRequestHandler):
             self._send(200, ROOT_TEXT)
         else:
             self._send(404, "not found\n")
+
+    def _json(self, code, data):
+        self._send(code, json.dumps(data) + "\n", "application/json")
+
+    def _screens(self, path):
+        """The add-on screen API, which the marketplace talks to:
+          GET  /screens                    what's installed, and what this display is
+          POST /screens/pair               show a pairing code on the screen
+          POST /screens/pair/confirm       {"code", "client"} -> {"token"}
+        and, with "Authorization: Bearer <token>":
+          POST /screens/install            {"manifest", "files", "settings"?, "show"?}
+          POST /screens/<id>/settings      {"settings"}
+          POST /screens/<id>/uninstall
+        """
+        m = self.model
+        if path == "/screens" and self.command == "GET":
+            r = Renderer.LAYOUTS
+            self._json(200, {
+                "api": SCREEN_API, "host": m.host, "ip": m.ip, "mode": m.mode,
+                "layout": m.layout, "design_size": r.get(m.layout),
+                "builtin": [x for x in MODES if m.ready.get(x)],
+                "installed": [a.summary() for a in map(m.addons.get, m.addons.ids()) if a],
+                "failed": m.addons.failed,
+                "paired": self._authed()})
+            return
+        if self.command != "POST":
+            self._send(405, "use POST\n")
+            return
+        try:
+            body = json.loads(self.body) if self.body else {}
+        except ValueError:
+            self._json(400, {"error": "the body isn't JSON"})
+            return
+        if not isinstance(body, dict):
+            self._json(400, {"error": "the body should be a JSON object"})
+            return
+        if path == "/screens/pair":
+            code = m.pairing.start()
+            log(f"pairing code {code} (for {self.client_address[0]})")
+            self._json(200, {"ok": True, "expires_in": PAIR_SECS})
+            return
+        if path == "/screens/pair/confirm":
+            token, err = m.pairing.confirm(body.get("code", ""), body.get("client"))
+            if token:
+                m.flash("paired with " + str(body.get("client") or "the marketplace")[:40], COL_GREEN)
+                self._json(200, {"token": token, "host": m.host})
+            else:
+                self._json(403, {"error": err})
+            return
+        if not self._authed():
+            self._json(401, {"error": "not paired - pair with the display first"})
+            return
+        if path == "/screens/install":
+            try:
+                screen = m.addons.install(body.get("manifest"), body.get("files"),
+                                          body.get("settings"), m)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            except OSError as e:
+                self._json(500, {"error": f"couldn't save it: {e}"})
+                return
+            if body.get("show", True):
+                m.set_mode(screen.id)
+            m.flash(f"installed {screen.name}", COL_GREEN)
+            self._json(200, {"ok": True, "screen": screen.summary()})
+            return
+        parts = path.split("/")  # ["", "screens", id, action]
+        if len(parts) == 4 and m.addons.get(parts[2]):
+            sid, action = parts[2], parts[3]
+            if action == "uninstall":
+                if m.mode == sid:
+                    m.set_mode("usage")
+                m.addons.uninstall(sid)
+                self._json(200, {"ok": True})
+                return
+            if action == "settings":
+                try:
+                    screen = m.addons.configure(sid, body.get("settings") or {}, m)
+                except Exception as e:
+                    self._json(400, {"error": f"{type(e).__name__}: {e}"})
+                    return
+                self._json(200, {"ok": True, "screen": screen.summary()})
+                return
+        self._json(404, {"error": "no such screen or action"})
+
+    def _authed(self):
+        return self.model.pairing.allowed(self.headers.get("Authorization"))
 
     def _send(self, code, text, ctype="text/plain"):
         body = text.encode()
@@ -3971,6 +4687,7 @@ class Renderer:
         self.shape_cache = {}
         self.art_url = None
         self.art_img = None
+        self.addon_images = {}  # add-on screens' decoded images: see ScreenUI.image
 
     # design units -> pixels
     def x(self, v):
@@ -4371,7 +5088,11 @@ class Renderer:
     def scene_key(self, snap, now):
         """Everything but the spinner's animation that changes the picture -
         redraw the whole screen only when this does."""
-        key = (snap.mode, snap.flash, snap.host, snap.ip, now.strftime("%Y%m%d%H%M"))
+        key = (snap.mode, snap.flash, snap.host, snap.ip, now.strftime("%Y%m%d%H%M"), snap.pair_code)
+        if snap.addon:
+            a = snap.addon
+            tick = int(snap.mono * a.fps) if a.fps else None
+            return key + (id(a), snap.addon_view[1:], tick, snap.thinking)
         if snap.mode == "usage":
             panel = ()
             if self.anim > 0:  # the session panel's text, minute by minute
@@ -4428,8 +5149,55 @@ class Renderer:
             self.photo_url = self.photo_img = None  # planespotters: only while it's on screen
         self.buttons = (snap.mode, [])  # the screen's drawing adds its own
         surf.fill(COL_BG)
-        getattr(self, f"_{snap.mode}_{self.layout}")(surf, snap, now)
+        if snap.addon:
+            self._addon(surf, snap, now)
+        else:
+            getattr(self, f"_{snap.mode if snap.mode in MODES else 'usage'}_{self.layout}")(surf, snap, now)
         self._status(surf, snap)
+        if snap.pair_code:
+            self._pair_card(surf, snap.pair_code)
+
+    def _addon(self, surf, snap, now):
+        """An add-on screen draws itself; if it throws, say so on the screen."""
+        a = snap.addon
+        data = snap.addon_view[0]
+        ui = ScreenUI(self, surf, a)
+        try:
+            a.obj.draw(ui, data, now)
+            a.draw_error = None
+        except Exception as e:
+            if a.draw_error != repr(e):
+                log(f"screen {a.id}: draw failed\n{traceback.format_exc()}")
+            a.draw_error = repr(e)
+            surf.fill(COL_BG)
+            ui = ScreenUI(self, surf, a)
+            ui.header(a.name, "this screen hit an error")
+            w = ui.content_right - ui.content_left
+            for i, line in enumerate(ui.wrap(f"{type(e).__name__}: {e}", w, 16, lines=4)):
+                ui.text(line, ui.content_left, ui.top + 30 + i * 24, 16, COL_RED)
+
+    def _pair_card(self, surf, code):
+        """Pairing with a marketplace: the code to type in, over whatever's showing."""
+        w, h = self.LAYOUTS[self.layout]
+        cw, ch = min(w - 24, 520), min(h - 24, 230)
+        cx, cy = (w - cw) / 2, (h - ch) / 2
+        k = ch / 230
+        pygame.draw.rect(surf, COL_CARD, self.rect(cx, cy, cw, ch), border_radius=self.n(18 * k))
+        pygame.draw.rect(surf, COL_ORANGE, self.rect(cx, cy, cw, ch), self.n(3 * k), self.n(18 * k))
+        mid = cx + cw / 2
+        size = self.fit_size("Pair with the screen marketplace", cw - 30, 22 * k, smallest=8)
+        self.text_on(surf, "Pair with the screen marketplace", mid, cy + 52 * k, size, COL_TEXT)
+        spaced = f"{code[:3]} {code[3:]}"
+        size = self.fit_size(spaced, cw - 30, 84 * k, bold=True, smallest=12)
+        self.text_on(surf, spaced, mid, cy + 150 * k, size, COL_ORANGE, bold=True)
+        size = self.fit_size("type this code in to pair", cw - 30, 18 * k, smallest=7)
+        self.text_on(surf, "type this code in to pair", mid, cy + 196 * k, size, COL_DIM)
+
+    def text_on(self, surf, s, x, baseline, size, color, bold=False):
+        """Centred text with a transparent background, for drawing on cards."""
+        f = self.font(size, bold)
+        img = f.render(s, True, color)
+        surf.blit(img, (self.x(x) - img.get_width() // 2, self.y(baseline) - f.get_ascent()))
 
     # where the status line starts: (x, baseline, text size)
     STATUS = {"landscape": (32, 454, 16), "portrait": (12, 315, 10),
@@ -4437,10 +5205,11 @@ class Renderer:
 
     def _status(self, surf, snap):
         addr = f"{snap.host}.local  {snap.ip}".rstrip()
-        status = snap.flash or {"usage": snap.usage_status, "spotify": snap.sp_status,
-                                "bambu": snap.printer_status,
-                                "planes": snap.planes_status,
-                                "f1": snap.f1_status, "metro": snap.metro_status}[snap.mode]
+        status = snap.flash or (snap.addon_view[2] if snap.addon else
+                                {"usage": snap.usage_status, "spotify": snap.sp_status,
+                                 "bambu": snap.printer_status,
+                                 "planes": snap.planes_status,
+                                 "f1": snap.f1_status, "metro": snap.metro_status}.get(snap.mode))
         if self.working_note(snap):
             # Only the usage screen has the big spinner, so on the others Claude
             # working shows up here - the Pi's stand-in for the ESP32's LED.
@@ -4457,7 +5226,7 @@ class Renderer:
                     text = f"{text}  {snap.host}.local"
             self.text(surf, self.fit(text, 156, 10), 12, 315, 10, color)
             return
-        text, color = status or ("starting...", COL_DIM)
+        text, color = status or ((snap.addon.name, COL_DIM) if snap.addon else ("starting...", COL_DIM))
         if self.layout == "strip":
             self.text(surf, self.fit(text, 272, 18), 24, 1414, 18, color)
             self.text(surf, self.fit(addr, 272, 18), 24, 1446, 18, COL_DIM)
@@ -6191,6 +6960,8 @@ def main():
             forever(f1_worker, model)
         if cfg.metro_key:
             forever(metro_worker, model)
+    for sid in model.addons.ids():  # add-on screens fetch in demo mode too: they're real
+        model.addons.get(sid).start(model)
 
     try:
         screen = open_screen(args, cfg)
@@ -6205,6 +6976,7 @@ def main():
         if rotate else screen
     renderer = Renderer(canvas.get_size(), find_fonts())
     model.art_px, model.thumb_px = renderer.art_px, renderer.thumb_px
+    model.layout = renderer.layout
     renderer.warm_spinner()  # draw the spark's frames now, not mid-animation
     log(f"screen {sw}x{sh}, rotate {rotate}, {renderer.layout} layout")
 
