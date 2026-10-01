@@ -88,13 +88,13 @@ fi
 chmod 600 "$CONF"
 
 if [ -z "$(conf_get anthropic refresh_token)" ] && interactive \
-   && ask "Log the display in to your Claude account now?" y; then
+   && ask "Log the display in to your Claude account now (for the Claude Usage screen)?" y; then
   python3 "$REPO/server/device_login.py" --config "$CONF" \
     || echo "Login didn't finish - run it again later: python3 server/device_login.py --config $CONF"
 fi
 
 if [ -z "$(conf_get spotify refresh_token)" ] && interactive \
-   && ask "Set up the optional Spotify now-playing screen now?" n; then
+   && ask "Log in to Spotify now (for the Spotify screen, if you'll add it)?" n; then
   cat <<EOF
 
 Spotify sends your browser back to http://127.0.0.1:8898/callback, so the
@@ -106,18 +106,6 @@ first and open the printed link on your computer:
 EOF
   python3 "$REPO/server/spotify_login.py" --config "$CONF" \
     || echo "Spotify setup didn't finish - run it again later: python3 server/spotify_login.py --config $CONF"
-fi
-
-if [ -z "$(conf_get bambu access_code)" ] && interactive \
-   && ask "Set up the optional Bambu Lab 3D printer screen now?" n; then
-  python3 "$APP" --setup-bambu --config "$CONF" \
-    || echo "Printer setup didn't finish - run it again later: python3 pi/claude_display.py --setup-bambu"
-fi
-
-if [ -z "$(conf_get planes lat)" ] && interactive \
-   && ask "Set up the optional planes-overhead screen now (it asks for your location)?" n; then
-  python3 "$APP" --setup-planes --config "$CONF" \
-    || echo "Planes setup didn't finish - run it again later: python3 pi/claude_display.py --setup-planes"
 fi
 
 NEED_REBOOT=0
@@ -197,6 +185,8 @@ PORT="$(conf_get server port)"
 say "Done"
 echo "The display answers at  http://$(hostname).local:${PORT:-8080}  ($(hostname -I 2>/dev/null | awk '{print $1}'))"
 echo "Point your Claude Code hooks or beacon.py at it - see the README."
+echo "Screens come from the Screen Market (github.com/nicoloco321/screen-market): pair"
+echo "this display with it, then add the ones you want - start with Claude Usage."
 [ "$MODE" = service ] && echo "Logs: journalctl -u claude-display -f"
 if [ "$NEED_REBOOT" = 1 ]; then
   if interactive && ask "Reboot now to finish?" y; then

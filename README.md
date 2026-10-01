@@ -289,10 +289,10 @@ at session start, so restart it once after copying.)
 
 [pi/claude_display.py](pi/claude_display.py) is the same display as a
 fullscreen app for a Raspberry Pi (built for a **Pi 2**, fine on anything
-newer) on an HDMI monitor or TV, or the official touchscreen. It has the same
-screens (usage with the thinking spinner; Spotify now playing, with album art,
-playback buttons and the queue) and speaks the same HTTP API on port 8080, so
-the hooks, `beacon.py`, `find_display.py` and `/switch` work unchanged. The
+newer) on an HDMI monitor or TV, or the official touchscreen. Its screens come
+from the Screen Market (below): the ESP32's usage and Spotify screens and many
+more. It speaks the same HTTP API on port 8080, so the hooks, `beacon.py`,
+`find_display.py` and `/switch` work unchanged. The
 layout follows the screen's shape: landscape screens get a wide layout with a
 clock, portrait ones the ESP32's stacked layout, and long bar panels their own
 (below).
@@ -349,7 +349,7 @@ the screen from its own Power port.
    The installer:
    - installs pygame and creates `~/.config/claude-display/config.ini`
    - walks you through `device_login.py` (paste the code as usual) and,
-     optionally, the Spotify login
+     optionally, the Spotify login, for those screens from the Screen Market
    - offers to rename the Pi to `claude-display`, so `claude-display.local`
      resolves
    - turns off screen blanking
@@ -360,208 +360,37 @@ the screen from its own Power port.
    It's safe to re-run.
 3. Reboot if it asks you to. From then on the display comes up by itself.
 
+**Screens.** The Pi app comes with no screens of its own: they all come from
+the [**Screen Market**](https://github.com/nicoloco321/screen-market), a web
+app you run in Docker (on CasaOS, say). Until you add some, the display shows
+how. Pair it once (a code appears on the display; type it into the market),
+then pick screens and they appear a few seconds later. Some to start with:
+
+| Screen | What it shows | Setup |
+|---|---|---|
+| [Claude Usage](https://github.com/nicoloco321/screen-market/tree/main/catalog/usage) | your 5-hour and weekly limits, the thinking spinner, and a panel of what each session is doing | a login made on the Pi: `server/device_login.py` |
+| [Spotify](https://github.com/nicoloco321/screen-market/tree/main/catalog/spotify) | now playing, with play/pause/skip buttons and the queue | a login made on the Pi: `server/spotify_login.py` |
+| [3D Printer](https://github.com/nicoloco321/screen-market/tree/main/catalog/bambu) | a Bambu Lab print's progress and temperatures | the printer's access code |
+| [Planes Overhead](https://github.com/nicoloco321/screen-market/tree/main/catalog/planes) | the nearest plane in its airline's livery, and a radar | your location |
+| [Formula 1](https://github.com/nicoloco321/screen-market/tree/main/catalog/f1) | the weekend's track with the cars moving round it live | none |
+| [DC Metro](https://github.com/nicoloco321/screen-market/tree/main/catalog/metro) | every WMATA train on a live map, and your next trains | a free WMATA key |
+
+There's also weather, a world clock, a countdown, crypto prices and Hacker
+News, and you can write your own in Python and publish it from the browser
+(see the [Screen Market's README](https://github.com/nicoloco321/screen-market#writing-a-screen)).
+Screens that need a key or a location take it on their page in the market:
+the display saves it to config.ini and restarts itself. Installing or removing
+a screen like Spotify, which plugs into the display itself, restarts it too.
+
 **Using it:**
 
-- Tap the screen (or click, or press Space) to switch screens. Ctrl+Q quits.
-- **Session panel.** While Claude works, or waits on you, the usage
-  screen's bars slide to the right end of the screen and shrink, opening the
-  middle for what's going on. It shows each session's project and how long
-  it's been working, what Claude is doing right now ("Running: Compile the
-  firmware", "Editing main.cpp"), any subagents and what they're doing, and a
-  yellow "needs you" with the reason when a permission prompt or question is
-  waiting. When Claude is done the bars slide back. The details come from the
-  [Claude Code hooks](#option-a--claude-code-hooks-recommended), which send
-  them along with each beacon (the ESP32 ignores them). Beacons from
-  `beacon.py` or the old curl hooks just show "Claude is working". This is on
-  the bar and landscape layouts.
-- The Pi has no status LED, so while Claude works the Spotify and printer
-  screens' status line shows a small spinner and "Claude is working...".
-- **Spotify screen.** The album art, the song and a progress bar, with
-  **previous**, **play/pause** and **next** buttons under it. Play/pause
-  shows pause while music plays and play while it's paused. Previous
-  restarts the song if it's more than 3 seconds in, like Spotify's own apps;
-  tap it again to go back a song. **Up next** lists the next songs in your
-  queue, refreshed when the song changes and every 30 s for songs you queue
-  from your phone. On a long bar screen the **queue button** at the bottom
-  right slides it in from the right: the progress bar shrinks and the
-  buttons move over to make room, and another tap slides it away (it stays
-  how you left it). The landscape and standing-strip layouts always show the
-  queue, and the portrait one has no room for it. A tap anywhere but the
-  buttons still switches screens. Previous, play/pause and next need
-  **Spotify Premium** (Spotify only takes playback commands from Premium
-  accounts) and a Spotify login made since they were added. If the status
-  line says "the buttons need a new spotify login", run
-  `python3 server/spotify_login.py --config ~/.config/claude-display/config.ini`
-  again (over SSH, see **Spotify login over SSH** below) and restart the
-  display.
-- **3D printer screen (Bambu Lab).** A third screen follows a print on a
-  Bambu Lab printer on your network: print name, a progress bar with the
-  percentage, layer count, time left and when it'll finish, and
-  nozzle/bed temperatures. Paused prints turn the bar yellow, failed ones red.
-  Set it up on the Pi with:
-
-  ```sh
-  python3 pi/claude_display.py --setup-bambu
-  ```
-
-  It finds the printer on the network (Bambu printers announce themselves),
-  asks for its **access code** (on the printer's screen under Settings →
-  WLAN, or Network on an X1), checks it can log in, and saves it to
-  config.ini. Restart the display, then tap through to the new screen, or use
-  `POST /mode/bambu`. The display reads the printer's local status feed
-  (MQTT over TLS on port 8883) directly: no Bambu cloud login, and only
-  while the printer screen is showing. If the printer refuses a correct code,
-  newer firmware may need **LAN Only Mode** with **Developer Mode** turned on.
-- **Planes overhead.** A fourth screen follows the nearest aircraft in the
-  air around you. On the left is a side view of the plane in its airline's
-  livery, gear up (see **Aircraft art** below). In the middle, its destination airport is the
-  headline, with the airport's name, the flight number and airline, a line
-  showing how far along the route it is and the miles left, then the aircraft
-  (type, registration, year built), altitude with climb/descent, speed,
-  heading and how far away it is. An emergency squawk (7500/7600/7700) shows
-  in red. On the right, a radar, north up, centred on you, shows every plane
-  around, the followed one's trail, a dashed line along its heading for the
-  next four minutes, and a notch pointing toward where it's headed. Set your
-  location once:
-
-  ```sh
-  python3 pi/claude_display.py --setup-planes
-  ```
-
-  It suggests a spot from your IP (rough), takes exact coordinates if you
-  paste them (right-click your house in Google Maps), checks the feed, and
-  saves them to config.ini. Restart the display, then tap through, or
-  `POST /mode/planes`. All the sources are free and need no account:
-  - **Positions** come from [adsb.fi](https://adsb.fi)'s open data, falling
-    back to [adsb.lol](https://adsb.lol) if it's down. The feed in use is
-    named in the status line.
-  - **Routes** come from [adsb.im](https://adsb.im), then
-    [adsbdb](https://www.adsbdb.com). A route only shows when the plane
-    really is near it, because flight numbers get reused and route data can
-    be stale. Private planes and helicopters show "route unknown".
-  - **Airline and aircraft-type names** come from two reference lists,
-    [Virtual Radar Server's standing data](https://github.com/vradarserver/standing-data)
-    and [tar1090-db](https://github.com/wiedehopf/tar1090-db). They're
-    downloaded once and kept in `~/.cache/claude-display`, refreshed monthly.
-  - **Aircraft art** is [Norebbo](https://www.norebbo.com)'s side-view
-    illustrations: the airline's livery on that exact type, else the type
-    in blank white livery, else a photo (below). Regional flights get
-    their brand's paint (a SkyWest E175 flying as United Express shows the
-    United Express livery). There are about 80 liveries: United, American,
-    Delta, Southwest, Alaska, the regionals, and the international carriers
-    at IAD. There are about 110 blank types, including private jets
-    (Gulfstream G550/G650, Global 5000/7500, Learjet 45/60, Falcon 50,
-    Citation X, King Air). Where United, Delta or Air Canada publish their
-    own side views on their fleet pages, those are used instead: they're in
-    the current livery, and they fill gaps like United Express, Delta
-    Connection and Air Canada Express. The credit under the picture names
-    whose art it is. None of this art is in this repo; Norebbo's is for
-    personal use. Build it on your PC and copy it to the Pi:
-
-    ```sh
-    pip install pillow numpy scipy
-    python3 pi/build_liveries.py out/liveries
-    scp -r out/liveries nico@claude-display.local:.local/share/claude-display/
-    ```
-
-    It downloads each illustration once, cuts out the gear-up plane onto a
-    transparent background, and writes the PNGs and an `index.json`. `out/`
-    is gitignored; don't share the images. delta.com and aircanada.com turn
-    away scripted downloads. For each one it skips, the script prints the
-    file name to save the image as from your browser, then you run it again.
-  - **Photos** come from [Planespotters.net](https://www.planespotters.net)
-    when there's no illustration for the type. Their terms ask for the
-    photographer's name, a QR code to the photo's page on a screen you
-    can't click, and that the image is only kept in memory while it's shown.
-    So only a photo gets a QR code, it's never saved to the SD card, and
-    it's dropped when you leave the screen. The small portrait layout has no
-    room for a scannable code, so it shows the radar there instead of a photo.
-
-  It only polls while the planes screen is showing: every 10 s for positions,
-  with the rest looked up once per plane and cached.
-
-  **The planes log.** Every plane the screen shows is logged with the
-  picture it got: its livery, a blank livery, a photo, or nothing. Open
-  `http://claude-display.local:8080/planes/log` (or **Planes log...** in
-  the Windows tray) to see what's missing. It lists the airline and type
-  pairs that showed a blank livery, as the `("UAL", "B737")` keys to add to
-  `LIVERIES` in `pi/build_liveries.py`. Then it lists the types with no
-  illustration at all, for `BLANKS`, with the most-seen first. The raw log
-  is `~/.local/state/claude-display/planes_log.csv`, also downloadable
-  from the page.
-- **Formula 1.** A fifth screen follows the F1 weekend, with no setup:
-  - **Left:** this week's (or the next) track, drawn the way F1 draws it.
-    While a session is on, the cars move round it in team colours, with the
-    top three labelled.
-  - **Middle, live:** the session and flag (green, yellow, SC, VSC, red,
-    chequered), the time left or the lap count, the latest race control
-    message, the fastest lap and the weather.
-  - **Middle, between sessions:** the circuit's name in big letters, the
-    next session with a countdown, the track's length, corners and pit-stop
-    time cost, last year's winner and the championship leader.
-  - **Right:** the running order while live. After a session, that day's
-    results. On other days, the weekend's schedule in your time zone.
-
-  Live data comes from F1's own timing feed, as the official app uses. It's
-  free without a login except for the cars' GPS positions, so the map
-  places each car from the ~25 timing loops per lap it passes and moves it
-  on at its lap pace. Checked against the real GPS, the dots land about
-  30 m (half a second) from the car. Where the loops sit on each track is
-  learned once from F1's archive of an earlier session there.
-  - **Schedule and results:** [OpenF1](https://openf1.org), free outside
-    live sessions.
-  - **Track maps:** [MultiViewer](https://multiviewer.app).
-  - **Standings and past winners:** [Jolpica](https://jolpi.ca).
-
-  The screen only fetches while it's showing. Turn it off with
-  `enabled = no` under `[f1]` in config.ini.
-- **Washington Metro.** A sixth screen follows WMATA's Metrorail:
-  - **Left:** a map of every line, drawn from where the stations really are,
-    with the middle of the city magnified so downtown has room. Lines that
-    share track run side by side. Every train is a dot in its line's colour,
-    sliding along the track as it moves (trains not carrying passengers are
-    small grey dots). Your station has a ring round it.
-  - **Right:** your station, its lines, and the next trains to arrive:
-    line, destination, 6 or 8 cars, and minutes (`ARR` / `BRD` as on the
-    platform signs). A WMATA alert about your station's lines shows in
-    yellow below them.
-
-  It needs a free WMATA api key. Sign up at
-  [developer.wmata.com](https://developer.wmata.com), subscribe to
-  **Default Tier** under Products, and copy the **Primary key** from your
-  profile. Then run this on the Pi:
-
-  ```bash
-  python3 pi/claude_display.py --setup-metro
-  ```
-
-  It checks the key and asks for your station. **Anyone on your network can
-  change the station** from a phone or computer at
-  `http://claude-display.local:8080/metro` (search, tap a station; the
-  Windows tray's **Metro station...** opens the same page), or with
-  `curl -X POST http://claude-display.local:8080/metro/station/dupont`.
-  That choice sticks across restarts.
-
-  Train positions come from WMATA's TrainPositions feed, which says which
-  track circuit (a stretch of track a few hundred metres long) each train is
-  on, fresh about every 10 s. The map places the train along its line from
-  that, and slides it to each new spot. The station list and track layout are
-  fetched once a month. The screen only polls while it's showing: every 10 s
-  for trains, 20 s for arrivals, 2 min for alerts. That's about 14,000 calls
-  a day if it's on screen all day; the free tier allows 50,000.
-- **Add-on screens.** Add more screens from the
-  [**Screen Market**](https://github.com/nicoloco321/screen-market), a web app
-  that runs in Docker (for example on CasaOS). Pair the display once with a code that appears on its screen.
-  After that, picking a screen in the marketplace installs it on the display
-  and switches to it. It ships with weather, a world clock, a countdown,
-  crypto prices and Hacker News. You can write your own in Python and publish
-  them from the browser; see the
-  [Screen Market's README](https://github.com/nicoloco321/screen-market#writing-a-screen).
-  Installed screens join the ones you tap through and answer `POST /mode/<id>`.
-  The marketplace also lists the built-in screens: from there you can leave
-  one out of the screens you tap through, or set up the planes, Metro, 3D
-  printer and F1 screens without SSH (the display saves the settings to
-  config.ini and restarts itself).
+- Tap the screen (or click, or press Space) to switch screens, in the order
+  you installed them. `POST /mode/<screen>` or `/mode/toggle` does it too.
+  Ctrl+Q quits. A tap on a screen's own buttons (Spotify's) presses them.
+- The Pi has no status LED, so while Claude works, screens without a spinner
+  of their own show a small one and "Claude is working..." in the status line.
+- Some screens have a setup step of their own on the Pi:
+  `python3 pi/claude_display.py --setup planes` (or `bambu`, `metro`).
 - Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
   `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
   `rotate` for a monitor mounted on its side. Apply changes with
@@ -578,7 +407,9 @@ the screen from its own Power port.
   login in that session, and open its link on your computer.
 - **Try it anywhere, no logins needed:**
   `python3 pi/claude_display.py --demo --windowed 800x480` (on a PC,
-  `pip install pygame` first).
+  `pip install pygame` first) shows the installed screens with fake data. To
+  try screens without the market, copy their folders from screen-market's
+  `catalog/` into `~/.local/share/claude-display/screens/`.
 
 ## Windows tray helper
 
@@ -589,9 +420,10 @@ Windows notification area, next to the clock:
   5-hour % itself if you prefer. Hover for both numbers; right-click for reset
   times.
 - Clawd **walks** while Claude is working, on any of your machines.
-- **Left-click** cycles the display through its screens (usage, Spotify,
-  3D printer, planes overhead, F1, Metro); the menu lists them all, and
-  **Metro station...** opens the page for picking your station.
+- **Left-click** cycles the display through its screens; the menu lists the
+  ones installed on it (usage and Spotify on the ESP32), and **Metro
+  station...** opens the page for picking your station when the Metro
+  screen is installed.
 - **Track Claude with hooks (exact)** installs or removes the
   [Claude Code hooks](#option-a--claude-code-hooks-recommended). While they're
   installed, the tray runs their watcher: it catches Esc interrupts and keeps
@@ -599,8 +431,9 @@ Windows notification area, next to the clock:
   from transcripts** falls back to the `beacon.py` approach.
 - **Start with Windows.**
 
-It reads everything from the display's `GET /usage`, so the PC needs no
-Anthropic login and adds no load on the rate-limited usage API. It works with
+It reads everything from the display's `GET /usage` (the Claude Usage
+screen answers it on the Pi), so the PC needs no Anthropic login and adds no
+load on the rate-limited usage API. It works with
 the Pi app, and with the ESP32 once it's flashed with this firmware. Older
 firmware still gets screen switching and beacons, and the menu tells you to
 re-flash for the numbers.
@@ -669,6 +502,8 @@ changes it later (and re-points the hooks). Windows often resolves
 | Pi: "the buttons need a new spotify login" | The Spotify login predates the buttons, so it can't control playback. Re-run `python3 server/spotify_login.py --config ~/.config/claude-display/config.ini`, then restart the display |
 | Pi: "the buttons need Spotify Premium" | Spotify only takes playback commands from Premium accounts. Now playing and the queue still work |
 | Pi: "no active Spotify device" | Spotify has nothing to send the command to, e.g. playback was paused long ago. Start playing on any device, then the buttons work |
+| Pi: "No screens yet" | Every screen comes from the [Screen Market](https://github.com/nicoloco321/screen-market): run it, pair the display (a code shows on the screen) and add some |
+| Pi: a screen says it isn't set up (or `POST /mode/...` answers 409) | It needs a key, location or login first: see its page in the Screen Market, which says what and can take most of them |
 | Pi: blank screen, service keeps restarting | `journalctl -u claude-display -e`. "could not open the screen" on Lite means no KMS driver: `/boot/firmware/config.txt` needs `dtoverlay=vc4-kms-v3d` (the default). Re-run `bash pi/install.sh` to fix group access |
 | Pi: picture has black borders or is cut off | Turn off overscan (`sudo raspi-config` → Display Options), or force a mode with `size = WxH` in config.ini |
 | Tray icon is grey / "Display not reachable" | Set the right address with **Display address…** in the tray menu (the IP from the display's status line always works) |

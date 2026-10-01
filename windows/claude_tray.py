@@ -7,7 +7,8 @@ helper - that sits next to the clock and:
   - shows your 5-hour / weekly usage at a glance: a meter under Clawd in the
     icon (or the 5-hour % itself), the numbers in the tooltip and menu
   - walks Clawd while Claude is working, on any of your machines
-  - switches the display between its usage, Spotify, 3D printer, planes, F1 and Metro screens
+  - switches the display between its screens - whichever you've installed
+    from the Screen Market on the Pi app, usage and Spotify on the ESP32
     (left-click the icon to cycle, or pick one from the menu)
   - tells the display exactly when Claude Code is working on this PC: one
     click installs the Claude Code hooks (server/display_hook.py), and the
@@ -75,6 +76,7 @@ DEFAULTS = {
 }
 
 POLL_SECS = 5           # re-read /usage from the display this often (it's on the LAN)
+ESP32_SCREENS = [("usage", "Usage"), ("spotify", "Spotify")]  # the firmware's own two
 TICK_SECS = 0.5         # worker loop; also the walking-Clawd frame rate
 OFFLINE_AFTER = 2       # failed polls in a row before we call the display offline
 
@@ -299,9 +301,11 @@ class TrayApp:
         self.settings = settings
         self.lock = threading.Lock()
         self.data = None        # the display's last /usage answer
-        self.mode = None        # "usage" / "spotify", None until known
+        self.mode = None        # the screen showing, None until known
+        self.screens = ESP32_SCREENS  # [(id, name)]: the Pi app lists its installed ones
         self.online = False
         self.legacy = False     # it answers, but its firmware predates GET /usage
+        self.no_usage = False   # a Pi with no Claude Usage screen installed
         self.failures = OFFLINE_AFTER
         self.ip = None          # settings["host"] resolved once (mDNS is slow)
         self.beaconing = False  # transcript beacon: we've told the display this PC is busy
@@ -339,9 +343,18 @@ class TrayApp:
     def poll(self):
         try:
             code, body = self.request("/usage")
+            screens, no_usage = ESP32_SCREENS, False
+            scode, sbody = self.request("/screens")
+            if scode == 200:  # the Pi app: its screens come from the Screen Market
+                info = json.loads(sbody)
+                screens = [(s["id"], s["name"]) for s in info.get("installed") or []
+                           if s.get("ready", True)]
             if code == 200:
                 data, legacy = json.loads(body), False
                 mode = data.get("mode")
+            elif code == 404 and scode == 200:  # no Claude Usage screen installed
+                data, legacy, no_usage = None, False, True
+                mode = info.get("mode")
             elif code == 404:  # older firmware: no /usage, but /mode still works
                 data, legacy = None, True
                 code, body = self.request("/mode")
@@ -358,15 +371,16 @@ class TrayApp:
             return
         with self.lock:
             self.data, self.mode, self.legacy = data, mode, legacy
+            self.screens, self.no_usage = screens, no_usage
             self.online, self.failures = True, 0
 
     def post_async(self, path, on_status=None):
         """POST from a worker thread - menu callbacks run on the UI thread."""
         def go():
             try:
-                code, _ = self.request(path, "POST")
+                code, body = self.request(path, "POST")
                 if on_status:
-                    on_status(code)
+                    on_status(code, body)
             except OSError:
                 self.notify(f"Couldn't reach the display at {self.settings['host']}.")
             self.poll_soon.set()
@@ -437,6 +451,8 @@ class TrayApp:
             return f"Display not reachable at {self.settings['host']}"
         if self.legacy:
             return "Re-flash the display firmware to see usage here"
+        if self.no_usage:
+            return "Add the Claude Usage screen from the Screen Market"
         if not (self.data and self.data.get("valid")):
             return "Waiting for the display's first usage fetch..."
         return self.usage_line("five_hour")
@@ -464,7 +480,7 @@ class TrayApp:
             icon_key = (self.settings["icon"], None if pct is None else round(pct), self.online, frame)
             tooltip = self.tooltip()
             menu_key = (self.status_line(), self.usage_line("seven_day"), walking, self.online,
-                        self.mode, self.beacon_enabled(), self.settings["icon"],
+                        self.mode, tuple(self.screens), self.beacon_enabled(), self.settings["icon"],
                         hooks_status()["ours"], hooks_status()["curl"],
                         self.settings["host"], startup_enabled())
         self.tick += 1
@@ -494,45 +510,41 @@ class TrayApp:
 
     # -- menu
     def build_menu(self):
+        # A callable, so the screens' items follow what's installed on the display.
+        return pystray.Menu(lambda: self.menu_items())
+
+    def menu_items(self):
         Item, Menu = pystray.MenuItem, pystray.Menu
         usage_known = lambda _: self.online and bool(self.data and self.data.get("valid"))
-        return Menu(
-            Item(lambda _: self.status_line(), None, enabled=False),
-            Item(lambda _: self.usage_line("seven_day"), None, enabled=False, visible=usage_known),
-            Item(lambda _: "Claude is working..." if self.thinking() else "Claude is idle",
-                 None, enabled=False, visible=lambda _: self.online),
-            Menu.SEPARATOR,
-            Item("Switch display screen", self.on_mode("toggle"), default=True,
-                 enabled=lambda _: self.online),
-            Item("Usage screen", self.on_mode("usage"), radio=True,
-                 checked=lambda _: self.mode == "usage", enabled=lambda _: self.online),
-            Item("Spotify screen", self.on_mode("spotify"), radio=True,
-                 checked=lambda _: self.mode == "spotify", enabled=lambda _: self.online),
-            Item("3D printer screen", self.on_mode("bambu"), radio=True,
-                 checked=lambda _: self.mode == "bambu", enabled=lambda _: self.online),
-            Item("Planes overhead screen", self.on_mode("planes"), radio=True,
-                 checked=lambda _: self.mode == "planes", enabled=lambda _: self.online),
-            Item("Formula 1 screen", self.on_mode("f1"), radio=True,
-                 checked=lambda _: self.mode == "f1", enabled=lambda _: self.online),
-            Item("Metro screen", self.on_mode("metro"), radio=True,
-                 checked=lambda _: self.mode == "metro", enabled=lambda _: self.online),
-            Menu.SEPARATOR,
-            Item("Track Claude with hooks (exact)", self.on_hooks,
-                 checked=lambda _: hooks_status()["ours"] is not None,
-                 enabled=lambda _: display_hook is not None),
-            Item("Guess activity from transcripts", self.on_beacon,
-                 checked=lambda _: self.beacon_enabled(),
-                 visible=lambda _: hooks_status()["ours"] is None and not hooks_status()["curl"]),
-            Item("Show 5-hour % in icon", self.on_icon_style,
-                 checked=lambda _: self.settings["icon"] == "percent"),
-            Item("Start with Windows", self.on_startup, checked=lambda _: startup_enabled()),
-            Item(lambda _: f"Display address: {self.settings['host']}...", self.on_address),
-            Item("Planes log...", self.on_planes_log, enabled=lambda _: self.online),
-            Item("Metro station...", self.on_metro_station, enabled=lambda _: self.online),
-            Menu.SEPARATOR,
-            Item("Refresh", lambda: self.poll_soon.set()),
-            Item("Quit", self.on_quit),
-        )
+        installed = {sid for sid, _ in self.screens}
+        yield Item(lambda _: self.status_line(), None, enabled=False)
+        yield Item(lambda _: self.usage_line("seven_day"), None, enabled=False, visible=usage_known)
+        yield Item(lambda _: "Claude is working..." if self.thinking() else "Claude is idle",
+                   None, enabled=False, visible=lambda _: self.online)
+        yield Menu.SEPARATOR
+        yield Item("Switch display screen", self.on_mode("toggle"), default=True,
+                   enabled=lambda _: self.online)
+        for sid, name in self.screens:
+            yield Item(f"{name} screen", self.on_mode(sid), radio=True,
+                       checked=lambda _, sid=sid: self.mode == sid, enabled=lambda _: self.online)
+        yield Menu.SEPARATOR
+        yield Item("Track Claude with hooks (exact)", self.on_hooks,
+                   checked=lambda _: hooks_status()["ours"] is not None,
+                   enabled=lambda _: display_hook is not None)
+        yield Item("Guess activity from transcripts", self.on_beacon,
+                   checked=lambda _: self.beacon_enabled(),
+                   visible=lambda _: hooks_status()["ours"] is None and not hooks_status()["curl"])
+        yield Item("Show 5-hour % in icon", self.on_icon_style,
+                   checked=lambda _: self.settings["icon"] == "percent")
+        yield Item("Start with Windows", self.on_startup, checked=lambda _: startup_enabled())
+        yield Item(lambda _: f"Display address: {self.settings['host']}...", self.on_address)
+        if "planes" in installed:
+            yield Item("Planes log...", self.on_planes_log, enabled=lambda _: self.online)
+        if "metro" in installed:
+            yield Item("Metro station...", self.on_metro_station, enabled=lambda _: self.online)
+        yield Menu.SEPARATOR
+        yield Item("Refresh", lambda: self.poll_soon.set())
+        yield Item("Quit", self.on_quit)
 
     def on_planes_log(self):
         """Every plane the display's planes screen has shown, in the browser."""
@@ -544,23 +556,12 @@ class TrayApp:
 
     def on_mode(self, what):
         def switch():
-            def result(code):
-                if code == 409 and what == "bambu":
-                    self.notify("The printer isn't set up on the display yet - run "
-                                "claude_display.py --setup-bambu on the Pi.")
-                elif code == 409 and what == "f1":
-                    self.notify("The F1 screen is turned off in the display's config.ini.")
-                elif code == 409 and what == "metro":
-                    self.notify("The Metro screen needs a WMATA api key first - run "
-                                "claude_display.py --setup-metro on the Pi.")
-                elif code == 409 and what == "planes":
-                    self.notify("The planes screen needs your location first - run "
-                                "claude_display.py --setup-planes on the Pi.")
-                elif code == 409:
-                    self.notify("Spotify isn't set up on the display yet - see the README.")
+            def result(code, body):
+                if code == 409:  # not set up yet: the display says how
+                    self.notify(body.strip() or "That screen isn't set up on the display yet.")
                 elif code == 404:
-                    self.notify("This display doesn't have that screen (the 3D printer, "
-                                "planes, F1 and Metro screens are in the Raspberry Pi app).")
+                    self.notify("This display doesn't have that screen - add it from the "
+                                "Screen Market (the ESP32 has usage and Spotify only).")
             self.post_async(f"/mode/{what}", result)
         return switch
 
