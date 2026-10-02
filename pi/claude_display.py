@@ -523,6 +523,193 @@ def cached_download(url, name, max_age=30 * 86400, headers=None):
         return f.read()
 
 
+# QR codes, for screens that point you somewhere: a page on the display, a
+# photo's source. A small byte-mode encoder (ECC level L, versions 1-10: up
+# to 271 bytes), after Project Nayuki's reference implementation.
+
+# per version: (ECC codewords per block, [(blocks, data codewords per block), ...])
+QR_BLOCKS_L = [None, (7, [(1, 19)]), (10, [(1, 34)]), (15, [(1, 55)]), (20, [(1, 80)]),
+               (26, [(1, 108)]), (18, [(2, 68)]), (20, [(2, 78)]), (24, [(2, 97)]),
+               (30, [(2, 116)]), (18, [(2, 68), (2, 69)])]
+
+
+QR_ALIGN = [None, [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42],
+            [6, 26, 46], [6, 28, 50]]
+
+
+def _gf_mul(x, y):
+    z = 0
+    for i in reversed(range(8)):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z
+
+
+def _rs_ecc(data, degree):
+    """Reed-Solomon error-correction codewords for one block."""
+    gen, root = [0] * (degree - 1) + [1], 1
+    for _ in range(degree):
+        for j in range(degree):
+            gen[j] = _gf_mul(gen[j], root)
+            if j + 1 < degree:
+                gen[j] ^= gen[j + 1]
+        root = _gf_mul(root, 2)
+    rem = [0] * degree
+    for b in data:
+        factor = b ^ rem.pop(0)
+        rem.append(0)
+        for i, g in enumerate(gen):
+            rem[i] ^= _gf_mul(g, factor)
+    return rem
+
+
+def qr_matrix(data):
+    """The QR code for `data` (bytes) as rows of booleans (True = dark)."""
+    for version in range(1, 11):
+        ecc_len, groups = QR_BLOCKS_L[version]
+        capacity = sum(n * k for n, k in groups)
+        count_bits = 8 if version < 10 else 16
+        if 4 + count_bits + 8 * len(data) <= capacity * 8:
+            break
+    else:
+        raise ValueError("too long for a QR code this encoder makes")
+    # the bit stream: byte mode, length, data, terminator, padding
+    bits = [int(c) for c in f"0100{len(data):0{count_bits}b}"]
+    for b in data:
+        bits += [(b >> i) & 1 for i in range(7, -1, -1)]
+    bits += [0] * min(4, capacity * 8 - len(bits))
+    bits += [0] * (-len(bits) % 8)
+    words = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8)]
+    words += [0xEC, 0x11] * ((capacity - len(words)) // 2) + [0xEC] * ((capacity - len(words)) % 2)
+    # split into blocks, add error correction, interleave
+    blocks, at = [], 0
+    for n, k in groups:
+        for _ in range(n):
+            blocks.append(words[at:at + k])
+            at += k
+    eccs = [_rs_ecc(b, ecc_len) for b in blocks]
+    stream = [b[i] for i in range(max(map(len, blocks))) for b in blocks if i < len(b)]
+    stream += [e[i] for i in range(ecc_len) for e in eccs]
+
+    size = version * 4 + 17
+    grid = [[False] * size for _ in range(size)]
+    fixed = [[False] * size for _ in range(size)]
+
+    def put(x, y, dark):
+        grid[y][x], fixed[y][x] = dark, True
+
+    for i in range(size):  # timing patterns
+        put(6, i, i % 2 == 0)
+        put(i, 6, i % 2 == 0)
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):  # finders + separators
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                if 0 <= cx + dx < size and 0 <= cy + dy < size:
+                    put(cx + dx, cy + dy, max(abs(dx), abs(dy)) not in (2, 4))
+    align = QR_ALIGN[version]
+    for i, ax in enumerate(align):
+        for j, ay in enumerate(align):
+            if (i, j) in ((0, 0), (0, len(align) - 1), (len(align) - 1, 0)):
+                continue
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    put(ax + dx, ay + dy, max(abs(dx), abs(dy)) != 1)
+
+    def format_bits(mask):
+        data = 1 << 3 | mask  # 01 = level L
+        rem = data
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        v = (data << 10 | rem) ^ 0x5412
+        for i in range(6):
+            put(8, i, (v >> i) & 1)
+        put(8, 7, (v >> 6) & 1)
+        put(8, 8, (v >> 7) & 1)
+        put(7, 8, (v >> 8) & 1)
+        for i in range(9, 15):
+            put(14 - i, 8, (v >> i) & 1)
+        for i in range(8):
+            put(size - 1 - i, 8, (v >> i) & 1)
+        for i in range(8, 15):
+            put(8, size - 15 + i, (v >> i) & 1)
+        put(8, size - 8, True)  # the dark module
+
+    format_bits(0)  # reserve the format areas
+    if version >= 7:
+        rem = version
+        for _ in range(12):
+            rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+        v = version << 12 | rem
+        for i in range(18):
+            a, b = size - 11 + i % 3, i // 3
+            put(a, b, (v >> i) & 1)
+            put(b, a, (v >> i) & 1)
+
+    # the data, zig-zagging up and down in two-module columns from the right
+    i, total = 0, len(stream) * 8
+    right = size - 1
+    while right >= 1:
+        if right == 6:
+            right = 5
+        upward = ((right + 1) & 2) == 0
+        for vert in range(size):
+            y = size - 1 - vert if upward else vert
+            for x in (right, right - 1):
+                if not fixed[y][x] and i < total:
+                    grid[y][x] = bool((stream[i >> 3] >> (7 - (i & 7))) & 1)
+                    i += 1
+        right -= 2
+
+    masks = (lambda x, y: (x + y) % 2 == 0, lambda x, y: y % 2 == 0, lambda x, y: x % 3 == 0,
+             lambda x, y: (x + y) % 3 == 0, lambda x, y: (x // 3 + y // 2) % 2 == 0,
+             lambda x, y: x * y % 2 + x * y % 3 == 0,
+             lambda x, y: (x * y % 2 + x * y % 3) % 2 == 0,
+             lambda x, y: ((x + y) % 2 + x * y % 3) % 2 == 0)
+
+    def apply(mask):
+        f = masks[mask]
+        for y in range(size):
+            for x in range(size):
+                if not fixed[y][x] and f(x, y):
+                    grid[y][x] = not grid[y][x]
+
+    def penalty():
+        score = 0
+        lines = [row for row in grid] + [list(col) for col in zip(*grid)]
+        for line in lines:  # runs of 5+, and finder look-alikes
+            run, prev = 0, None
+            for m in line:
+                if m == prev:
+                    run += 1
+                else:
+                    if run >= 5:
+                        score += run - 2
+                    run, prev = 1, m
+            if run >= 5:
+                score += run - 2
+            s = "".join("1" if m else "0" for m in line)
+            score += 40 * (s.count("10111010000") + s.count("00001011101"))
+        for y in range(size - 1):  # 2x2 blocks
+            for x in range(size - 1):
+                if grid[y][x] == grid[y][x + 1] == grid[y + 1][x] == grid[y + 1][x + 1]:
+                    score += 3
+        dark = sum(map(sum, grid))
+        score += 10 * (abs(dark * 20 - size * size * 10) // (size * size))
+        return score
+
+    best = None
+    for mask in range(8):
+        apply(mask)
+        format_bits(mask)
+        score = penalty()
+        if best is None or score < best[0]:
+            best = (score, mask)
+        apply(mask)  # XOR again to undo
+    apply(best[1])
+    format_bits(best[1])
+    return grid
+
+
 # ---------------------------------------------------------------- screens
 #
 # Every screen comes from the Screen Market (github.com/nicoloco321/screen-market),
@@ -551,7 +738,7 @@ def cached_download(url, name, max_age=30 * 86400, headers=None):
 
 SCREENS_DIR = os.path.expanduser("~/.local/share/claude-display/screens")
 SCREEN_API = 1     # what an add-on screen's manifest "api" may ask for
-NATIVE_API = 1     # what a native screen's "native_api" may ask for: the hooks below
+NATIVE_API = 2     # what a native screen's "native_api" may ask for: the hooks below (2: + qr_matrix)
 WELCOME = "welcome"  # the screen shown while none are installed (or set up)
 SCREEN_ID = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 SCREEN_FILE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")

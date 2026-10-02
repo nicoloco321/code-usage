@@ -376,6 +376,7 @@ then pick screens and they appear a few seconds later. Some to start with:
 | [Planes Overhead](https://github.com/nicoloco321/screen-market/tree/main/catalog/planes) | the nearest plane in its airline's livery, and a radar | your location |
 | [Formula 1](https://github.com/nicoloco321/screen-market/tree/main/catalog/f1) | the weekend's track with the cars moving round it live | none |
 | [DC Metro](https://github.com/nicoloco321/screen-market/tree/main/catalog/metro) | every WMATA train on a live map, and your next trains | a free WMATA key |
+| [E*TRADE](https://github.com/nicoloco321/screen-market/tree/main/catalog/etrade) | today's gain or loss, and how each holding moved | an E*TRADE API key and a daily login, or holdings you list |
 
 There's also weather, a world clock, a countdown, crypto prices and Hacker
 News, and you can write your own in Python and publish it from the browser
