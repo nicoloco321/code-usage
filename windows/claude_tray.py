@@ -347,8 +347,9 @@ class TrayApp:
             scode, sbody = self.request("/screens")
             if scode == 200:  # the Pi app: its screens come from the Screen Market
                 info = json.loads(sbody)
-                screens = [(s["id"], s["name"]) for s in info.get("installed") or []
-                           if s.get("ready", True)]
+                # read every poll, so a screen installed from the market shows up here
+                screens = [(s["id"], f"{s.get('icon') or ''} {s['name']}".strip())
+                           for s in info.get("installed") or [] if s.get("ready", True)]
             if code == 200:
                 data, legacy = json.loads(body), False
                 mode = data.get("mode")

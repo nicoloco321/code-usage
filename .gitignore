@@ -4,3 +4,6 @@ firmware/.vscode
 __pycache__/
 # pi/build_liveries.py output - Norebbo art, personal use only, never commit it
 out/
+
+# mac/build.sh output
+mac/DeskSwitch.app/

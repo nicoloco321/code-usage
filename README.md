@@ -17,7 +17,9 @@ the 480x320 landscape boards are still supported (see [Hardware](#hardware)).
 No ESP32? The same display also runs as a **fullscreen Raspberry Pi app** that
 starts on boot ([Raspberry Pi edition](#raspberry-pi-edition)), and a
 **Windows tray helper** puts your usage next to the clock
-([Windows tray helper](#windows-tray-helper)).
+([Windows tray helper](#windows-tray-helper)), and a **Mac menu bar
+switcher** flips between screens ([Mac menu bar switcher](#mac-menu-bar-switcher)).
+Both list the screens installed on the display, so they keep up when you add one.
 
 ```
 +------------------+   172x320 portrait
@@ -457,6 +459,23 @@ changes it later (and re-points the hooks). Windows often resolves
 > `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.3.x_…\LocalCache\Roaming\claude-display`,
 > rather than `%APPDATA%`. The hooks pin the same Python as the tray, so they
 > share it.
+
+## Mac menu bar switcher
+
+[mac/DeskSwitch.swift](mac/DeskSwitch.swift) puts the display's screens in
+the Mac menu bar: pick one to switch to it, or **Cycle to next** (⌘T). The
+glyph shows what's on the display. The menu lists the screens installed on
+it, read again each time you open the menu, so a screen you add from the
+Screen Market shows up straight away (the ESP32 gets its usage and Spotify
+screens). It needs the Xcode command line tools to build:
+
+```sh
+./mac/build.sh --run
+```
+
+It looks for the display at `claude-display.local`; change `kHost` at the top
+of the file if yours has another name. It replaces the DeskSwitch from the
+desk-screen repo (same app id).
 
 ## Customizing
 

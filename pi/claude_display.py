@@ -765,7 +765,8 @@ class AddonScreen:
     def summary(self, model=None):
         m = self.manifest
         return {"id": self.id, "name": self.name, "version": m.get("version", ""),
-                "author": m.get("author", ""), "kind": "addon", "ready": True, "settings": self.settings,
+                "author": m.get("author", ""), "icon": m.get("icon", ""), "kind": "addon", "ready": True,
+                "settings": self.settings,
                 "status": self.status[0] if self.status and self.status[0] != "loading..." else None,
                 "error": self.draw_error}
 
@@ -897,7 +898,7 @@ class NativeScreen:
         m = self.manifest
         ready = model.demo or self.ready(model.cfg)
         return {"id": self.id, "name": self.name, "version": m.get("version", ""),
-                "author": m.get("author", ""), "kind": "native", "ready": ready,
+                "author": m.get("author", ""), "icon": m.get("icon", ""), "kind": "native", "ready": ready,
                 "needs_setup": not model.demo and (not ready or bool(self.hook("needs_setup", model.cfg))),
                 "settings": self.settings_values(model.cfg), "setup": m.get("setup") or None,
                 "status": None, "error": self.draw_error}
