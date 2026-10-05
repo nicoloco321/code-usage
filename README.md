@@ -135,7 +135,12 @@ from your everyday Claude Code session, so it won't disturb it.
 
 ### 2. Configure and flash the ESP32
 
-Edit [config.h](firmware/src/config.h):
+Copy the template, then edit your copy. `config.h` is gitignored, since it
+holds your Wi-Fi password and tokens:
+
+```sh
+cp firmware/src/config.h.example firmware/src/config.h
+```
 
 - `WIFI_SSID` / `WIFI_PASS` — your 2.4 GHz network (ESP32 has no 5 GHz)
 - `DEVICE_REFRESH_TOKEN` — the value printed by step 1
