@@ -30,7 +30,8 @@ from before it, not as new work.
 
 Hooks can't see two things: an Esc interrupt (Stop doesn't fire) and a tool
 running longer than the display's 5-minute backstop. watch() covers both; the
-Windows tray helper runs it, or run --watch yourself.
+Windows tray helper runs it, the Mac menu bar app runs a Swift port of it
+(mac/ClaudeHooks.swift), or run --watch yourself.
 
 No third-party dependencies.
 """
@@ -84,6 +85,10 @@ INTERRUPTED = "[Request interrupted by user"
 
 
 # ---------------------------------------------------------------- state file
+
+# mac/ClaudeHooks.swift reads and writes this file too, under the same lock: it
+# ports watch_once() and summary() (and install()) for the Mac menu bar app.
+# Change the state's shape, the summary, or the hook events, and change it too.
 
 def _retry(fn, secs=5):
     """Windows sometimes refuses a file for a moment (antivirus, the Store

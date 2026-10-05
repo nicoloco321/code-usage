@@ -1,235 +1,359 @@
-// DeskSwitch - a macOS menu bar switcher for the Claude Code usage display.
+// DeskSwitch - the Claude Code usage display, from the Mac menu bar: the Mac
+// version of the Windows tray helper (windows/claude_tray.py).
 //
-// The menu lists the screens installed on the display, so a screen you add
-// from the Screen Market shows up here by itself: the list is read again every
-// time the menu opens, and every 30 s for the menu bar glyph. It speaks the
-// display's HTTP API, the one the /switch Claude Code command uses:
+// The menu bar item is Clawd with a meter of your 5-hour usage under him; he
+// walks while Claude is working, on this Mac or any other. The menu has:
 //
-//   GET  /screens                        the installed screens and the one showing (Pi app)
+//   - your 5-hour and weekly usage and when they reset, read from the display
+//     (GET /usage) - or why it can't show them
+//   - the screens installed on the display, to switch between. A screen you
+//     add from the Screen Market shows up by itself; an ESP32 display, which
+//     can't list them, gets its own usage and Spotify screens.
+//   - Track Claude with hooks: installs the Claude Code hooks
+//     (server/display_hook.py) and runs their watcher - see ClaudeHooks.swift
+//   - Start at login
+//
+// It speaks the display's HTTP API, the one the /switch Claude Code command uses:
+//
+//   GET  /usage                          usage, the screen showing, whether Claude is working
+//   GET  /screens                        the installed screens (Pi app)
 //   POST /mode/<screen> | /mode/toggle   switch
-//   GET  /mode                           the screen showing (any display)
-//
-// An ESP32 display has no GET /screens: then the menu falls back to the
-// firmware's own screens.
+//   GET  /mode                           the screen showing (firmware older than /usage)
 //
 // Build with mac/build.sh, which produces DeskSwitch.app. It runs as an agent
 // (LSUIElement), so there is no Dock icon or main window - just the menu bar
-// item, whose glyph tracks whatever the display is currently showing.
+// item.
 
 import Cocoa
+import ServiceManagement
 
-private let kHost = "claude-display.local"
-private let kPort = 8080
-private let kTimeout: TimeInterval = 5   // headroom for a cold mDNS resolve
-private let kRefreshSeconds: TimeInterval = 30
+private let kPollSeconds: TimeInterval = 5     // re-read the display this often (it's on the LAN)
+private let kWatchSeconds: TimeInterval = 2    // the hooks' watcher, like the Windows tray's
+private let kFrameSeconds: TimeInterval = 0.5  // Clawd's walk
+private let kOfflineAfter = 2                  // failed polls in a row before the display counts as offline
 
-// ---------------------------------------------------------------- screens
-
-/// One screen on the display, as GET /screens lists it.
-struct Screen: Equatable {
-    let id: String
-    let name: String
-    let icon: String   // the Screen Market's emoji, "" if none
-
-    var title: String { icon.isEmpty ? name : "\(icon)  \(name)" }
-
-    /// Menu bar glyph, so the icon alone says what the panel is showing.
-    var symbol: String { Screen.symbols[id] ?? "display" }
-
-    static let symbols: [String: String] = [
-        "usage": "chart.bar.fill", "spotify": "music.note", "split": "rectangle.split.2x1.fill",
-        "bambu": "printer.fill", "planes": "airplane", "f1": "flag.checkered",
-        "metro": "tram.fill", "weather": "cloud.sun.fill", "world-clock": "clock.fill",
-        "countdown": "timer", "crypto": "bitcoinsign.circle.fill", "hacker-news": "newspaper.fill",
-    ]
-
-    /// What an ESP32 display has, since it can't list its screens.
-    static let firmware = [
-        Screen(id: "usage", name: "Claude Code usage", icon: ""),
-        Screen(id: "spotify", name: "Spotify now playing", icon: ""),
-    ]
+private func infoItem() -> NSMenuItem {
+    let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    item.isEnabled = false
+    return item
 }
-
-// ---------------------------------------------------------------- network
-
-/// Talks to the display, addressed by its mDNS hostname.
-///
-/// The shell commands have to pass `curl -4`, because a raw dual-stack
-/// getaddrinfo on a .local name stalls ~5s on the AAAA query that nothing
-/// answers - and on a cold mDNS cache it fails outright with EAI_NONAME.
-/// URLSession does not share that problem: CFNetwork resolves .local on its
-/// own path, measured at 369ms cold and ~90ms warm with no stalls. So hand the
-/// hostname straight to URLSession.
-///
-/// Do not "optimise" this by pre-resolving to an IPv4 literal - that was the
-/// first cut and it was both slower and flaky on a cold cache, on top of going
-/// stale whenever DHCP moves the device.
-final class Device {
-    /// `done(status, body)` on the main queue; status 0 when unreachable.
-    func send(path: String, method: String, done: @escaping (Int, Data?) -> Void) {
-        guard let url = URL(string: "http://\(kHost):\(kPort)\(path)") else {
-            DispatchQueue.main.async { done(0, nil) }
-            return
-        }
-        var req = URLRequest(url: url, timeoutInterval: kTimeout)
-        req.httpMethod = method
-        req.cachePolicy = .reloadIgnoringLocalCacheData   // never cached: it changes under us
-
-        URLSession.shared.dataTask(with: req) { data, response, _ in
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            DispatchQueue.main.async { done(code, data) }
-        }.resume()
-    }
-
-    static func text(_ data: Data?) -> String {
-        guard let data = data else { return "" }
-        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-
-// ---------------------------------------------------------------- menu
 
 final class Controller: NSObject, NSMenuDelegate {
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let device = Device()
     private let menu = NSMenu()
-    private let statusLine = NSMenuItem(title: "Checking…", action: nil, keyEquivalent: "")
-    private let firstFixed = NSMenuItem.separator()   // the screens go between statusLine and this
-    private var screens: [Screen] = []
+    private let statusLine = infoItem()
+    private let weeklyLine = infoItem()
+    private let workingLine = infoItem()
+    private let noteLine = infoItem()                 // what the last thing you did came to
+    private let firstFixed = NSMenuItem.separator()   // the screens go between the info lines and this
+    private let cycleItem = NSMenuItem(title: "Cycle to next", action: #selector(cycle), keyEquivalent: "t")
+    private let hooksItem = NSMenuItem(title: "Track Claude with hooks (exact)",
+                                       action: #selector(toggleHooks), keyEquivalent: "")
+    private let loginItem = NSMenuItem(title: "Start at login", action: #selector(toggleLogin), keyEquivalent: "")
     private var screenItems: [NSMenuItem] = []
-    private var current: String?
-    private var online = false
-    private var timer: Timer?
+    private var shownScreens: [Screen]?
+
+    private var display = DisplayState()
+    private var failures = kOfflineAfter
+    private var polling = false, pollAgain = false
+    private var frame = 0
+    private var iconKey = ""
+    private var note = ""
+    private var noteSeen = false
+
+    // The hooks. display_hook.py's path is baked in by build.sh.
+    private let hookScript = Bundle.main.object(forInfoDictionaryKey: "DisplayHookScript") as? String
+    private let watcher = HookWatcher()
+    private let hooksQueue = DispatchQueue(label: "DeskSwitch.hooks")   // settings.json and the watcher
+    private var hooksHost: String?   // where the installed hooks report, nil when they aren't installed
+    private var watching = false
 
     override init() {
         super.init()
 
         menu.delegate = self
-        statusLine.isEnabled = false
-        menu.addItem(statusLine)
+        menu.autoenablesItems = false   // offline, the display's items are greyed out by hand
+        for item in [statusLine, weeklyLine, workingLine, noteLine] { menu.addItem(item) }
         menu.addItem(.separator())
         menu.addItem(firstFixed)
 
-        let toggle = NSMenuItem(title: "Cycle to next", action: #selector(cycle), keyEquivalent: "t")
-        toggle.target = self
-        menu.addItem(toggle)
-
         let market = NSMenuItem(title: "Add screens from the Screen Market…",
                                 action: #selector(openMarketHelp), keyEquivalent: "")
-        market.target = self
-        menu.addItem(market)
-
+        for item in [cycleItem, market] {
+            item.target = self
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        for item in [hooksItem, loginItem] {
+            item.target = self
+            menu.addItem(item)
+        }
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit DeskSwitch",
                                 action: #selector(NSApplication.terminate(_:)),
                                 keyEquivalent: "q"))
 
         statusItem.menu = menu
-        setIcon()
+        update()
         refresh()
+        watch()
 
-        // Keeps the glyph and the list honest when they change elsewhere - a
-        // screen installed from the Screen Market, a tap on the display, the
-        // /switch command, another machine.
-        timer = Timer.scheduledTimer(withTimeInterval: kRefreshSeconds, repeats: true) { [weak self] _ in
-            self?.refresh()
+        // Keeps everything honest when it changes elsewhere - a screen
+        // installed from the Screen Market, a tap on the display, the /switch
+        // command, Claude starting work on another machine.
+        repeatEvery(kPollSeconds) { $0.refresh() }
+        repeatEvery(kWatchSeconds) { $0.watch() }
+        repeatEvery(kFrameSeconds) { $0.step() }
+    }
+
+    /// In the common modes, so the icon and the menu keep updating while the
+    /// menu is open.
+    private func repeatEvery(_ seconds: TimeInterval, _ action: @escaping (Controller) -> Void) {
+        let timer = Timer(timeInterval: seconds, repeats: true) { [weak self] _ in
+            if let self = self { action(self) }
         }
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     // -- what's on the display
 
-    /// Rebuild the screen items when the list changed; tick the one showing.
-    private func show(_ list: [Screen], current mode: String?) {
-        online = true
-        current = mode
-        if list != screens {
-            screens = list
-            for item in screenItems { menu.removeItem(item) }
-            screenItems = []
-            var at = menu.index(of: firstFixed)
-            if list.isEmpty {
-                let none = NSMenuItem(title: "No screens yet - add some from the Screen Market",
-                                      action: nil, keyEquivalent: "")
-                none.isEnabled = false
-                menu.insertItem(none, at: at)
-                screenItems.append(none)
-            }
-            for screen in list {
-                let item = NSMenuItem(title: screen.title, action: #selector(pick(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = screen.id
-                menu.insertItem(item, at: at)
-                screenItems.append(item)
-                at += 1
-            }
-        }
-        for item in screenItems {
-            item.state = (item.representedObject as? String) == mode ? .on : .off
-        }
-        let showing = list.first { $0.id == mode }
-        statusLine.title = showing.map { "Showing: \($0.name)" } ?? (list.isEmpty ? "No screens installed" : "Showing: \(mode ?? "?")")
-        setIcon()
-    }
-
-    private func unreachable() {
-        online = false
-        current = nil
-        statusLine.title = "Display unreachable"
-        setIcon()
-    }
-
-    /// Unreachable gets a neutral glyph rather than a stale screen's.
-    private func setIcon() {
-        let screen = screens.first { $0.id == current }
-        let name = online ? (screen?.symbol ?? "display") : "display.trianglebadge.exclamationmark"
-        let label = online ? "Claude display: \(screen?.name ?? current ?? "on")" : "Claude display unreachable"
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: label)
-            ?? NSImage(systemSymbolName: "display", accessibilityDescription: label)
-        image?.isTemplate = true          // let the menu bar tint it for light/dark
-        statusItem.button?.image = image
-        statusItem.button?.toolTip = label
-    }
-
+    /// Read the display again: /usage, then /screens - the ESP32 serves one
+    /// request at a time.
     private func refresh() {
-        device.send(path: "/screens", method: "GET") { [weak self] code, data in
-            guard let self = self else { return }
-            if code == 200, let data = data,
-               let info = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-                let installed = info["installed"] as? [[String: Any]] ?? []
-                let list = installed.compactMap { s -> Screen? in
-                    guard let id = s["id"] as? String, (s["ready"] as? Bool) != false else { return nil }
-                    return Screen(id: id, name: s["name"] as? String ?? id, icon: s["icon"] as? String ?? "")
-                }
-                self.show(list, current: info["mode"] as? String)
-            } else if code != 0 {
-                // An ESP32: it can't list its screens, but it says which one is up.
-                self.device.send(path: "/mode", method: "GET") { [weak self] code, data in
-                    if code == 200 {
-                        self?.show(Screen.firmware, current: Device.text(data))
-                    } else {
-                        self?.unreachable()
-                    }
-                }
-            } else {
-                self.unreachable()
+        if polling {
+            pollAgain = true
+            return
+        }
+        polling = true
+        device.send(path: "/usage", method: "GET") { [weak self] code, body in
+            self?.device.send(path: "/screens", method: "GET") { [weak self] scode, sbody in
+                self?.polled(usage: (code, body), screens: (scode, sbody))
             }
         }
+    }
+
+    private func polled(usage: (code: Int, body: Data?), screens: (code: Int, body: Data?)) {
+        var list = Screen.firmware
+        let info = screens.code == 200 ? Device.json(screens.body) : nil
+        if let info = info {   // the Pi app: its screens come from the Screen Market
+            list = Screen.installed(info)
+        }
+        if usage.code == 200, let data = Usage(json: usage.body) {
+            polled(list, usage: data, mode: data.mode)
+        } else if usage.code == 404, let info = info {   // no Claude Usage screen installed
+            polled(list, noUsage: true, mode: info["mode"] as? String)
+        } else if usage.code == 404 {   // older ESP32 firmware: no /usage, but /mode still works
+            device.send(path: "/mode", method: "GET") { [weak self] code, data in
+                if code == 0 {
+                    self?.pollFailed()
+                } else {
+                    self?.polled(list, legacy: true, mode: code == 200 ? Device.text(data) : nil)
+                }
+            }
+        } else {
+            pollFailed()
+        }
+    }
+
+    private func polled(_ screens: [Screen], usage: Usage? = nil, legacy: Bool = false,
+                        noUsage: Bool = false, mode: String?) {
+        display.checked = true
+        display.online = true
+        display.screens = screens
+        display.usage = usage
+        display.legacy = legacy
+        display.noUsage = noUsage
+        display.mode = mode
+        failures = 0
+        pollDone()
+    }
+
+    private func pollFailed() {
+        display.checked = true
+        failures += 1
+        // The ESP32 can't answer while it's mid-fetch, so one miss isn't "offline".
+        if failures >= kOfflineAfter { display.online = false }
+        pollDone()
+    }
+
+    private func pollDone() {
+        polling = false
+        update()
+        if pollAgain {
+            pollAgain = false
+            refresh()
+        }
+    }
+
+    /// Bring the menu and the icon up to date with what we know.
+    private func update() {
+        // Offline, the last list stays up, greyed out.
+        if display.online && display.screens != shownScreens { rebuildScreens() }
+        for item in screenItems {
+            item.state = (item.representedObject as? String) == display.mode ? .on : .off
+            item.isEnabled = display.online && item.representedObject != nil
+        }
+        cycleItem.isEnabled = display.online
+
+        statusLine.title = display.statusLine
+        weeklyLine.title = display.usageLine(\.sevenDay)
+        weeklyLine.isHidden = !display.usageKnown
+        workingLine.title = display.thinking ? "Claude is working…" : "Claude is idle"
+        workingLine.isHidden = !display.online
+        noteLine.title = note
+        noteLine.isHidden = note.isEmpty
+
+        hooksItem.state = hooksHost != nil ? .on : .off
+        hooksItem.isEnabled = hooksHost != nil || hookScript != nil   // removing them needs no script
+        setIcon()
+    }
+
+    private func rebuildScreens() {
+        shownScreens = display.screens
+        for item in screenItems { menu.removeItem(item) }
+        screenItems = []
+        var at = menu.index(of: firstFixed)
+        if display.screens.isEmpty {
+            let none = NSMenuItem(title: "No screens yet - add some from the Screen Market",
+                                  action: nil, keyEquivalent: "")
+            menu.insertItem(none, at: at)
+            screenItems.append(none)
+        }
+        for screen in display.screens {
+            let item = NSMenuItem(title: screen.title, action: #selector(pick(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = screen.id
+            menu.insertItem(item, at: at)
+            screenItems.append(item)
+            at += 1
+        }
+    }
+
+    private func setIcon() {
+        let walkFrame = display.thinking ? 1 + frame % 2 : 0
+        let pct = display.fivePct
+        let key = "\(pct.map { Int($0.rounded(.toNearestOrEven)) } ?? -1) \(display.online) \(walkFrame)"
+        if key != iconKey {
+            iconKey = key
+            let image = Clawd.image(pct: pct, online: display.online, frame: walkFrame)
+            image.accessibilityDescription = display.tooltip
+            statusItem.button?.image = image
+        }
+        statusItem.button?.toolTip = display.tooltip
+    }
+
+    /// Clawd's next step, while Claude is working.
+    private func step() {
+        frame += 1
+        if display.thinking { setIcon() }
     }
 
     // Opening the menu is the moment the list matters, so read it again then -
     // that's what makes a newly installed screen appear without waiting.
-    func menuWillOpen(_ menu: NSMenu) { refresh() }
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        noteSeen = !note.isEmpty
+    }
+
+    // A note stays until you've had the chance to read it.
+    func menuDidClose(_ menu: NSMenu) {
+        if noteSeen {
+            noteSeen = false
+            show(note: "")
+        }
+    }
+
+    private func show(note text: String) {
+        note = text
+        update()
+    }
+
+    // -- this Mac's Claude Code hooks
+
+    /// The hooks' watcher, every couple of seconds while they're installed:
+    /// it catches Esc interrupts and keeps the display awake through long
+    /// tool runs, and says whether Claude is working here.
+    private func watch() {
+        if watching { return }
+        watching = true
+        hooksQueue.async { [watcher] in
+            let ours = HookSettings.installed()
+            var working: Bool? = false
+            if let ours = ours {
+                let (host, port) = ours.isEmpty ? (kHost, kPort) : HookSettings.splitHost(ours)
+                working = watcher.watchOnce(host: host, port: port)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.watching = false
+                self.hooksHost = ours
+                if let working = working { self.display.localWorking = working }
+                self.update()
+            }
+        }
+    }
+
+    @objc private func toggleHooks() {
+        let script = hookScript
+        hooksQueue.async {
+            var problem = ""
+            do {
+                if HookSettings.installed() != nil {
+                    try HookSettings.uninstall()
+                } else if let script = script {
+                    try HookSettings.install(script: script, host: kHost, port: kPort)
+                }
+            } catch {
+                problem = "Couldn't update ~/.claude/settings.json: \(error.localizedDescription)"
+            }
+            let ours = HookSettings.installed()
+            DispatchQueue.main.async { [weak self] in
+                self?.hooksHost = ours
+                self?.show(note: problem)
+            }
+        }
+    }
 
     // -- actions
 
+    @objc private func toggleLogin() {
+        let service = SMAppService.mainApp
+        var problem = ""
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            problem = "Couldn't change Start at login: \(error.localizedDescription)"
+        }
+        if service.status == .requiresApproval {
+            problem = "Allow DeskSwitch in System Settings › General › Login Items"
+            SMAppService.openSystemSettingsLoginItems()
+        }
+        loginItem.state = service.status == .enabled ? .on : .off
+        show(note: problem)
+    }
+
     private func switchTo(_ path: String) {
-        statusLine.title = "Switching…"
+        show(note: "Switching…")
         device.send(path: path, method: "POST") { [weak self] code, data in
             guard let self = self else { return }
-            if code == 409 {
-                // Not set up yet: the display says what it needs.
-                self.statusLine.title = Device.text(data)
-                return
+            switch code {
+            case 200..<300:
+                self.show(note: "")
+            case 409:   // not set up yet: the display says what it needs
+                let text = Device.text(data)
+                self.show(note: text.isEmpty ? "That screen isn't set up on the display yet." : text)
+            case 404:
+                self.show(note: "This display doesn't have that screen - add it from the Screen Market.")
+            case 0:
+                self.show(note: "Couldn't reach the display at \(kHost).")
+            default:
+                self.show(note: "The display answered HTTP \(code).")
             }
             self.refresh()
         }
@@ -246,29 +370,5 @@ final class Controller: NSObject, NSMenuDelegate {
         if let url = URL(string: "https://github.com/nicoloco321/screen-market#run-it-on-casaos") {
             NSWorkspace.shared.open(url)
         }
-    }
-}
-
-// ---------------------------------------------------------------- main
-
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    // Held here so the status item outlives launch; nothing else retains it.
-    private var controller: Controller?
-
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        controller = Controller()
-    }
-}
-
-@main
-struct DeskSwitchApp {
-    static func main() {
-        let app = NSApplication.shared
-        // NSApplication.delegate is unowned, so this local has to outlive the
-        // call - it does, because run() only returns when the app quits.
-        let delegate = AppDelegate()
-        app.delegate = delegate
-        app.setActivationPolicy(.accessory)   // menu bar only, no Dock icon
-        app.run()
     }
 }

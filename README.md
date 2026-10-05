@@ -17,8 +17,8 @@ the 480x320 landscape boards are still supported (see [Hardware](#hardware)).
 No ESP32? The same display also runs as a **fullscreen Raspberry Pi app** that
 starts on boot ([Raspberry Pi edition](#raspberry-pi-edition)), and a
 **Windows tray helper** puts your usage next to the clock
-([Windows tray helper](#windows-tray-helper)), and a **Mac menu bar
-switcher** flips between screens ([Mac menu bar switcher](#mac-menu-bar-switcher)).
+([Windows tray helper](#windows-tray-helper)), and a **Mac menu bar app** does
+the same in the Mac menu bar ([Mac menu bar app](#mac-menu-bar-app)).
 Both list the screens installed on the display, so they keep up when you add one.
 
 ```
@@ -75,7 +75,7 @@ The ESP32 talks to Anthropic directly — **no companion server required**:
    polls. The repo ships a [`/switch` Claude Code command](.claude/commands/switch.md)
    that drives this. See [Spotify now-playing mode](#4-optional-spotify-now-playing-mode).
    `GET /usage` returns the numbers on screen as JSON (the Windows tray helper
-   reads it).
+   and the Mac menu bar app read it).
 
 > The old `server/claude_usage_server.py` (a Mac-side usage proxy) is no longer
 > needed and is kept only as a fallback. The display is self-contained now.
@@ -178,6 +178,9 @@ python3 server/display_hook.py --install --host 192.168.1.42    # macOS / Linux
 py -3 server\display_hook.py --install --host 192.168.1.42      # Windows
 ```
 
+Or tick **Track Claude with hooks** in the [Windows tray helper](#windows-tray-helper)
+or the [Mac menu bar app](#mac-menu-bar-app).
+
 It tracks each Claude Code session on the machine as **working**, **waiting**
 or **idle**:
 - **Working:** you submit a prompt, or a tool runs.
@@ -196,8 +199,9 @@ Hooks can't see two things:
 - **Esc interrupts:** Claude Code fires no hook for them.
 - **Tools running longer than the display's 5-minute backstop.**
 
-A watcher covers both. The [Windows tray helper](#windows-tray-helper) runs it
-automatically; elsewhere, run `display_hook.py --watch` alongside Claude Code.
+A watcher covers both. The [Windows tray helper](#windows-tray-helper) and the
+[Mac menu bar app](#mac-menu-bar-app) run it automatically; elsewhere, run
+`display_hook.py --watch` alongside Claude Code.
 Without it, an interrupted turn stays "working" until the 5-minute backstop
 (`BEACON_TTL_MS`) clears it.
 
@@ -466,22 +470,41 @@ changes it later (and re-points the hooks). Windows often resolves
 > rather than `%APPDATA%`. The hooks pin the same Python as the tray, so they
 > share it.
 
-## Mac menu bar switcher
+## Mac menu bar app
 
-[mac/DeskSwitch.swift](mac/DeskSwitch.swift) puts the display's screens in
-the Mac menu bar: pick one to switch to it, or **Cycle to next** (⌘T). The
-glyph shows what's on the display. The menu lists the screens installed on
-it, read again each time you open the menu, so a screen you add from the
-Screen Market shows up straight away (the ESP32 gets its usage and Spotify
-screens). It needs the Xcode command line tools to build:
+DeskSwitch ([mac/](mac/DeskSwitch.swift)) is the Mac version of the Windows
+tray helper, in the menu bar:
+
+- **Clawd with a 5-hour meter** under him (green / yellow / red). Hover for
+  both numbers; the menu has them with their reset times.
+- Clawd **walks** while Claude is working, on any of your machines.
+- The menu lists the **screens** installed on the display, read again each
+  time you open it, so a screen you add from the Screen Market shows up
+  straight away (the ESP32 gets its usage and Spotify screens). Pick one to
+  switch to it, or **Cycle to next** (⌘T).
+- **Track Claude with hooks (exact)** installs or removes the
+  [Claude Code hooks](#option-a--claude-code-hooks-recommended), and while
+  they're installed the app runs their watcher, which catches Esc interrupts
+  and keeps the display awake through long tool runs. The hooks run
+  `server/display_hook.py` from this checkout with `/usr/bin/python3`, so
+  rebuild the app if you move the repo. (The watcher is a Swift port of
+  `display_hook.py`'s, in [mac/ClaudeHooks.swift](mac/ClaudeHooks.swift).)
+- **Start at login.**
+- The first line of the menu says what's wrong when there are no numbers:
+  the display isn't reachable, its firmware predates `GET /usage`, or the Pi
+  has no Claude Usage screen installed.
+
+Like the tray helper, it reads everything from the display's `GET /usage`, so
+the Mac needs no Anthropic login. It needs macOS 13 or later, and the Xcode
+command line tools to build:
 
 ```sh
 ./mac/build.sh --run
 ```
 
 It looks for the display at `claude-display.local`; change `kHost` at the top
-of the file if yours has another name. It replaces the DeskSwitch from the
-desk-screen repo (same app id).
+of [mac/Display.swift](mac/Display.swift) if yours has another name. It
+replaces the DeskSwitch from the desk-screen repo (same app id).
 
 ## Customizing
 
