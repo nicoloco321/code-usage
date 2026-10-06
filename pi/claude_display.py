@@ -9,8 +9,10 @@ This file is the display itself: the screen, the HTTP API the hooks and
 beacons talk to, and the machinery screens plug into. The screens all come
 from the Screen Market (github.com/nicoloco321/screen-market): your Claude
 Code usage, Spotify, a Bambu Lab printer, planes overhead, Formula 1, the
-Washington Metro, weather, clocks... Pair the display with the market once (a
-code shows up on the screen) and install the ones you want; they land in
+Washington Metro, weather, clocks... Link the display to your account there
+once (it shows a code to type in) and install the ones you want from any
+browser; the display checks in with the market for them (MarketLink), so
+nothing on your network needs opening up. They land in
 ~/.local/share/claude-display/screens. Until then it shows how to do that.
 
   - beacons: POST /thinking/on while Claude works, /thinking/off when done
@@ -356,6 +358,8 @@ class Model:
         self.ip = ""
         self.layout = None         # the renderer's, for GET /screens
         self.pairing = Pairing(state)
+        self.link = None           # the MarketLink, if this display links to a Screen Market
+        self.reporting = False     # telling the market what a job did: a restart waits
         self.addons = ScreenStore(screens or SCREENS_DIR)  # the installed screens: see ScreenStore
         self.addons.load_all(self)
         saved = state.get("mode")
@@ -464,6 +468,8 @@ class Model:
                 mode=self.mode, sessions=self.sessions_now(now),
                 addon=addon, addon_view=addon.view() if addon else None, native=native,
                 pair_code=self.pairing.showing, screens=len(self.modes()),
+                link_code=self.link and self.link.code, link_url=self.link and self.link.code_url,
+                market=self.link and self.link.site,
                 thinking=self.thinking(now), flash=flash and flash[:2],
                 host=self.host, ip=self.ip, port=self.cfg.port, mono=now, **fields)
 
@@ -745,6 +751,9 @@ SCREEN_FILE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 SCREEN_MAX_BYTES = 4 * 1024 * 1024  # one install, all files together
 PAIR_SECS = 180
 PAIR_TRIES = 5
+# The Screen Market this display links to ([market] url in config.ini
+# overrides it; set that to nothing to turn linking off).
+MARKET_URL = ""
 
 
 def display_version():
@@ -1547,6 +1556,190 @@ class ScreenUI:
         return {"landscape": 768, "portrait": 168, "bar": 1452, "strip": 296}[self.layout]
 
 
+# ---------------------------------------------------------------- screen calls
+
+def screens_info(m):
+    """What's installed, and what this display is (GET /screens, and what it
+    reports to the Screen Market)."""
+    return {
+        "api": SCREEN_API, "native_api": NATIVE_API, "version": m.version,
+        "host": m.host, "ip": m.ip, "mode": m.mode,
+        "layout": m.layout, "design_size": Renderer.LAYOUTS.get(m.layout),
+        "installed": [a.summary(m) for a in map(m.addons.get, m.addons.ids()) if a],
+        "failed": m.addons.failed, "restarting": m.restart}
+
+
+def show_screen(m, want):
+    """Switch to a screen (or "toggle"): (HTTP status, message)."""
+    if want == "toggle":
+        want = m.next_mode()
+    if want == m.mode or m.set_mode(want):
+        return 200, want
+    if not m.modes():
+        return 409, "no screens installed yet - add some from the Screen Market"
+    if want not in m.modes():
+        return 404, f"no {want} screen on this display"
+    native = m.native(want)
+    return 409, getattr(native and native.mod, "NOT_READY", f"the {want} screen isn't set up yet")
+
+
+def screen_action(m, path, body):
+    """Install, configure or remove a screen: (HTTP status, reply). The paths
+    are the HTTP API's - POST /screens/install, /screens/<id>/settings,
+    /screens/<id>/uninstall - which MarketLink's jobs use too."""
+    if path == "/screens/install":
+        try:
+            screen = m.addons.install(body.get("manifest"), body.get("files"), body.get("settings"), m)
+        except ValueError as e:
+            return 400, {"error": str(e)}
+        except OSError as e:
+            return 500, {"error": f"couldn't save it: {e}"}
+        if screen is None:  # a native screen: it's in, once the display restarts
+            if body.get("show", True):
+                m.state.put("mode", body["manifest"]["id"])
+            return 200, {"ok": True, "restarting": True}
+        if body.get("show", True):
+            m.set_mode(screen.id)
+        m.flash(f"installed {screen.name}", COL_GREEN)
+        return 200, {"ok": True, "screen": screen.summary(m)}
+    parts = path.split("/")  # ["", "screens", id, action]
+    if len(parts) == 4 and (m.addons.get(parts[2]) or parts[2] in m.addons.failed):
+        sid, action = parts[2], parts[3]
+        if action == "uninstall" and not m.addons.get(sid):  # one that didn't load
+            shutil.rmtree(os.path.join(m.addons.folder, sid), ignore_errors=True)
+            m.addons.failed.pop(sid, None)
+            m.addons.remember_order(sid, keep=False)
+            return 200, {"ok": True}
+        if action == "uninstall":
+            if m.mode == sid:
+                nxt = m.next_mode()
+                if nxt == sid or not m.set_mode(nxt):
+                    with m.lock:
+                        m.mode = WELCOME
+            m.addons.uninstall(sid, m)
+            return 200, {"ok": True, "restarting": m.restart}
+        if action == "settings" and m.addons.get(sid):
+            try:
+                screen = m.addons.configure(sid, body.get("settings") or {}, m)
+            except Exception as e:
+                return 400, {"error": f"{type(e).__name__}: {e}"}
+            return 200, {"ok": True, "restarting": m.restart, "screen": screen.summary(m)}
+    return 404, {"error": "no such screen or action"}
+
+
+class MarketLink:
+    """The display's line to the Screen Market, from the inside out - so it
+    works behind any home router, with nothing to open up.
+
+    Not linked yet: it asks the market for a code, shows it (with a QR code)
+    until someone signed in there types it in, and gets a token for it. Linked:
+    it checks in - what's installed, what it just did - and the market answers
+    as soon as there's something to do (install, settings, show, uninstall),
+    or after LINK_WAIT seconds of nothing. Unlinked from the website, it starts
+    over with a new code.
+    """
+    LINK_WAIT = 25  # the market's long-poll; our timeout is longer
+
+    def __init__(self, model, url):
+        self.m, self.url = model, url.rstrip("/")
+        self.site = urllib.parse.urlsplit(self.url).netloc or self.url
+        self.code = None      # the code to type in, while not linked
+        self.code_url = None  # the same, as a link (the QR code)
+
+    @property
+    def token(self):
+        return self.m.state.get("market_token")
+
+    def call(self, path, body, token=None, timeout=None):
+        headers = {"Content-Type": "application/json", "User-Agent": "claude-display"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        code, raw, _ = http(self.url + path, json.dumps(body).encode(), headers,
+                            timeout=timeout or self.LINK_WAIT + 20, method="POST")
+        try:
+            data = json.loads(raw or b"{}")
+        except ValueError:
+            data = {}
+        return code, data if isinstance(data, dict) else {}
+
+    def run(self):
+        wait = 5
+        while True:
+            try:
+                if self.token:
+                    self.check_in()
+                else:
+                    self.link()
+                wait = 5
+            except (OSError, ValueError) as e:  # offline, the market's down...
+                log(f"screen market: {e} - trying again in {wait}s")
+                time.sleep(wait)
+                wait = min(wait * 2, 300)
+
+    def link(self):
+        code, r = self.call("/api/device/link", {"host": self.m.host, "layout": self.m.layout,
+                                                 "version": self.m.version}, timeout=20)
+        if code != 200 or not r.get("code"):
+            raise OSError(f"asking for a link code: HTTP {code} {r.get('error', '')}".strip())
+        self.code, self.code_url = r["code"], r.get("url")
+        log(f"screen market: sign in at {self.url} and link this display with code {self.code}")
+        until = time.monotonic() + int(r.get("expires_in") or 900) - 10
+        while time.monotonic() < until:
+            code, got = self.call("/api/device/link/poll", {"poll": r["poll"]})
+            if code == 200 and got.get("token"):
+                self.m.state.put("market_token", got["token"])
+                self.code = self.code_url = None
+                self.m.flash("linked to the Screen Market", COL_GREEN)
+                log("screen market: linked")
+                return
+            if code == 404:
+                return  # expired: ask for a new one
+            if code != 200:
+                raise OSError(f"waiting to be linked: HTTP {code}")
+
+    def check_in(self):
+        results = []
+        while True:
+            self.m.reporting = bool(results)  # a restart waits until the market has heard
+            try:
+                code, r = self.call("/api/device/sync", {"status": screens_info(self.m), "results": results,
+                                                         "wait": not results}, token=self.token)
+            finally:
+                self.m.reporting = False
+            if code == 401:
+                log("screen market: unlinked from the website - showing a new code")
+                self.m.state.put("market_token", None)
+                return
+            if code != 200:
+                raise OSError(f"checking in: HTTP {code}")
+            jobs = r.get("jobs") or []
+            if jobs:
+                self.m.reporting = True  # hold any restart a job asks for
+            results = [self.do(job) for job in jobs if isinstance(job, dict)]
+
+    def do(self, job):
+        """Carry out one job from the market: {"id", "code", "reply"}."""
+        action, sid = job.get("action"), str(job.get("screen") or "")
+        try:
+            if action == "install":
+                code, reply = screen_action(self.m, "/screens/install", {
+                    "manifest": job.get("manifest"), "files": job.get("files"),
+                    "settings": job.get("settings"), "show": job.get("show", True)})
+            elif action in ("settings", "uninstall") and SCREEN_ID.match(sid):
+                code, reply = screen_action(self.m, f"/screens/{sid}/{action}",
+                                            {"settings": job.get("settings") or {}})
+            elif action == "show" and SCREEN_ID.match(sid):
+                code, text = show_screen(self.m, sid)
+                reply = {"ok": True} if code == 200 else {"error": text}
+            else:
+                code, reply = 400, {"error": f"this display doesn't know how to {action!r}"}
+        except Exception as e:
+            log(f"screen market: {action} {sid} failed\n{traceback.format_exc()}")
+            code, reply = 500, {"error": f"{type(e).__name__}: {e}"}
+        log(f"screen market: {action} {sid} -> {code}")
+        return {"id": job.get("id"), "code": code, "reply": reply}
+
+
 # ---------------------------------------------------------------- http server
 
 class BeaconHandler(BaseHTTPRequestHandler):
@@ -1596,17 +1789,8 @@ class BeaconHandler(BaseHTTPRequestHandler):
         elif path.startswith("/screens"):
             self._screens(path)
         elif path.startswith("/mode/") and path[6:] in m.modes() + ("toggle",):
-            want = path[6:]
-            if want == "toggle":
-                want = m.next_mode()
-            if want == m.mode or m.set_mode(want):
-                self._send(200, want + "\n")
-            elif not m.modes():
-                self._send(409, "no screens installed yet - add some from the Screen Market\n")
-            else:
-                native = m.native(want)
-                self._send(409, getattr(native and native.mod, "NOT_READY",
-                                        f"the {want} screen isn't set up yet") + "\n")
+            code, text = show_screen(m, path[6:])
+            self._send(code, text + "\n")
         elif any(n.hook("route", self, m, path) for n in m.addons.natives()):
             pass  # a screen's own page (the Metro's station picker, the planes log...)
         elif path == "/":
@@ -1629,14 +1813,7 @@ class BeaconHandler(BaseHTTPRequestHandler):
         """
         m = self.model
         if path == "/screens" and self.command == "GET":
-            r = Renderer.LAYOUTS
-            self._json(200, {
-                "api": SCREEN_API, "native_api": NATIVE_API, "version": m.version,
-                "host": m.host, "ip": m.ip, "mode": m.mode,
-                "layout": m.layout, "design_size": r.get(m.layout),
-                "installed": [a.summary(m) for a in map(m.addons.get, m.addons.ids()) if a],
-                "failed": m.addons.failed, "restarting": m.restart,
-                "paired": self._authed()})
+            self._json(200, dict(screens_info(m), paired=self._authed()))
             return
         if self.command != "POST":
             self._send(405, "use POST\n")
@@ -1665,53 +1842,7 @@ class BeaconHandler(BaseHTTPRequestHandler):
         if not self._authed():
             self._json(401, {"error": "not paired - pair with the display first"})
             return
-        if path == "/screens/install":
-            try:
-                screen = m.addons.install(body.get("manifest"), body.get("files"),
-                                          body.get("settings"), m)
-            except ValueError as e:
-                self._json(400, {"error": str(e)})
-                return
-            except OSError as e:
-                self._json(500, {"error": f"couldn't save it: {e}"})
-                return
-            if screen is None:  # a native screen: it's in, once the display restarts
-                if body.get("show", True):
-                    m.state.put("mode", body["manifest"]["id"])
-                self._json(200, {"ok": True, "restarting": True})
-                return
-            if body.get("show", True):
-                m.set_mode(screen.id)
-            m.flash(f"installed {screen.name}", COL_GREEN)
-            self._json(200, {"ok": True, "screen": screen.summary(m)})
-            return
-        parts = path.split("/")  # ["", "screens", id, action]
-        if len(parts) == 4 and (m.addons.get(parts[2]) or parts[2] in m.addons.failed):
-            sid, action = parts[2], parts[3]
-            if action == "uninstall" and not m.addons.get(sid):  # one that didn't load
-                shutil.rmtree(os.path.join(m.addons.folder, sid), ignore_errors=True)
-                m.addons.failed.pop(sid, None)
-                m.addons.remember_order(sid, keep=False)
-                self._json(200, {"ok": True})
-                return
-            if action == "uninstall":
-                if m.mode == sid:
-                    nxt = m.next_mode()
-                    if nxt == sid or not m.set_mode(nxt):
-                        with m.lock:
-                            m.mode = WELCOME
-                m.addons.uninstall(sid, m)
-                self._json(200, {"ok": True, "restarting": m.restart})
-                return
-            if action == "settings" and m.addons.get(sid):
-                try:
-                    screen = m.addons.configure(sid, body.get("settings") or {}, m)
-                except Exception as e:
-                    self._json(400, {"error": f"{type(e).__name__}: {e}"})
-                    return
-                self._json(200, {"ok": True, "restarting": m.restart, "screen": screen.summary(m)})
-                return
-        self._json(404, {"error": "no such screen or action"})
+        self._json(*screen_action(m, path, body))
 
     def _authed(self):
         return self.model.pairing.allowed(self.headers.get("Authorization"))
@@ -1984,7 +2115,8 @@ class Renderer:
     def scene_key(self, snap, now):
         """Everything but the spinner's animation that changes the picture -
         redraw the whole screen only when this does."""
-        key = (snap.mode, snap.flash, snap.host, snap.ip, now.strftime("%Y%m%d%H%M"), snap.pair_code)
+        key = (snap.mode, snap.flash, snap.host, snap.ip, now.strftime("%Y%m%d%H%M"), snap.pair_code,
+               snap.link_code)
         if snap.addon:
             a = snap.addon
             tick = int(snap.mono * a.fps) if a.fps else None
@@ -2031,30 +2163,74 @@ class Renderer:
                 ui.text(line, ui.content_left, ui.top + 30 + i * 24, 16, COL_RED)
 
     def _welcome(self, surf, snap, now):
-        """No screens yet (or none set up): how to get some."""
+        """No screens yet (or none set up): how to get some - with the code to
+        link this display to the Screen Market, while it isn't."""
         ui = ScreenUI(self, surf, SimpleNamespace(id=WELCOME, color=COL_ORANGE, settings={}, folder=""))
         L, x0, x1 = self.layout, ui.content_left, ui.content_right
         title = "No screens yet" if not snap.screens else "Your screens need setting up"
-        lines = ("Add some from the Screen Market: pair this display with it, then pick "
-                 "the ones you want - your Claude usage, Spotify, weather, clocks and more.",
-                 f"This display is {snap.host}.local  ({snap.ip or 'no network yet'})")
+        if snap.link_code:
+            lines = (f"Sign in at {snap.market}, go to My display and type in this code (or scan "
+                     "the QR code), then pick the screens you want.",)
+        elif snap.market:
+            lines = (f"Pick some at {snap.market} - your Claude usage, Spotify, weather, clocks "
+                     "and more - and they show up here.",)
+        else:
+            lines = ("Add some from the Screen Market: pair this display with it, then pick "
+                     "the ones you want - your Claude usage, Spotify, weather, clocks and more.",)
+        if not (snap.link_code and L == "bar"):  # no room on a bar next to the code
+            lines += (f"This display is {snap.host}.local  ({snap.ip or 'no network yet'})",)
+        qr = None  # (x, y, size) of the QR code
         if L == "bar":
             self.mascot(surf, 40, 70, 12)
             x0, top, size = 260, 100, 40
+            if snap.link_url:
+                qr = (x1 - 230, 45, 230)
         elif L == "strip":
             self.mascot(surf, 82, 90, 13)
             top, size = 300, 32
+            if snap.link_url:
+                qr = (x0, 1050, x1 - x0)
         else:
             k = 1 if L == "landscape" else 0.42
             self.mascot(surf, x0, 30 * k + 12, 7 * k)
             top, size = (150, 34) if L == "landscape" else (76, 15)
+            if snap.link_url and L == "landscape":
+                qr = (x1 - 210, 130, 210)
+        if qr and L != "strip":
+            x1 = qr[0] - 30
         ui.text(ui.fit(title, x1 - x0, size, True), x0, top, size, COL_ORANGE, bold=True)
         y = top + size * 0.6
         for i, text in enumerate(lines):
-            for line in ui.wrap(text, x1 - x0, size * 0.55, lines=2 if L in ("landscape", "bar") else 6):
+            for line in ui.wrap(text, x1 - x0, size * 0.55, lines=3 if L in ("landscape", "bar") else 7):
                 y += size * 0.85
                 ui.text(line, x0, y, size * 0.55, COL_SUB if i == 0 else COL_DIM)
             y += size * 0.3
+            if i == 0 and snap.link_code:  # the code, big, under what to do with it
+                y += size * (1.3 if L == "bar" else 1.7)
+                code_size = self.fit_size(snap.link_code, x1 - x0, size * (1.3 if L == "bar" else 1.6),
+                                          bold=True, smallest=10)
+                ui.text(snap.link_code, x0, y, code_size, COL_TEXT, bold=True)
+                y += size * 0.2
+        if qr:
+            self.qr_code(surf, snap.link_url, *qr)
+
+    def qr_code(self, surf, link, x, y, size):
+        """A QR code of `link`, `size` design units square, top-left at (x, y)."""
+        px = self.n(size)
+        cache = getattr(self, "qr_cache", {})
+        img = cache.get((link, px))
+        if img is None:
+            grid = qr_matrix(link.encode())
+            n = len(grid) + 8  # with its quiet zone
+            cell = max(1, px // n)
+            img = pygame.Surface((n * cell, n * cell))
+            img.fill((255, 255, 255))
+            for gy, row in enumerate(grid):
+                for gx, dark in enumerate(row):
+                    if dark:
+                        img.fill((0, 0, 0), (cell * (gx + 4), cell * (gy + 4), cell, cell))
+            self.qr_cache = {(link, px): img}
+        surf.blit(img, (self.x(x) + (px - img.get_width()) // 2, self.y(y) + (px - img.get_height()) // 2))
 
     def _addon(self, surf, snap, now):
         """An add-on screen draws itself; if it throws, say so on the screen."""
@@ -2106,6 +2282,9 @@ class Renderer:
         addr = f"{snap.host}.local  {snap.ip}".rstrip()
         status = snap.flash or (snap.addon_view[2] if snap.addon else
                                 snap.native.hook("status", snap) if snap.native else None)
+        if status is None and snap.link_code and (snap.addon or snap.native):
+            # screens installed, but not linked to the market: where to do that
+            status = (f"Screen Market code {snap.link_code}", COL_ORANGE)
         if self.working_note(snap):
             # Only the usage screen has the big spinner, so on the others Claude
             # working shows up here - the Pi's stand-in for the ESP32's LED.
@@ -2380,6 +2559,10 @@ def main():
     for native in natives:
         native.hook("on_layout", model, renderer)  # e.g. how big Spotify's album art is
     renderer.warm_spinner()  # draw the spark's frames now, not mid-animation
+    market = cfg.get("market", "url", MARKET_URL)  # once the layout's known: the market shows it
+    if market and not args.demo:
+        model.link = MarketLink(model, market)
+        forever(model.link.run)
     log(f"screen {sw}x{sh}, rotate {rotate}, {renderer.layout} layout")
 
     def present(*rects):
@@ -2424,7 +2607,7 @@ def main():
                     else:
                         model.toggle_mode()
 
-            if model.restart:  # screens or settings changed: start again with them
+            if model.restart and not model.reporting:  # screens or settings changed: start again with them
                 log("restarting with the new screens / settings")
                 time.sleep(0.5)  # let the HTTP reply go out
                 pygame.quit()

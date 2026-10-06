@@ -185,8 +185,9 @@ PORT="$(conf_get server port)"
 say "Done"
 echo "The display answers at  http://$(hostname).local:${PORT:-8080}  ($(hostname -I 2>/dev/null | awk '{print $1}'))"
 echo "Point your Claude Code hooks or beacon.py at it - see the README."
-echo "Screens come from the Screen Market (github.com/nicoloco321/screen-market): pair"
-echo "this display with it, then add the ones you want - start with Claude Usage."
+echo "Screens come from the Screen Market (github.com/nicoloco321/screen-market): sign in"
+echo "there, link this display with the code it shows, then add the ones you want -"
+echo "start with Claude Usage."
 [ "$MODE" = service ] && echo "Logs: journalctl -u claude-display -f"
 if [ "$NEED_REBOOT" = 1 ]; then
   if interactive && ask "Reboot now to finish?" y; then

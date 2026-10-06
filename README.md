@@ -374,8 +374,11 @@ the screen from its own Power port.
 **Screens.** The Pi app comes with no screens of its own: they all come from
 the [**Screen Market**](https://github.com/nicoloco321/screen-market), a web
 app you run in Docker (on CasaOS, say). Until you add some, the display shows
-how. Pair it once (a code appears on the display; type it into the market),
-then pick screens and they appear a few seconds later. Some to start with:
+how. Link it to your account there once (it shows a code; sign in and type it
+in, or scan its QR code), then pick screens from any browser and they appear
+a few seconds later. The display connects out to the market, so it works
+behind any router. Point it at your market with `[market] url` in config.ini.
+Some to start with:
 
 | Screen | What it shows | Setup |
 |---|---|---|
@@ -550,7 +553,7 @@ replaces the DeskSwitch from the desk-screen repo (same app id).
 | Pi: "the buttons need a new spotify login" | The Spotify login predates the buttons, so it can't control playback. Re-run `python3 server/spotify_login.py --config ~/.config/claude-display/config.ini`, then restart the display |
 | Pi: "the buttons need Spotify Premium" | Spotify only takes playback commands from Premium accounts. Now playing and the queue still work |
 | Pi: "no active Spotify device" | Spotify has nothing to send the command to, e.g. playback was paused long ago. Start playing on any device, then the buttons work |
-| Pi: "No screens yet" | Every screen comes from the [Screen Market](https://github.com/nicoloco321/screen-market): run it, pair the display (a code shows on the screen) and add some |
+| Pi: "No screens yet" | Every screen comes from the [Screen Market](https://github.com/nicoloco321/screen-market): sign in there, link the display with the code it shows, and add some. No code on screen? Set `[market] url` in config.ini, and check `journalctl -u claude-display` for why it can't reach the market |
 | Pi: a screen says it isn't set up (or `POST /mode/...` answers 409) | It needs a key, location or login first: see its page in the Screen Market, which says what and can take most of them |
 | Pi: blank screen, service keeps restarting | `journalctl -u claude-display -e`. "could not open the screen" on Lite means no KMS driver: `/boot/firmware/config.txt` needs `dtoverlay=vc4-kms-v3d` (the default). Re-run `bash pi/install.sh` to fix group access |
 | Pi: picture has black borders or is cut off | Turn off overscan (`sudo raspi-config` → Display Options), or force a mode with `size = WxH` in config.ini |
