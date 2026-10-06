@@ -1,7 +1,5 @@
 # Claude Code Usage Display
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/nicoloco321)
-
 An ESP32 + SPI TFT desk display for your Claude Code rate limits. The default
 build targets the **Waveshare ESP32-C6-LCD-1.47** (a 172x320 portrait panel);
 the 480x320 landscape boards are still supported (see [Hardware](#hardware)).
@@ -561,3 +559,5 @@ replaces the DeskSwitch from the desk-screen repo (same app id).
 | Pi: picture has black borders or is cut off | Turn off overscan (`sudo raspi-config` → Display Options), or force a mode with `size = WxH` in config.ini |
 | Tray icon is grey / "Display not reachable" | Set the right address with **Display address…** in the tray menu (the IP from the display's status line always works) |
 | Tray says "Re-flash the display firmware" | The ESP32 predates `GET /usage`; flash this version. Switching screens and beacons work either way |
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/nicoloco321)
