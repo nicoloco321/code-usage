@@ -1,5 +1,7 @@
 # Claude Code Usage Display
 
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/nicoloco321)
+
 An ESP32 + SPI TFT desk display for your Claude Code rate limits. The default
 build targets the **Waveshare ESP32-C6-LCD-1.47** (a 172x320 portrait panel);
 the 480x320 landscape boards are still supported (see [Hardware](#hardware)).
