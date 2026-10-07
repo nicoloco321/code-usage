@@ -402,6 +402,13 @@ a screen like Spotify, which plugs into the display itself, restarts it too.
 - Tap the screen (or click, or press Space) to switch screens, in the order
   you installed them. `POST /mode/<screen>` or `/mode/toggle` does it too.
   Ctrl+Q quits. A tap on a screen's own buttons (Spotify's) presses them.
+- Swipe down from the top edge for the **home menu**: every screen in equal
+  sections (side by side, or stacked on a tall screen), each with how it's
+  doing. Tap one to show it; swipe it back up (or leave it a minute) to
+  close it. Its **Settings** page keeps the details you'll want later: the
+  display's address and port, the command that points a computer's Claude
+  Code hooks at it, the logins its screens need, and how to SSH in, restart,
+  read the logs and update. With a keyboard, the down arrow or M opens it.
 - The Pi has no status LED, so while Claude works, screens without a spinner
   of their own show a small one and "Claude is working..." in the status line.
 - Some screens have a setup step of their own on the Pi:

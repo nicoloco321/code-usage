@@ -17,7 +17,8 @@ nothing on your network needs opening up. They land in
 
   - beacons: POST /thinking/on while Claude works, /thinking/off when done
     (Claude Code hooks or beacon.py); every screen shows a spinner then
-  - screens: POST /mode/<screen>, /mode/toggle, or tap the screen; GET /mode
+  - screens: POST /mode/<screen>, /mode/toggle, tap the screen, or pick one
+    from the home menu (swipe down from the top edge); GET /mode
   - add-on screens: GET /screens, and the pairing and install calls the
     Screen Market makes (see BeaconHandler._screens)
 
@@ -35,13 +36,17 @@ pi/install.sh sets everything up to start fullscreen on boot. Needs pygame 2
 
 Keys: tap / click / space switches screens, Ctrl+Q quits (Esc too, windowed).
 A screen can have buttons of its own (Spotify's play / pause, say): a tap on
-one presses it instead.
+one presses it instead. Swipe down from the top edge (or drag with the mouse,
+or press the down arrow or M) for the home menu: every screen, to tap the one
+you want, and Settings with the display's address, its logins and the Pi's
+commands. Swipe it back up, or press Esc.
 """
 
 import argparse
 import base64
 import configparser
 import datetime
+import getpass
 import hashlib
 import importlib.util
 import io
@@ -2422,6 +2427,762 @@ class Renderer:
         return snap.native.hook("draw_frame", self, surf, snap)
 
 
+# ---------------------------------------------------------------- the home menu
+
+MENU_SECS = 0.25     # sliding all the way down or back up
+MENU_IDLE_SECS = 60  # left down with nobody touching it, it goes back up
+# For the commands on the Settings page. DejaVu's ships with Raspberry Pi OS;
+# the others let you try the menu on a desktop. Falls back to the regular font.
+MONO_CANDIDATES = ["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                   r"C:\Windows\Fonts\consola.ttf",
+                   "/System/Library/Fonts/Supplemental/Andale Mono.ttf"]
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the code-usage checkout
+
+
+def mix(a, b, t):
+    """Colour a, t of the way to colour b."""
+    return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def tilde(path):
+    """A path with your home folder as ~, the way you'd type it."""
+    path, home = os.path.abspath(path), os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+class HomeMenu:
+    """The home menu: every installed screen in equal sections. Swipe down
+    from the top edge (or press the down arrow, or M) and it slides down over
+    whatever's showing; tap a section to show that screen, or swipe it back up.
+    Its Settings page has the details you'll want later: where the display
+    is, how to point Claude Code at it, the logins its screens need, and how
+    to look after the Pi.
+
+    The sections sit side by side on wide layouts (landscape, bar) and stack
+    on tall ones (portrait, strip). The main loop hands it every touch first
+    (press / drag / release) and, while it's down, lets it draw (frame)."""
+
+    # Where it all goes, in each layout's design units (the title row is in
+    # header): the screens' sections or the settings' cards, the gap between
+    # them, the handle at the bottom edge (centre x, centre y, w, h), and the
+    # biggest text the settings' cards use.
+    BODY = {"landscape": (32, 100, 736, 336), "bar": (28, 76, 1424, 214),
+            "portrait": (12, 46, 156, 252), "strip": (24, 256, 272, 1164)}
+    GAP = {"landscape": 12, "bar": 16, "portrait": 6, "strip": 14}
+    NARROWEST = {"landscape": 80, "bar": 96, "portrait": 26, "strip": 110}  # a section, before a 2nd row
+    GRIP = {"landscape": (400, 458, 64, 6), "bar": (740, 305, 72, 6),
+            "portrait": (90, 310, 36, 4), "strip": (160, 1450, 80, 8)}
+    TEXT = {"landscape": 14, "bar": 15, "portrait": 8, "strip": 16}
+
+    def __init__(self, model, renderer):
+        self.m, self.r = model, renderer
+        self.W, self.H = renderer.W, renderer.H  # the canvas, in pixels
+        short = min(self.W, self.H)
+        self.slop = max(8, short * 0.035)       # a touch that moves less is a tap
+        self.travel = short * 0.65              # a pull this long brings it all the way down
+        self.zone = min(self.H * 0.2, self.W * 0.3)  # a pull starts this near the top edge
+        self.pos = 0.0          # 0 = up out of sight, 1 = all the way down
+        self.slide = None       # (from, to, when) while it slides on its own
+        self.touch = None       # the touch being followed (see press)
+        self.fresh = False      # just coming down: keep a copy of the screen under it first
+        self.stale = False      # going back up: draw that screen afresh (it may be another one now)
+        self.page = "screens"   # or "settings"
+        self.sheet = 0          # which page of cards Settings is on (portrait has a few)
+        self.surf = None        # the menu, drawn
+        self.under = None       # the screen it slides over
+        self.key = None         # what self.surf shows
+        self.drawn = None       # how far down it was last put on the canvas
+        self.hits = []          # [(rect, what tapping there does)] as last drawn
+        self.touched = 0.0      # when anyone last touched it
+        self.icons = {}         # (screen id, px, ready) -> its icon
+        self.backs = {}         # (colour, size, radius, showing) -> a section's card
+        self.logo_r = None      # (scale, a landscape Renderer) for drawing logos (see logo)
+        self.mono_path = next((p for p in MONO_CANDIDATES if os.path.exists(p)), None)
+        self.mono_fonts = {}
+        self.health = (-1e9, None)
+        depth = self.r.n(18)    # the shadow it casts on the screen while it slides
+        self.shadow = pygame.Surface((self.W, depth), pygame.SRCALPHA)
+        for i in range(depth):
+            self.shadow.fill((0, 0, 0, round(130 * (1 - i / depth) ** 2)), (0, i, self.W, 1))
+
+    @property
+    def out(self):
+        """Is it on the screen, or on its way?"""
+        return self.pos > 0 or self.fresh or self.moving
+
+    @property
+    def moving(self):
+        return self.slide is not None or bool(self.touch and self.touch.pull)
+
+    def open(self):
+        if not self.out:
+            self.fresh, self.page = True, "screens"
+        self.touched = time.monotonic()
+        self.glide(1.0)
+
+    def close(self):
+        self.glide(0.0)
+
+    def glide(self, to):
+        self.slide = (self.pos, to, time.monotonic())
+        self.stale = self.stale or to == 0
+
+    # -- touches, in canvas pixels
+    def press(self, pos):
+        x, y = pos
+        self.touch = SimpleNamespace(x0=x, y0=y, x=x, y=y, pull=None, trail=[(time.monotonic(), y)])
+        self.touched = time.monotonic()
+
+    def drag(self, pos):
+        """The finger moved. A pull down from the top edge brings the menu
+        down with it; a pull up takes it back."""
+        t = self.touch
+        if t is None:
+            return
+        now = time.monotonic()
+        t.x, t.y = pos
+        t.trail = [p for p in t.trail if now - p[0] < 0.1] + [(now, t.y)]
+        self.touched = now
+        dx, dy = t.x - t.x0, t.y - t.y0
+        if t.pull is None and abs(dy) > self.slop and abs(dy) > abs(dx):
+            if dy > 0 and not self.out and t.y0 < self.zone:
+                t.pull, self.fresh, self.page = "down", True, "screens"
+            elif dy < 0 and self.pos == 1 and not self.slide:
+                t.pull, self.stale = "up", True
+        if t.pull:
+            self.pos = max(0.0, min(1.0, (0 if t.pull == "down" else 1) + dy / self.travel))
+
+    def release(self, pos):
+        """The finger lifted. True if the menu took the touch (a pull, or a
+        tap while it's down); False for a tap the screen should have."""
+        if self.touch is None:
+            return self.out
+        self.drag(pos)  # (some touchscreens send nothing between down and up)
+        t, self.touch = self.touch, None
+        if t.pull:
+            (t0, y0), (t1, y1) = t.trail[0], t.trail[-1]
+            fling = (y1 - y0) / (t1 - t0) / self.travel if t1 - t0 > 0.01 else 0  # travels a second
+            if t.pull == "down":
+                self.glide(1.0 if self.pos > 0.3 or fling > 2 else 0.0)
+            else:
+                self.glide(0.0 if self.pos < 0.7 or fling < -2 else 1.0)
+            return True
+        if not self.out:
+            return False
+        if abs(t.x - t.x0) < self.slop and abs(t.y - t.y0) < self.slop and not self.slide:
+            what = next((w for rect, w in self.hits if rect.collidepoint(t.x, t.y)), None)
+            if what and what[0] == "show":
+                self.choose(what[1])
+            elif what and what[0] == "page":
+                self.page, self.sheet = what[1], 0
+            elif what and what[0] == "sheet":
+                self.sheet += 1
+        return True
+
+    def choose(self, sid):
+        """A screen's section was tapped: show that screen and go back up -
+        or, if it isn't set up yet, go to Settings, which says what it needs."""
+        if not self.m.is_ready(sid):
+            self.page, self.sheet = "settings", 0
+            return
+        self.m.set_mode(sid)
+        self.close()
+
+    # -- drawing
+    def frame(self, canvas, snap, now):
+        """Put the menu on the canvas as it is now; True if that changed it."""
+        if self.fresh:  # coming down: keep the screen it covers
+            self.fresh, self.under, self.key = False, canvas.copy(), None
+        if self.stale and self.under is not None:  # going up: to the screen as it is now
+            self.stale = False
+            self.r.draw(self.under, snap, now)
+        if self.slide:
+            start, end, at = self.slide
+            k = min(1.0, (snap.mono - at) / (MENU_SECS * max(0.4, abs(end - start))))
+            self.pos = start + (end - start) * (1 - (1 - k) ** 3)  # fast, then settling
+            if k >= 1:
+                self.slide, self.pos = None, end
+        elif self.pos == 1 and not self.touch and snap.mono - self.touched > MENU_IDLE_SECS:
+            self.close()
+        key = self.scene_key(snap, now)
+        if key != self.key:
+            self.key, self.drawn = key, None
+            self.render(snap, now)
+        if self.drawn == self.pos:
+            return False
+        self.drawn = self.pos
+        if self.pos >= 1:
+            canvas.blit(self.surf, (0, 0))
+        else:
+            edge = round(self.pos * self.H)
+            canvas.blit(self.under, (0, 0))
+            canvas.blit(self.surf, (0, edge - self.H))
+            canvas.blit(self.shadow, (0, edge))
+            if self.pos <= 0 and not self.moving:
+                self.under = None  # all the way up: the screen gets drawn afresh
+        return True
+
+    def scene_key(self, snap, now):
+        """Everything that changes the menu's picture."""
+        screens = tuple((s.id, self.m.is_ready(s.id), self.tile_status(s, snap)) for s in self.installed())
+        key = (self.page, snap.mode, screens, now.strftime("%H%M"), snap.flash, snap.thinking,
+               snap.pair_code)
+        if self.page == "settings":
+            key += (self.sheet, snap.ip, snap.link_code, snap.market, self.health_line())
+        return key
+
+    def installed(self):
+        return [s for s in map(self.m.addons.get, self.m.modes()) if s]
+
+    def render(self, snap, now):
+        if self.surf is None:
+            self.surf = pygame.Surface((self.W, self.H)).convert()
+        self.surf.fill(COL_BG)
+        self.hits = []
+        ui = ScreenUI(self.r, self.surf, SimpleNamespace(id="menu", color=COL_ORANGE, settings={}, folder=""))
+        if self.page == "settings":
+            self.settings(ui, snap, now)
+        else:
+            self.screens(ui, snap, now)
+        gx, gy, gw, gh = self.GRIP[self.r.layout]  # the handle: swipe up here
+        ui.rect(gx - gw / 2, gy - gh / 2, gw, gh, (74, 74, 74), radius=gh / 2)
+        if snap.pair_code:
+            self.r._pair_card(self.surf, snap.pair_code)
+
+    def header(self, ui, title, sub, now, page, sheets=None):
+        """The title row: the title and a line under it (sub: (text, colour)),
+        the clock, and the button to the other page. sheets = (this one,
+        how many) puts a button for the next one beside it."""
+        L = self.r.layout
+        text, color = sub
+        label = "Settings" if page == "settings" else "Screens"
+        if L == "landscape":
+            self.pill(ui, 768, 27, 50, page, label)
+            ui.text(title, 32, 58, 30, COL_TEXT, bold=True)
+            ui.text(ui.fit(text, 400, 16), 32, 83, 16, color)
+            ui.text(clock_str(now), 590, 58, 26, COL_TEXT, align="r")
+            ui.text(f"{now.strftime('%a %b')} {now.day}", 590, 81, 15, COL_DIM, align="r")
+        elif L == "bar":
+            self.pill(ui, 1452, 14, 48, page, label)
+            ui.text(title, 28, 50, 30, COL_TEXT, bold=True)
+            x = 28 + ui.width(title, 30, True) + 24
+            ui.text(ui.fit(text, 1080 - x, 18), x, 50, 18, color)
+            ui.text(clock_str(now), 1268, 49, 24, COL_TEXT, bold=True, align="r")
+        elif L == "strip":
+            ui.text(clock_str(now), 160, 64, 22, COL_DIM, align="c")
+            ui.text(title, 160, 118, 40, COL_TEXT, bold=True, align="c")
+            for i, line in enumerate(ui.wrap(text, 272, 18, lines=2)):
+                ui.text(line, 160, 150 + i * 24, 18, color, align="c")
+            self.pill(ui, 160, 182, 52, page, label, align="c")
+        else:  # portrait: room for the title and the buttons, no more
+            ui.text(title, 12, 29, 16, COL_TEXT, bold=True)
+            self.pill(ui, 168, 9, 28, page, label, align="icon")
+            if sheets:  # (only portrait's settings come in pages)
+                self.pill(ui, 130, 9, 28, "sheet", f"{sheets[0] + 1}/{sheets[1]}", align="icon")
+
+    def pill(self, ui, x, y, h, what, label, align="r"):
+        """A rounded button with an icon and a label: its right edge at x
+        (align "r"), or its centre ("c"); "icon" makes a square one with just
+        the icon, right edge at x - or for "sheet", just the label."""
+        s = h * 0.44
+        if align == "icon":
+            w = h * 1.2
+            x -= w
+            ui.rect(x, y, w, h, COL_CARD, radius=h * 0.3)
+            if what == "sheet":
+                ui.text(label, x + w / 2, y + h * 0.66, h * 0.42, COL_TEXT, bold=True, align="c")
+            else:
+                self.glyph(ui, what, x + w / 2, y + h / 2, s)
+        else:
+            size = h * 0.38
+            w = h * 0.42 + s + h * 0.24 + ui.width(label, size, True) + h * 0.5
+            x -= w if align == "r" else w / 2
+            ui.rect(x, y, w, h, COL_CARD, radius=h / 2)
+            self.glyph(ui, what, x + h * 0.42 + s / 2, y + h / 2, s)
+            ui.text(label, x + h * 0.42 + s + h * 0.24, y + h * 0.64, size, COL_TEXT, bold=True)
+        self.hits.append((self.r.rect(x, y, w, h), ("sheet",) if what == "sheet" else ("page", what)))
+
+    def glyph(self, ui, what, cx, cy, size):
+        """The buttons' icons: a gear for Settings, four squares for Screens."""
+        px = self.r.n(size)
+
+        def draw(big, k):
+            p = px * k
+            c = p / 2
+            if what == "settings":
+                for i in range(8):  # the teeth, then the wheel, then its hole
+                    a = i * math.pi / 4
+                    ca, sa = math.cos(a), math.sin(a)
+                    pygame.draw.polygon(big, COL_TEXT, [
+                        (c + ca * r - sa * w, c + sa * r + ca * w)
+                        for r, w in ((c * 0.6, -c * 0.2), (c, -c * 0.15), (c, c * 0.15), (c * 0.6, c * 0.2))])
+                pygame.draw.circle(big, COL_TEXT, (c, c), c * 0.74)
+                pygame.draw.circle(big, COL_CARD, (c, c), c * 0.3)
+            else:
+                g = p * 0.42
+                for i, j in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                    pygame.draw.rect(big, COL_TEXT, (i * (p - g), j * (p - g), g, g),
+                                     border_radius=round(g * 0.3))
+
+        img = self.r._ss(("menu-glyph", what), px, px, draw)
+        ui.surface.blit(img, (self.r.x(cx) - px // 2, self.r.y(cy) - px // 2))
+
+    # -- the screens
+    def screens(self, ui, snap, now):
+        L = self.r.layout
+        hint = ("tap one to show it  ·  swipe up to go back", COL_DIM)
+        self.header(ui, "Screens", snap.flash or (("Claude is working...", COL_ORANGE)
+                                                  if snap.thinking else hint), now, "settings")
+        screens = self.installed()
+        x, y, w, h = self.BODY[L]
+        if not screens:
+            k = min(w, h) / 220
+            self.r.mascot(ui.surface, x + w / 2 - 36 * k, y + h / 2 - 66 * k, 6 * k)
+            ui.text("No screens yet", x + w / 2, y + h / 2 + 22 * k, 26 * k, COL_TEXT, bold=True, align="c")
+            ui.text(ui.fit("Add some from the Screen Market: Settings says how", w, 15 * k),
+                    x + w / 2, y + h / 2 + 50 * k, 15 * k, COL_DIM, align="c")
+            return
+        n = len(screens)
+        gap = self.GAP[L] * (0.6 if n > 7 else 1)
+        across = L in ("landscape", "bar")
+        long, short = (w, h) if across else (h, w)  # the screens share out the long way
+        lanes = 1  # (a second row, or column, only once there are too many to read)
+        while lanes < 3 and (long - gap * (-(-n // lanes) - 1)) / -(-n // lanes) < self.NARROWEST[L]:
+            lanes += 1
+        per = -(-n // lanes)
+        each, depth = (long - gap * (per - 1)) / per, (short - gap * (lanes - 1)) / lanes
+        look = self.tile_look(ui, screens, *((each, depth) if across else (depth, each)))
+        for i, screen in enumerate(screens):
+            lane, i = divmod(i, per)
+            along, aside = i * (each + gap), lane * (depth + gap)
+            box = (x + along, y + aside, each, depth) if across else (x + aside, y + along, depth, each)
+            self.tile(ui, screen, box, snap, look)
+            self.hits.append((self.r.rect(*box), ("show", screen.id)))
+
+    def tile_look(self, ui, screens, w, h):
+        """How the sections are laid out - the same for all of them, so they
+        line up: the icon beside the words if they're wide, else above them,
+        and the sizes, as big as fits every name (on two lines if need be)."""
+        wide = w >= h * 2
+        if wide:
+            icon = min(h * 0.62, w * 0.3, 108)
+            pad = min((h - icon) / 2, 28)
+            room, size = w - pad * 2.7 - icon - 12, max(9, min(26, h * 0.22))
+        else:
+            pad = max(6, w * 0.06)
+            icon = min(w * 0.72, h * 0.4, 112)
+            room, size = w - 2 * pad, max(9, min(24, w * 0.13))
+        small, lines = size * 0.7, 1
+        for k in (1, 0.94, 0.88, 0.82, 0.76):
+            if all(ui.width(s.name, size * k, True) <= room for s in screens):
+                size *= k
+                break
+        else:
+            size, lines = size * 0.76, 2
+        return SimpleNamespace(wide=wide, icon=icon, pad=pad, room=room, size=size, small=small, lines=lines)
+
+    def tile(self, ui, screen, box, snap, look):
+        """One screen's section: its icon, its name and how it's doing, on
+        its own colour - lit up while it's the one showing."""
+        x, y, w, h = box
+        accent = self.accent(screen)
+        here = screen.id == snap.mode
+        rect = self.r.rect(x, y, w, h)
+        radius = self.r.n(min(18, w * 0.14, h * 0.14))
+        ui.surface.blit(self.tile_back(accent, rect.size, radius, here), rect)
+        if here:
+            pygame.draw.rect(ui.surface, accent, rect, self.r.n(max(1.5, min(3, w * 0.05, h * 0.05))),
+                             border_radius=radius)
+        size, small = look.size, look.small
+        names = (ui.wrap(screen.name, look.room, size, bold=True, lines=2) if look.lines > 1
+                 else [ui.fit(screen.name, look.room, size, True)])
+        words = look.lines * size * 1.2 + small * 1.6  # (the same height in every section)
+        if look.wide:
+            self.icon(ui, screen, x + look.pad, y + (h - look.icon) / 2, look.icon, accent)
+            at, base, align = x + look.pad * 1.7 + look.icon, y + (h - words) / 2 + size * 0.95, "l"
+        else:  # (leaving room at the bottom for the bar that marks the one showing)
+            top = y + (h - 12 - look.icon - size * 0.55 - words) / 2
+            self.icon(ui, screen, x + (w - look.icon) / 2, top, look.icon, accent)
+            at, base, align = x + w / 2, top + look.icon + size * 1.5, "c"
+        for line in names:
+            ui.text(line, at, base, size, COL_TEXT, bold=True, align=align)
+            base += size * 1.2
+        text, color = self.tile_status(screen, snap)
+        if text:
+            below = y + h - 16 - (base + small * 0.4)  # the room under the status's first line
+            self.status_text(ui, text, color, at, base + small * 0.4, small, look.room, align,
+                             lines=2 if not look.wide and below > small * 1.6 else 1)
+        if here:  # and a bar in its colour, like a dock's running light
+            if look.wide:
+                bar = min(40, h * 0.42)
+                ui.rect(x + w - 14, y + (h - bar) / 2, 5, bar, accent, radius=2.5)
+            else:
+                bar = min(44, w * 0.3)
+                ui.rect(x + (w - bar) / 2, y + h - 14, bar, 5, accent, radius=2.5)
+
+    def tile_back(self, accent, size, radius, here):
+        """A section's card: its colour, fading as it goes down (cached)."""
+        key = (accent, size, radius, here)
+        img = self.backs.get(key)
+        if img is None:
+            w, h = size
+            top, bottom = (0.3, 0.12) if here else (0.17, 0.04)
+            img = self.backs[key] = pygame.Surface(size, pygame.SRCALPHA)
+            for i in range(h):
+                img.fill(mix(COL_CARD, accent, top + (bottom - top) * i / max(1, h - 1)), (0, i, w, 1))
+            corners = pygame.Surface(size, pygame.SRCALPHA)
+            pygame.draw.rect(corners, (255, 255, 255, 255), corners.get_rect(), border_radius=radius)
+            img.blit(corners, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+        return img
+
+    @staticmethod
+    def accent(screen):
+        return getattr(screen, "color", None) or parse_color(screen.manifest.get("color"))
+
+    def tile_status(self, screen, snap):
+        """What a section says under the screen's name: its status line,
+        if it has one, else what kind of screen it is. (text, colour)"""
+        if not self.m.is_ready(screen.id):
+            return "not set up yet", COL_YELLOW
+        try:
+            if isinstance(screen, NativeScreen):
+                if not self.m.demo and screen.hook("needs_setup", self.m.cfg):
+                    return "not set up yet", COL_YELLOW
+                status = screen.hook("status", snap)
+            else:
+                status = screen.view()[2]
+        except Exception:
+            status = None
+        if status and status[0] and status[0] != "loading...":
+            return str(status[0]), parse_color(status[1], COL_DIM)
+        kind = str(screen.manifest.get("category") or "")
+        return ("" if kind.lower() == screen.name.lower() else kind), COL_DIM
+
+    def status_text(self, ui, text, color, x, base, size, max_w, align, lines=1):
+        """A status under a name: a dot in its colour, then the words (a dim
+        one is just the words), over as many lines as it may take."""
+        d = 0 if color == COL_DIM else size * 0.55
+        room = max_w - d * 1.7
+        for i, part in enumerate(ui.wrap(text, room, size, lines=lines) if lines > 1 else [ui.fit(text, room, size)]):
+            left = x - (ui.width(part, size) + d * 1.7) / 2 if align == "c" else x
+            if d and not i:
+                ui.circle(left + d / 2, base - size * 0.36, d / 2, color)
+            ui.text(part, left + d * 1.7, base, size, COL_SUB if d else COL_DIM)
+            base += size * 1.3
+
+    def icon(self, ui, screen, x, y, size, accent):
+        px = self.r.n(size)
+        ready = self.m.is_ready(screen.id)
+        key = (screen.id, px, ready)
+        img = self.icons.get(key)
+        if img is None:
+            img = self.icons[key] = self.make_icon(screen, px, accent)
+            if not ready:  # faded, like a greyed-out app
+                img.fill((255, 255, 255, 105), special_flags=pygame.BLEND_RGBA_MULT)
+        ui.surface.blit(img, (self.r.x(x), self.r.y(y)))
+
+    def make_icon(self, screen, px, accent):
+        """A screen's icon, px square: a native screen's logo (the one in its
+        own header) on a dark tile, else its initial on a tile of its colour,
+        the badge an add-on screen's header has."""
+        logo = self.logo(screen, px * 0.6) if isinstance(screen, NativeScreen) and screen.has("brand") else None
+        back = COL_BG if logo else accent
+        img = self.r._ss(("menu-icon", back, px), px, px, lambda big, k: pygame.draw.rect(
+            big, back, big.get_rect(), border_radius=round(px * k * 0.24))).copy()
+        if logo:
+            lw, lh = logo.get_size()
+            k = min(px * 0.62 / lw, px * 0.6 / lh)
+            logo = pygame.transform.smoothscale(logo, (max(1, round(lw * k)), max(1, round(lh * k))))
+            img.blit(logo, logo.get_rect(center=(px // 2, px // 2)))
+        else:
+            mark = str(screen.manifest.get("icon") or "")
+            letter = (mark if re.fullmatch(r"[A-Za-z0-9]{1,2}", mark) else
+                      next((c for c in screen.name if c.isalnum()), "?")).upper()
+            f = self.r.font(px * (0.5 if len(letter) == 1 else 0.38) / self.r.s, True)
+            glyph = f.render(letter, True, COL_BG)
+            img.blit(glyph, glyph.get_rect(center=(px // 2, px // 2 + px // 40)))
+        return img
+
+    def logo(self, native, px):
+        """A native screen's logo, about px pixels tall: what its brand() hook
+        draws in the landscape header (about 56 units tall, left of x = 112),
+        drawn off-screen by a landscape renderer at the right scale and cut out
+        of the background."""
+        k = px / 56
+        if not self.logo_r or self.logo_r[0] != k:
+            self.logo_r = (k, Renderer((round(800 * k), round(480 * k)), self.r.font_paths, self.r.natives))
+        lr = self.logo_r[1]
+        surf = pygame.Surface((lr.n(112), lr.n(100)))
+        surf.fill(COL_BG)
+        try:
+            native.hook("brand", lr, surf, "")
+        except Exception:
+            log(f"screen {native.id}: brand failed\n{traceback.format_exc()}")
+            return None
+        mask = pygame.mask.from_threshold(surf, COL_BG, (4, 4, 4, 255))
+        mask.invert()
+        found = mask.get_bounding_rects()
+        return surf.subsurface(found[0].unionall(found[1:])).copy() if found else None
+
+    # -- settings
+    def settings(self, ui, snap, now):
+        cards = self.cards(snap)
+        sheets = self.arrange(len(cards))
+        self.sheet %= len(sheets)
+        self.header(ui, "Settings", ("the details you'll want later", COL_DIM), now, "screens",
+                    (self.sheet, len(sheets)) if len(sheets) > 1 else None)
+        rows = sheets[self.sheet]
+        x, y, w, h = self.BODY[self.r.layout]
+        gap = self.GAP[self.r.layout]
+        plan = []  # each row: its cards' widths, shared out by weight, and how tall it'd like to be
+        for row in rows:
+            across = (w - gap * (len(row) - 1)) / sum(cards[i][2] for i in row)
+            widths = [across * cards[i][2] for i in row]
+            plan.append((row, widths, max(self.card_height(ui, *cards[i][:2], wide)
+                                          for i, wide in zip(row, widths))))
+        k = (h - gap * (len(rows) - 1)) / sum(want for _, _, want in plan)
+        for row, widths, want in plan:
+            left = x
+            for i, wide in zip(row, widths):
+                self.card(ui, (left, y, wide, want * k), *cards[i][:2])
+                left += wide + gap
+            y += want * k + gap
+
+    def arrange(self, n):
+        """The cards' places: pages of rows of card numbers."""
+        L, every = self.r.layout, list(range(n))
+        if L == "bar":
+            return [[every]]
+        if L == "strip":
+            return [[[i] for i in every]]
+        if L == "portrait":
+            return [[[i] for i in every[p:p + 2]] for p in range(0, n, 2)]
+        top = (n + 1) // 2 if n > 3 else n  # landscape: two rows once there are four
+        return [[every[:top], every[top:]]] if top < n else [[every]]
+
+    def cards(self, snap):
+        """What Settings shows: [(title, lines, how wide)]. A line is ("big",
+        text[, colour]), ("text", text), ("dim", text), ("code", command),
+        ("item", label, value, as code?) or ("dot", text, colour)."""
+        m, cards = self.m, []
+        rotate = m.cfg.rotate if m.cfg.rotate in (90, 180, 270) else 0
+        market = ("off ([market] url)" if not m.link else "not linked yet" if snap.link_code
+                  else snap.market)
+        display = [("big", f"{snap.host}.local"),
+                   ("item", "IP", snap.ip or "no network yet", False),
+                   ("item", "Port", str(snap.port), False),
+                   ("item", "Market", market, False),
+                   ("item", "Screen", f"{self.W}×{self.H} {self.r.layout}" + (
+                       f", turned {rotate}°" if rotate else ""), False),
+                   ("item", "Version", m.version.replace(" ", ", ") or "not from git", False)]
+        health = self.health_line()
+        if health:
+            display.append(("dot",) + health)
+        cards.append(("This display", display, 0.85))
+
+        if snap.link_code:  # (what the welcome screen says, for when there are screens)
+            cards.append(("Screen Market", [
+                ("dot", "Not linked to this display yet", COL_YELLOW),
+                ("text", f"Sign in at {snap.market}, open My display and type in:"),
+                ("big", snap.link_code, COL_ORANGE)], 1))
+
+        cards.append(("Claude Code", [
+            ("text", "On each computer with Claude Code, in code-usage:"),
+            ("code", f"python3 server/display_hook.py --install --host {snap.ip or snap.host + '.local'}"),
+            ("dim", "so the display knows when Claude's working. Can't find it? "
+                    "python3 server/find_display.py")], 1))
+
+        screens, ready = [], 0
+        for screen in self.installed():
+            native = screen if isinstance(screen, NativeScreen) else None
+            command = native and (native.manifest.get("setup") or {}).get("command")
+            if command:  # a login made on the Pi: the thing you'll need again
+                fine = m.is_ready(screen.id) and (m.demo or not native.hook("needs_setup", m.cfg))
+                screens += [("dot", screen.name, COL_GREEN if fine else COL_YELLOW), ("code", command)]
+            elif not m.is_ready(screen.id):
+                screens += [("dot", f"{screen.name}: not set up yet", COL_YELLOW),
+                            ("dim", getattr(native and native.mod, "NOT_READY", "")
+                             or "Set it up on its page in the Screen Market.")]
+            else:
+                ready += 1
+        if not screens:
+            screens = [("dot", f"All {ready} set up" if ready else "None yet", COL_GREEN if ready else COL_DIM),
+                       ("dim", "Screens and their settings come from the Screen Market.")]
+        cards.append(("Screens", screens, 1.1))
+
+        service = os.path.exists("/etc/systemd/system/claude-display.service")
+        pi = [("item", "SSH", f"ssh {getpass.getuser()}@{snap.host}.local", True),
+              ("item", "Folder", tilde(REPO_DIR), True),
+              ("item", "Config", tilde(m.cfg.path), True),
+              ("item", "Update", "git pull", True),
+              ("item", "Restart", "sudo systemctl restart claude-display" if service else "sudo reboot", True)]
+        if service:
+            pi.append(("item", "Logs", "journalctl -u claude-display -f", True))
+        cards.append(("On the Pi", pi, 1.15))
+        return cards
+
+    def health_line(self):
+        """How the Pi is doing - temperature, time up, power - as (text,
+        colour), or None where it can't tell. Looked at every 30 s at most."""
+        at, line = self.health
+        if time.monotonic() - at < 30:
+            return line
+        bits, color = [], COL_GREEN
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                bits.append(f"{int(f.read()) / 1000:.0f}°C")
+        except (OSError, ValueError):
+            pass
+        try:
+            with open("/proc/uptime") as f:
+                mins = int(float(f.read().split()[0]) // 60)
+            bits.append("up " + (f"{mins // 1440}d {mins % 1440 // 60}h" if mins >= 1440 else fmt_minutes(mins)))
+        except (OSError, ValueError, IndexError):
+            pass
+        try:  # the Pi's own word on its power supply
+            out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=2)
+            flags = int(out.stdout.strip().split("=")[1], 16)
+            if flags & 0x1:
+                bits.append("low voltage now")
+                color = COL_RED
+            elif flags & 0x10000:
+                bits.append("low voltage since boot")
+                color = COL_YELLOW
+            else:
+                bits.append("power ok")
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+        line = ("  ·  ".join(bits), color) if bits else None
+        self.health = (time.monotonic(), line)
+        return line
+
+    def card_height(self, ui, title, lines, w):
+        """How tall a card w wide would like to be: its text all at full size."""
+        pad = self.TEXT[self.r.layout] * 1.1
+        return self.lay_out(ui, title, lines, w - 2 * pad, self.TEXT[self.r.layout])[1] + 1.6 * pad
+
+    def card(self, ui, box, title, lines):
+        """One card of Settings, its text as big as fits."""
+        x, y, w, h = box
+        ui.rect(x, y, w, h, COL_CARD, radius=min(16, w * 0.06, h * 0.08))
+        pad = self.TEXT[self.r.layout] * 1.1
+        x, y, w, h = x + pad, y + pad * 0.8, w - 2 * pad, h - 1.6 * pad
+        most = self.TEXT[self.r.layout]
+        size = most
+        while True:
+            ops, used = self.lay_out(ui, title, lines, w, size)
+            if used <= h or size <= most * 0.6:
+                break
+            size -= 0.5
+        clip = ui.surface.get_clip()
+        ui.surface.set_clip(self.r.rect(x, y, w, h + pad * 0.6))  # (if even the smallest text won't fit)
+        for kind, *op in ops:
+            if kind == "chip":
+                ui.rect(x + op[0], y + op[1], op[2], op[3], COL_BG, radius=min(8, op[3] / 2))
+            elif kind == "text":
+                ui.text(op[0], x + op[2], y + op[1], op[3], op[4], bold=op[5])
+            elif kind == "mono":
+                self.mono_text(ui.surface, op[0], x + op[2], y + op[1], op[3], op[4])
+            elif kind == "dot":
+                ui.circle(x + op[2], y + op[1], op[3], op[4])
+        ui.surface.set_clip(clip)
+
+    def lay_out(self, ui, title, lines, w, s):
+        """Where a card's lines go at text size s in w: ([drawing op], height).
+        Ops are ("text" / "mono", text, baseline, x, size, colour[, bold]),
+        ("dot", "", centre y, centre x, radius, colour) and the dark backing
+        of a command, ("chip", x, top, w, h)."""
+        ops, y = [], 0.0
+
+        def row(size):  # a line of text at size: its baseline
+            nonlocal y
+            y += size * 1.4
+            return y - size * 0.35
+
+        ts = self.TEXT[self.r.layout] * 1.12  # (the same in every card, however small its text)
+        ops.append(("text", ui.fit(title, w, ts, True), row(ts), 0, ts, COL_ORANGE, True))
+        y += s * 0.3
+        label_w = max((ui.width(line[1], s * 0.9) for line in lines if line[0] == "item"), default=0) + s
+        for line in lines:
+            kind = line[0]
+            if kind == "big":
+                bs = s * 1.3
+                size = next((bs * k for k in (1, 0.9, 0.8, 0.7) if ui.width(line[1], bs * k, True) <= w), bs * 0.7)
+                ops.append(("text", ui.fit(line[1], w, size, True), row(bs), 0, size,
+                            line[2] if len(line) > 2 else COL_TEXT, True))
+            elif kind in ("text", "dim"):
+                size, color = (s, COL_SUB) if kind == "text" else (s * 0.9, COL_DIM)
+                for part in ui.wrap(line[1], w, size, lines=4):
+                    ops.append(("text", part, row(size), 0, size, color, False))
+            elif kind == "dot":
+                d = s * 0.27
+                for i, part in enumerate(ui.wrap(line[1], w - s, s, lines=3)):
+                    base = row(s)
+                    if not i:
+                        ops.append(("dot", "", base - s * 0.36, d, d, line[2]))
+                    ops.append(("text", part, base, s, s, COL_TEXT, False))
+            elif kind == "code":
+                cs = s * 0.88
+                top = y + s * 0.15
+                y = top + cs * 0.15
+                parts = [("mono", part, row(cs), cs * 0.55, cs, COL_TEXT)
+                         for part in self.wrap_code(line[1], w - cs * 1.1, cs)]
+                y += cs * 0.3
+                ops += [("chip", 0, top, w, y - top)] + parts
+                y += s * 0.2
+            elif kind == "item":
+                vs = s * 0.88 if line[3] else s
+                parts = (self.wrap_code(line[2], w - label_w, vs) if line[3]
+                         else ui.wrap(line[2], w - label_w, vs, lines=3))
+                for i, part in enumerate(parts):
+                    base = row(s)
+                    if not i:
+                        ops.append(("text", line[1], base, 0, s * 0.9, COL_DIM, False))
+                    ops.append(("mono", part, base, label_w, vs, COL_TEXT) if line[3]
+                               else ("text", part, base, label_w, vs, COL_TEXT, False))
+        return ops, y
+
+    def mono_font(self, size):
+        px = self.r.n(size)
+        f = self.mono_fonts.get(px)
+        if f is None:
+            f = self.mono_fonts[px] = pygame.font.Font(self.mono_path or self.r.font_paths[0], px)
+        return f
+
+    def mono_text(self, surf, s, x, baseline, size, color):
+        f = self.mono_font(size)
+        key = ("mono", s, id(f), color)
+        img = self.r.text_cache.get(key)
+        if img is None:
+            img = self.r.text_cache[key] = f.render(s, True, color)
+        surf.blit(img, (self.r.x(x), self.r.y(baseline) - f.get_ascent()))
+
+    def wrap_code(self, text, max_w, size):
+        """A command broken into lines that fit max_w: at its spaces, and
+        inside anything too long after a slash or an @."""
+        f = self.mono_font(size)
+        width = lambda s: f.size(s)[0] / self.r.s
+        pieces = []  # (text, glued to the one before it - no space between)
+        for word in text.split():
+            glued = False
+            while width(word) > max_w and len(word) > 1:
+                cut = max(1, int(len(word) * max_w / width(word)))
+                slash = max(word.rfind("/", 0, cut), word.rfind("@", 0, cut))
+                cut = slash + 1 if slash > 0 else cut
+                pieces.append((word[:cut], glued))
+                word, glued = word[cut:], True
+            pieces.append((word, glued))
+        out, line = [], ""
+        for piece, glued in pieces:
+            trial = line + ("" if glued or not line else " ") + piece
+            if line and width(trial) > max_w:
+                out.append(line)
+                line = piece
+            else:
+                line = trial
+        return out + [line] if line else out
+
+
 # ---------------------------------------------------------------- main
 
 def forever(fn, *args):
@@ -2559,6 +3320,8 @@ def main():
     for native in natives:
         native.hook("on_layout", model, renderer)  # e.g. how big Spotify's album art is
     renderer.warm_spinner()  # draw the spark's frames now, not mid-animation
+    menu = HomeMenu(model, renderer)
+    menu.render(model.snapshot(), datetime.datetime.now().astimezone())  # and the menu's icons
     market = cfg.get("market", "url", MARKET_URL)  # once the layout's known: the market shows it
     if market and not args.demo:
         model.link = MarketLink(model, market)
@@ -2581,6 +3344,9 @@ def main():
         else:
             pygame.display.flip()
 
+    def on_canvas(pos):
+        return unrotate_point(pos, rotate, *canvas.get_size())
+
     clock = pygame.time.Clock()
     last_key, last_frame, last_cars, last_ip_check = None, -1, -1, 0.0
     try:
@@ -2591,15 +3357,26 @@ def main():
                 if ev.type == pygame.KEYDOWN:
                     if ev.key == pygame.K_q and ev.mod & pygame.KMOD_CTRL:
                         return
-                    if ev.key == pygame.K_ESCAPE and args.windowed:
+                    if menu.out:
+                        if ev.key in (pygame.K_ESCAPE, pygame.K_UP, pygame.K_m, pygame.K_SPACE,
+                                      pygame.K_TAB, pygame.K_RETURN):
+                            menu.close()
+                    elif ev.key == pygame.K_ESCAPE and args.windowed:
                         return
-                    if ev.key in (pygame.K_SPACE, pygame.K_TAB, pygame.K_RETURN):
+                    elif ev.key in (pygame.K_DOWN, pygame.K_m):
+                        menu.open()
+                    elif ev.key in (pygame.K_SPACE, pygame.K_TAB, pygame.K_RETURN):
                         model.toggle_mode()
+                elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    menu.press(on_canvas(ev.pos))
+                elif ev.type == pygame.MOUSEMOTION:
+                    menu.drag(on_canvas(ev.pos))
                 elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+                    if menu.release(on_canvas(ev.pos)):
+                        continue  # a pull on the home menu, or a tap on it
                     # Touchscreens send taps as clicks. A tap on a button
                     # presses it; anywhere else switches screens.
-                    button = renderer.button_at(unrotate_point(ev.pos, rotate, *canvas.get_size()),
-                                                model.mode)
+                    button = renderer.button_at(on_canvas(ev.pos), model.mode)
                     native = model.native()
                     if button and native:
                         renderer.press(button, time.monotonic())
@@ -2619,6 +3396,12 @@ def main():
 
             snap = model.snapshot()
             now = datetime.datetime.now().astimezone()
+            if menu.out:  # the home menu draws; the screen waits under it
+                if menu.frame(canvas, snap, now):
+                    present()
+                last_key = None  # once it's gone back up, the screen's drawn afresh
+                clock.tick(60 if menu.moving else 15)
+                continue
             moving = renderer.advance(snap)  # the session panel's slide
             key = renderer.scene_key(snap, now)
             frame = renderer.spin_frame(snap)
