@@ -20,7 +20,9 @@ nothing on your network needs opening up. They land in
   - screens: POST /mode/<screen>, /mode/toggle, tap the screen, or pick one
     from the home menu (swipe down from the top edge); GET /mode
   - add-on screens: GET /screens, and the pairing and install calls the
-    Screen Market makes (see BeaconHandler._screens)
+    Screen Market makes (see BeaconHandler._screens). A screen turned off
+    there stays installed but is skipped; the market can also have the
+    display draw a screen that isn't installed yet, to try it out
 
 It speaks the firmware's HTTP API on the same port, so the hooks, beacon.py,
 find_display.py and the /switch command work unchanged - point them at the Pi.
@@ -61,6 +63,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -367,6 +370,9 @@ class Model:
         self.reporting = False     # telling the market what a job did: a restart waits
         self.addons = ScreenStore(screens or SCREENS_DIR)  # the installed screens: see ScreenStore
         self.addons.load_all(self)
+        self.started = set()       # the native screens whose workers are running (see start_native)
+        self.looping = False       # the main loop is drawing: pygame work waits for it (see on_main)
+        self.main_calls = []
         saved = state.get("mode")
         self.mode = saved if self.is_ready(saved) else next(
             (m for m in self.modes() if self.is_ready(m)), WELCOME)
@@ -384,19 +390,78 @@ class Model:
 
     # -- screen mode (persisted, like the firmware's NVS "mode")
     def modes(self):
-        """Every installed screen, in install order."""
-        return self.addons.ids()
+        """Every installed screen that's turned on, in install order."""
+        return tuple(sid for sid in self.addons.ids() if self.addons.is_on(sid))
 
     def native(self, mode=None):
         """The native screen showing (or `mode`), if it is one."""
         return self.addons.native(self.mode if mode is None else mode)
 
     def is_ready(self, mode):
-        """Installed, and set up enough to show."""
+        """Installed, turned on, and set up enough to show."""
         screen = self.addons.get(mode)
+        if screen is None or not self.addons.is_on(mode):
+            return False
         if isinstance(screen, NativeScreen):
             return self.demo or screen.ready(self.cfg)
-        return screen is not None
+        return True
+
+    def start_native(self, native):
+        """Start a native screen's workers (--demo's fakes in demo mode), once.
+        One that's turned off isn't started until it's turned on."""
+        if native.id in self.started:
+            return
+        if self.demo:
+            if native.has("demo"):
+                forever(native.mod.demo, self)
+        elif native.ready(self.cfg):
+            native.hook("start", self)
+        else:
+            return
+        self.started.add(native.id)
+
+    def turn_screen(self, sid, on):
+        """Turn an installed screen on or off. Off, it stays installed,
+        settings and all, but it's out of the screens you tap through and the
+        home menu, and its workers don't start (ones already running carry on
+        until the display next restarts)."""
+        self.addons.turn(sid, on)
+        native = self.native(sid)
+        if on and native:
+            self.start_native(native)
+        if on and not self.is_ready(self.mode):  # nothing was on: this one is now
+            self.set_mode(sid)
+        if not on and self.mode == sid:
+            if not self.set_mode(self.next_mode()):
+                with self.lock:
+                    self.mode = WELCOME
+
+    # -- pygame belongs to the main loop: drawing for anyone else waits for it
+    def on_main(self, fn, timeout=30):
+        """fn()'s result, run by the main loop between frames (pygame's fonts
+        aren't safe to share between threads) - or straight away, with no
+        main loop. Raises what fn raised, or TimeoutError."""
+        if not self.looping:
+            return fn()
+        call = {"fn": fn, "done": threading.Event()}
+        with self.lock:
+            self.main_calls.append(call)
+        if not call["done"].wait(timeout):
+            raise TimeoutError("the display was too busy to get to it")
+        if "error" in call:
+            raise call["error"]
+        return call["result"]
+
+    def run_main_calls(self):
+        """The main loop's side of on_main."""
+        with self.lock:
+            calls, self.main_calls = self.main_calls, []
+        for call in calls:
+            try:
+                call["result"] = call["fn"]()
+            except Exception as e:
+                call["error"] = e
+            call["done"].set()
 
     def set_mode(self, mode):
         """Switch screens. False if that screen isn't installed or set up."""
@@ -473,6 +538,7 @@ class Model:
                 mode=self.mode, sessions=self.sessions_now(now),
                 addon=addon, addon_view=addon.view() if addon else None, native=native,
                 pair_code=self.pairing.showing, screens=len(self.modes()),
+                screens_off=len(self.addons.ids()) - len(self.modes()),
                 link_code=self.link and self.link.code, link_url=self.link and self.link.code_url,
                 market=self.link and self.link.site,
                 thinking=self.thinking(now), flash=flash and flash[:2],
@@ -839,6 +905,34 @@ def check_manifest(manifest):
     return None
 
 
+def screen_blobs(manifest, files):
+    """An install's files ({name: text, or {"text"} / {"base64"}}) as
+    {name: bytes}, its manifest checked. Raises ValueError with what's wrong."""
+    problem = check_manifest(manifest)
+    if problem:
+        raise ValueError(problem)
+    entry = manifest.get("entry") or "screen.py"
+    if not isinstance(files, dict) or entry not in files:
+        raise ValueError(f"the install has no {entry}")
+    blobs, total = {}, 0
+    for name, content in files.items():
+        if not SCREEN_FILE.match(name) or name in ("manifest.json", "settings.json"):
+            raise ValueError(f"bad file name {name!r}")
+        if isinstance(content, dict) and "base64" in content:
+            blob = base64.b64decode(content["base64"])
+        elif isinstance(content, dict) and "text" in content:
+            blob = str(content["text"]).encode()
+        elif isinstance(content, str):
+            blob = content.encode()
+        else:
+            raise ValueError(f"{name}: give its text or base64")
+        total += len(blob)
+        blobs[name] = blob
+    if total > SCREEN_MAX_BYTES:
+        raise ValueError("the screen's files are too big (4 MB at most)")
+    return blobs
+
+
 class ScreenContext:
     """What fetch() gets: settings, the network, and a way to say how it's going."""
 
@@ -1161,13 +1255,26 @@ class ScreenStore:
             return self.screens.get(sid)
 
     def remember_order(self, sid, keep=True):
-        """A new screen goes last in the taps; an update keeps its place."""
+        """A new screen goes last in the taps; an update keeps its place; a
+        removed one is forgotten (being turned off too, so it comes back on)."""
         if self.state is None:
             return
         order = [x for x in self.state.get("screen_order") or [] if x != sid or keep]
         if keep and sid not in order:
             order.append(sid)
         self.state.put("screen_order", order)
+        if not keep and sid in (self.state.get("screens_off") or []):
+            self.turn(sid, True)
+
+    def is_on(self, sid):
+        """Not turned off (see Model.turn_screen)."""
+        return self.state is None or sid not in (self.state.get("screens_off") or [])
+
+    def turn(self, sid, on):
+        if self.state is None:
+            return
+        off = [x for x in self.state.get("screens_off") or [] if x != sid]
+        self.state.put("screens_off", off if on else off + [sid])
 
     def native(self, sid):
         screen = self.get(sid)
@@ -1180,29 +1287,8 @@ class ScreenStore:
     def install(self, manifest, files, settings, model):
         """Write the screen to disk and load it, replacing any old version.
         Returns the new AddonScreen; raises ValueError with what's wrong."""
-        problem = check_manifest(manifest)
-        if problem:
-            raise ValueError(problem)
+        blobs = screen_blobs(manifest, files)
         sid = manifest["id"]
-        entry = manifest.get("entry") or "screen.py"
-        if not isinstance(files, dict) or entry not in files:
-            raise ValueError(f"the install has no {entry}")
-        blobs, total = {}, 0
-        for name, content in files.items():
-            if not SCREEN_FILE.match(name) or name in ("manifest.json", "settings.json"):
-                raise ValueError(f"bad file name {name!r}")
-            if isinstance(content, dict) and "base64" in content:
-                blob = base64.b64decode(content["base64"])
-            elif isinstance(content, dict) and "text" in content:
-                blob = str(content["text"]).encode()
-            elif isinstance(content, str):
-                blob = content.encode()
-            else:
-                raise ValueError(f"{name}: give its text or base64")
-            total += len(blob)
-            blobs[name] = blob
-        if total > SCREEN_MAX_BYTES:
-            raise ValueError("the screen's files are too big (4 MB at most)")
 
         os.makedirs(self.folder, exist_ok=True)
         staging = os.path.join(self.folder, f".{sid}.new")
@@ -1568,9 +1654,11 @@ def screens_info(m):
     reports to the Screen Market)."""
     return {
         "api": SCREEN_API, "native_api": NATIVE_API, "version": m.version,
+        "features": ["enable", "preview"],  # what the Screen Market can ask of it beyond the api
         "host": m.host, "ip": m.ip, "mode": m.mode,
         "layout": m.layout, "design_size": Renderer.LAYOUTS.get(m.layout),
-        "installed": [a.summary(m) for a in map(m.addons.get, m.addons.ids()) if a],
+        "installed": [dict(a.summary(m), enabled=m.addons.is_on(a.id))
+                      for a in map(m.addons.get, m.addons.ids()) if a],
         "failed": m.addons.failed, "restarting": m.restart}
 
 
@@ -1580,6 +1668,8 @@ def show_screen(m, want):
         want = m.next_mode()
     if want == m.mode or m.set_mode(want):
         return 200, want
+    if want in m.addons.ids() and not m.addons.is_on(want):
+        return 409, f"the {want} screen is turned off - turn it on in the Screen Market first"
     if not m.modes():
         return 409, "no screens installed yet - add some from the Screen Market"
     if want not in m.modes():
@@ -1588,10 +1678,90 @@ def show_screen(m, want):
     return 409, getattr(native and native.mod, "NOT_READY", f"the {want} screen isn't set up yet")
 
 
+# What a screen being tried out is drawn at: the Screen Market's preview.py sizes.
+PREVIEW_SIZES = {"landscape": (800, 480), "portrait": (360, 640), "bar": (1480, 320), "strip": (320, 1480)}
+PREVIEW_FETCH_SECS = 15
+
+
+def preview_screen(m, body):
+    """Try out an add-on screen without installing it - one being written in
+    the Screen Market: load it, run its fetch() once for real data, and draw
+    it in every layout, the way preview.py does. Nothing on the display
+    changes. (HTTP status, {"previews": {layout: base64 PNG}, "layout",
+    "status", "error"}): status is what its status line says, error what its
+    draw() raised (the pictures show it too)."""
+    manifest = body.get("manifest")
+    if isinstance(manifest, dict) and manifest.get("kind") == "native":
+        return 400, {"error": "a native screen joins the display itself, so it can't be tried out "
+                              "- install it instead"}
+    folder = tempfile.mkdtemp(prefix="screen-test-")
+    screen = None
+    try:
+        try:
+            blobs = screen_blobs(manifest, body.get("files"))
+            for name, blob in blobs.items():
+                with open(os.path.join(folder, name), "wb") as f:
+                    f.write(blob)
+            for name, value in (("manifest.json", manifest), ("settings.json", body.get("settings") or {})):
+                with open(os.path.join(folder, name), "w", encoding="utf-8") as f:
+                    json.dump(value, f)
+            screen = AddonScreen(folder)
+        except Exception as e:
+            return 400, {"error": f"it didn't load: {type(e).__name__}: {e}"}
+        data, status = None, None
+        fetch = getattr(screen.obj, "fetch", None)
+        if callable(fetch):
+            got = {}
+
+            def run():
+                try:
+                    got["data"] = fetch(ScreenContext(screen))
+                except Exception as e:
+                    got["error"] = e
+
+            worker = threading.Thread(target=run, daemon=True, name=f"test-{screen.id}")
+            worker.start()
+            worker.join(PREVIEW_FETCH_SECS)
+            if "error" in got:
+                status = (f"{screen.name}: {got['error']}"[:120], COL_RED)
+            elif worker.is_alive():
+                status = (f"{screen.name}: fetch() took over {PREVIEW_FETCH_SECS}s", COL_RED)
+            else:
+                data = got.get("data")
+        if status is None and screen.status and screen.status[0] != "loading...":
+            status = screen.status  # one fetch() set itself
+
+        def draw():
+            out, now = {}, datetime.datetime.now().astimezone()
+            for layout, size in PREVIEW_SIZES.items():
+                surf = pygame.Surface(size)
+                snap = SimpleNamespace(
+                    mode=screen.id, sessions=[], addon=screen, addon_view=(data, 1, status), native=None,
+                    pair_code=None, screens=1, screens_off=0, link_code=None, link_url=None, market=None,
+                    thinking=False, flash=None, host=m.host, ip=m.ip, port=m.cfg.port, mono=time.monotonic())
+                Renderer(size, find_fonts()).draw(surf, snap, now)
+                buf = io.BytesIO()
+                pygame.image.save(surf, buf, "screen.png")
+                out[layout] = base64.b64encode(buf.getvalue()).decode()
+            return out
+
+        previews = m.on_main(draw)
+        log(f"tried out screen {screen.id} ({screen.name})")
+        return 200, {"previews": previews, "layout": m.layout, "status": status and status[0],
+                     "error": screen.draw_error}
+    finally:
+        if screen:
+            screen.stop()
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def screen_action(m, path, body):
-    """Install, configure or remove a screen: (HTTP status, reply). The paths
-    are the HTTP API's - POST /screens/install, /screens/<id>/settings,
-    /screens/<id>/uninstall - which MarketLink's jobs use too."""
+    """Install, configure, turn on or off, remove or try out a screen: (HTTP
+    status, reply). The paths are the HTTP API's - POST /screens/install,
+    /screens/preview, /screens/<id>/settings, /screens/<id>/enable and
+    /disable, /screens/<id>/uninstall - which MarketLink's jobs use too."""
+    if path == "/screens/preview":
+        return preview_screen(m, body)
     if path == "/screens/install":
         try:
             screen = m.addons.install(body.get("manifest"), body.get("files"), body.get("settings"), m)
@@ -1601,9 +1771,11 @@ def screen_action(m, path, body):
             return 500, {"error": f"couldn't save it: {e}"}
         if screen is None:  # a native screen: it's in, once the display restarts
             if body.get("show", True):
+                m.addons.turn(body["manifest"]["id"], True)
                 m.state.put("mode", body["manifest"]["id"])
             return 200, {"ok": True, "restarting": True}
         if body.get("show", True):
+            m.addons.turn(screen.id, True)  # (asked to show one that was off: it's on again)
             m.set_mode(screen.id)
         m.flash(f"installed {screen.name}", COL_GREEN)
         return 200, {"ok": True, "screen": screen.summary(m)}
@@ -1623,6 +1795,9 @@ def screen_action(m, path, body):
                         m.mode = WELCOME
             m.addons.uninstall(sid, m)
             return 200, {"ok": True, "restarting": m.restart}
+        if action in ("enable", "disable") and m.addons.get(sid):
+            m.turn_screen(sid, action == "enable")
+            return 200, {"ok": True, "enabled": action == "enable", "mode": m.mode}
         if action == "settings" and m.addons.get(sid):
             try:
                 screen = m.addons.configure(sid, body.get("settings") or {}, m)
@@ -1639,8 +1814,9 @@ class MarketLink:
     Not linked yet: it asks the market for a code, shows it (with a QR code)
     until someone signed in there types it in, and gets a token for it. Linked:
     it checks in - what's installed, what it just did - and the market answers
-    as soon as there's something to do (install, settings, show, uninstall),
-    or after LINK_WAIT seconds of nothing. Unlinked from the website, it starts
+    as soon as there's something to do (install, settings, show, uninstall,
+    enable / disable, or preview: draw a screen being written there), or
+    after LINK_WAIT seconds of nothing. Unlinked from the website, it starts
     over with a new code.
     """
     LINK_WAIT = 25  # the market's long-poll; our timeout is longer
@@ -1726,11 +1902,11 @@ class MarketLink:
         """Carry out one job from the market: {"id", "code", "reply"}."""
         action, sid = job.get("action"), str(job.get("screen") or "")
         try:
-            if action == "install":
-                code, reply = screen_action(self.m, "/screens/install", {
+            if action in ("install", "preview"):
+                code, reply = screen_action(self.m, f"/screens/{action}", {
                     "manifest": job.get("manifest"), "files": job.get("files"),
                     "settings": job.get("settings"), "show": job.get("show", True)})
-            elif action in ("settings", "uninstall") and SCREEN_ID.match(sid):
+            elif action in ("settings", "uninstall", "enable", "disable") and SCREEN_ID.match(sid):
                 code, reply = screen_action(self.m, f"/screens/{sid}/{action}",
                                             {"settings": job.get("settings") or {}})
             elif action == "show" and SCREEN_ID.match(sid):
@@ -1793,7 +1969,7 @@ class BeaconHandler(BaseHTTPRequestHandler):
             self._send(200, m.mode + "\n")
         elif path.startswith("/screens"):
             self._screens(path)
-        elif path.startswith("/mode/") and path[6:] in m.modes() + ("toggle",):
+        elif path.startswith("/mode/") and path[6:] in m.addons.ids() + ("toggle",):
             code, text = show_screen(m, path[6:])
             self._send(code, text + "\n")
         elif any(n.hook("route", self, m, path) for n in m.addons.natives()):
@@ -1813,7 +1989,10 @@ class BeaconHandler(BaseHTTPRequestHandler):
           POST /screens/pair/confirm       {"code", "client"} -> {"token"}
         and, with "Authorization: Bearer <token>":
           POST /screens/install            {"manifest", "files", "settings"?, "show"?}
+          POST /screens/preview            {"manifest", "files", "settings"?} -> PNGs of it
           POST /screens/<id>/settings      {"settings"}
+          POST /screens/<id>/enable        back into the screens you tap through
+          POST /screens/<id>/disable       out of them, still installed
           POST /screens/<id>/uninstall
         """
         m = self.model
@@ -2128,7 +2307,7 @@ class Renderer:
             return key + (id(a), snap.addon_view[1:], tick, snap.thinking)
         if snap.native:
             return key + tuple(snap.native.hook("scene_key", self, snap, now, default=()))
-        return key + (WELCOME, snap.screens, snap.thinking)
+        return key + (WELCOME, snap.screens, snap.screens_off, snap.thinking)
 
     def draw(self, surf, snap, now):
         for native in self.natives:
@@ -2172,8 +2351,11 @@ class Renderer:
         link this display to the Screen Market, while it isn't."""
         ui = ScreenUI(self, surf, SimpleNamespace(id=WELCOME, color=COL_ORANGE, settings={}, folder=""))
         L, x0, x1 = self.layout, ui.content_left, ui.content_right
-        title = "No screens yet" if not snap.screens else "Your screens need setting up"
-        if snap.link_code:
+        title = ("Your screens are all turned off" if snap.screens_off and not snap.screens
+                 else "No screens yet" if not snap.screens else "Your screens need setting up")
+        if snap.screens_off and not snap.screens and not snap.link_code:
+            lines = (f"Turn some back on under My display at {snap.market or 'the Screen Market'}.",)
+        elif snap.link_code:
             lines = (f"Sign in at {snap.market}, go to My display and type in this code (or scan "
                      "the QR code), then pick the screens you want.",)
         elif snap.market:
@@ -3294,11 +3476,8 @@ def main():
         model.flash(f"port {cfg.port} busy - beacons off", COL_RED, secs=60)
 
     for native in natives:  # each screen's workers: real, or --demo's fakes
-        if args.demo:
-            if native.has("demo"):
-                forever(native.mod.demo, model)
-        elif native.ready(cfg):
-            native.hook("start", model)
+        if args.demo or model.addons.is_on(native.id):
+            model.start_native(native)
     for sid in model.addons.ids():  # add-on screens fetch in demo mode too: they're real
         screen = model.addons.get(sid)
         if isinstance(screen, AddonScreen):
@@ -3349,8 +3528,10 @@ def main():
 
     clock = pygame.time.Clock()
     last_key, last_frame, last_cars, last_ip_check = None, -1, -1, 0.0
+    model.looping = True
     try:
         while True:
+            model.run_main_calls()  # pygame work for the other threads (a screen tried out)
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
                     return

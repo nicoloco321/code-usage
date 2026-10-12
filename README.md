@@ -396,6 +396,8 @@ News, and you can write your own in Python and publish it from the browser
 Screens that need a key or a location take it on their page in the market:
 the display saves it to config.ini and restarts itself. Installing or removing
 a screen like Spotify, which plugs into the display itself, restarts it too.
+Each screen has an on/off switch under My display in the market. Switched
+off, it stays installed but the display skips it.
 
 **Using it:**
 
