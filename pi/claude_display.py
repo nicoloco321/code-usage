@@ -1536,8 +1536,8 @@ class ScreenUI:
                    h / 2 if radius is None else radius)
 
     def line(self, x1, y1, x2, y2, color=COL_CARD, width=1):
-        pygame.draw.line(self.surface, parse_color(color, COL_CARD), self._px(x1, y1),
-                         self._px(x2, y2), self.r.n(width))
+        """A straight line: anti-aliased, with round ends, like lines()."""
+        self.lines([(x1, y1), (x2, y2)], parse_color(color, COL_CARD), width)
 
     def lines(self, points, color=COL_TEXT, width=1, closed=False):
         """A polyline through points. Anti-aliased: drawn on a surface SSx
