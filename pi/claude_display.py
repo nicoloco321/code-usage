@@ -79,6 +79,7 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 warnings.filterwarnings("ignore", message="Your system is neon capable")
 try:
     import pygame
+    import pygame.gfxdraw  # anti-aliased discs with an exact colour inside (ScreenUI.circle)
 except ImportError:
     sys.exit("pygame is missing - on the Pi run:  sudo apt install python3-pygame")
 
@@ -1568,12 +1569,19 @@ class ScreenUI:
         self.surface.blit(pygame.transform.smoothscale(big, (bw, bh)), (x0, y0))
 
     def circle(self, cx, cy, radius, color=COL_TEXT, width=0):
-        """A disc, or a ring `width` wide. Anti-aliased like lines(), and cached."""
+        """A disc, or a ring `width` wide, anti-aliased. A disc is drawn with
+        gfxdraw, so its inside is exactly `color`: supersampling shrinks colours
+        a notch, which shows when the disc is the background colour (the cut
+        that makes the moon a crescent). A ring is supersampled like lines()."""
         color = parse_color(color, COL_TEXT)
         r, w = self.r.n(radius), self.r.n(width) if width else 0
         x, y = self._px(cx, cy)
         if r < 2:  # a dot this small has no edge to smooth
             pygame.draw.circle(self.surface, color, (x, y), r, w)
+            return
+        if not w:
+            pygame.gfxdraw.aacircle(self.surface, x, y, r, color)
+            pygame.gfxdraw.filled_circle(self.surface, x, y, r, color)
             return
         size = 2 * r + 2
         img = self.r._ss(("circle", color, r, w), size, size,
