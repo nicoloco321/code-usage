@@ -188,7 +188,11 @@ echo "Point your Claude Code hooks or beacon.py at it - see the README."
 echo "Screens come from the Screen Market (github.com/nicoloco321/screen-market): sign in"
 echo "there, link this display with the code it shows, then add the ones you want -"
 echo "start with Claude Usage."
-[ "$MODE" = service ] && echo "Logs: journalctl -u claude-display -f"
+if [ "$MODE" = service ]; then
+  echo "Logs: journalctl -u claude-display -f"
+else
+  echo "Logs: ~/.local/state/claude-display/display.log"
+fi
 if [ "$NEED_REBOOT" = 1 ]; then
   if interactive && ask "Reboot now to finish?" y; then
     sudo reboot

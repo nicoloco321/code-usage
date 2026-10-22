@@ -88,6 +88,7 @@ sys.modules.setdefault("claude_display", sys.modules[__name__])
 
 CONFIG_PATH = os.path.expanduser("~/.config/claude-display/config.ini")
 STATE_PATH = os.path.expanduser("~/.local/state/claude-display/state.json")
+LOG_PATH = os.path.expanduser("~/.local/state/claude-display/display.log")  # start-desktop.sh writes it
 CACHE_DIR = os.path.expanduser("~/.cache/claude-display")  # reference data, re-fetched monthly
 
 
@@ -3242,9 +3243,10 @@ class HomeMenu:
               ("item", "Folder", tilde(REPO_DIR), True),
               ("item", "Config", tilde(m.cfg.path), True),
               ("item", "Update", "git pull", True),
-              ("item", "Restart", "sudo systemctl restart claude-display" if service else "sudo reboot", True)]
-        if service:
-            pi.append(("item", "Logs", "journalctl -u claude-display -f", True))
+              ("item", "Restart", "sudo systemctl restart claude-display" if service
+               else 'pkill -KILL -fx "python3 claude_display.py"', True),
+              ("item", "Logs", "journalctl -u claude-display -f" if service
+               else f"tail -f {tilde(LOG_PATH)}", True)]
         cards.append(("On the Pi", pi, 1.15))
         return cards
 

@@ -417,12 +417,17 @@ off, it stays installed but the display skips it.
   `python3 pi/claude_display.py --setup planes` (or `bambu`, `metro`).
 - Settings live in `~/.config/claude-display/config.ini`: poll rates, port,
   `size = 1280x720` to push fewer pixels on a big TV (easier on a Pi 2), and
-  `rotate` for a monitor mounted on its side. Apply changes with
-  `sudo systemctl restart claude-display`. Logs:
-  `journalctl -u claude-display -f`.
+  `rotate` for a monitor mounted on its side. Apply changes by restarting
+  the display: `sudo systemctl restart claude-display` with the Lite service,
+  or `pkill -KILL -fx "python3 claude_display.py"` on the desktop edition
+  (its launcher starts it again a few seconds later). Logs:
+  `journalctl -u claude-display -f` on Lite, or
+  `~/.local/state/claude-display/display.log` on the desktop (a fresh one
+  each boot; the one before is `display.log.old`).
 - Re-mint a login any time with
   `python3 server/device_login.py --config ~/.config/claude-display/config.ini`
-  (`spotify_login.py` takes `--config` too).
+  (`spotify_login.py` takes `--config` too), then restart the display as it
+  says: it only reads config.ini when it starts.
 - Rotated tokens and the chosen screen persist in
   `~/.local/state/claude-display/state.json`, the Pi's equivalent of the
   ESP32's NVS.
@@ -560,10 +565,11 @@ replaces the DeskSwitch from the desk-screen repo (same app id).
 | `/mode/spotify` answers 409 / "spotify not set up" | Spotify isn't configured: run `python3 server/spotify_login.py`, paste both `#define`s into config.h, reflash |
 | "spotify auth failed" | Refresh token revoked or wrong client id — re-run `spotify_login.py`. A persistent 403 usually means your account isn't added to the Spotify app (Dashboard → your app → User Management) |
 | "nothing playing" but music is on | Spotify only reports an *active* device; start playback from any Spotify app and it appears within one poll (~5 s) |
+| Pi: "auth failed - run device_login.py" | The display's Claude login was rejected (revoked, or signed out). Re-run it on the Pi itself, with `--config`: `python3 server/device_login.py --config ~/.config/claude-display/config.ini` (without it, it only prints a line for config.h). Then restart the display as it says |
 | Pi: "the buttons need a new spotify login" | The Spotify login predates the buttons, so it can't control playback. Re-run `python3 server/spotify_login.py --config ~/.config/claude-display/config.ini`, then restart the display |
 | Pi: "the buttons need Spotify Premium" | Spotify only takes playback commands from Premium accounts. Now playing and the queue still work |
 | Pi: "no active Spotify device" | Spotify has nothing to send the command to, e.g. playback was paused long ago. Start playing on any device, then the buttons work |
-| Pi: "No screens yet" | Every screen comes from the [Screen Market](https://debian.tail4287f.ts.net/#/): sign in there, link the display with the code it shows, and add some. No code on screen? Set `[market] url` in config.ini, and check `journalctl -u claude-display` for why it can't reach the market |
+| Pi: "No screens yet" | Every screen comes from the [Screen Market](https://debian.tail4287f.ts.net/#/): sign in there, link the display with the code it shows, and add some. No code on screen? Set `[market] url` in config.ini, and check the logs (`journalctl -u claude-display`, or `~/.local/state/claude-display/display.log` on the desktop) for why it can't reach the market |
 | Pi: a screen says it isn't set up (or `POST /mode/...` answers 409) | It needs a key, location or login first: see its page in the Screen Market, which says what and can take most of them |
 | Pi: blank screen, service keeps restarting | `journalctl -u claude-display -e`. "could not open the screen" on Lite means no KMS driver: `/boot/firmware/config.txt` needs `dtoverlay=vc4-kms-v3d` (the default). Re-run `bash pi/install.sh` to fix group access |
 | Pi: picture has black borders or is cut off | Turn off overscan (`sudo raspi-config` → Display Options), or force a mode with `size = WxH` in config.ini |

@@ -122,6 +122,15 @@ def save_to_config(path, section, values):
         f.write("\n".join(out) + "\n")
 
 
+def restart_command():
+    """How to restart the Raspberry Pi app so it reads config.ini again - same
+    as device_login.py's: the systemd service on Lite, or else killing the app
+    so pi/start-desktop.sh starts it again."""
+    if os.path.exists("/etc/systemd/system/claude-display.service"):
+        return "sudo systemctl restart claude-display"
+    return 'pkill -KILL -fx "python3 claude_display.py"'
+
+
 class _Callback(http.server.BaseHTTPRequestHandler):
     """Catches Spotify's redirect back to 127.0.0.1 and stashes the code."""
     result = None
@@ -252,7 +261,7 @@ def main():
     if args.config:
         save_to_config(args.config, "spotify", {"client_id": client_id, "refresh_token": refresh})
         print(f"\nSaved client_id and refresh_token under [spotify] in {args.config}.")
-        print("Restart the display to use it: sudo systemctl restart claude-display (or reboot)")
+        print("Restart the display to use it:", restart_command())
         return
 
     print("\nPaste these lines into firmware/src/config.h (replacing the empty ones):\n")

@@ -117,6 +117,16 @@ def save_to_config(path, section, values):
         f.write("\n".join(out) + "\n")
 
 
+def restart_command():
+    """How to restart the Raspberry Pi app so it reads config.ini again, the
+    way pi/install.sh started it: the systemd service on Raspberry Pi OS Lite,
+    or else the desktop autostart's pi/start-desktop.sh, which starts the app
+    again when it's killed (but not when it quits)."""
+    if os.path.exists("/etc/systemd/system/claude-display.service"):
+        return "sudo systemctl restart claude-display"
+    return 'pkill -KILL -fx "python3 claude_display.py"'
+
+
 def main():
     ap = argparse.ArgumentParser(description="Mint a usage-reading login for the display.")
     ap.add_argument("--config", metavar="PATH",
@@ -199,7 +209,7 @@ def main():
     if args.config:
         save_to_config(args.config, "anthropic", {"refresh_token": refresh})
         print(f"\nSaved to [anthropic] refresh_token in {args.config}.")
-        print("Restart the display to use it: sudo systemctl restart claude-display (or reboot)")
+        print("Restart the display to use it:", restart_command())
         return
 
     print("\nPaste this line into firmware/src/config.h (replacing the existing one):\n")
