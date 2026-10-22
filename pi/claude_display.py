@@ -1539,13 +1539,47 @@ class ScreenUI:
                          self._px(x2, y2), self.r.n(width))
 
     def lines(self, points, color=COL_TEXT, width=1, closed=False):
-        if len(points) > 1:
-            pygame.draw.lines(self.surface, parse_color(color, COL_TEXT), closed,
-                              [self._px(x, y) for x, y in points], self.r.n(width))
+        """A polyline through points. Anti-aliased: drawn on a surface SSx
+        bigger and smoothscaled down, so diagonals look smooth, not stepped.
+        Round joints and caps keep a thick line from notching at the corners."""
+        if len(points) < 2:
+            return
+        color = parse_color(color, COL_TEXT)
+        w = max(1, self.r.n(width))
+        if w <= 1:  # a hairline doesn't gain from supersampling
+            pygame.draw.lines(self.surface, color, closed, [self._px(x, y) for x, y in points], w)
+            return
+        r = self.r  # (unrounded pixels: a curve's many points would each round a different way)
+        pts = [(r.ox + x * r.s, r.oy + y * r.s) for x, y in points]
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        pad = w + 2
+        x0, y0 = int(min(xs) - pad), int(min(ys) - pad)
+        bw = int(max(xs) + pad) - x0
+        bh = int(max(ys) + pad) - y0
+        if bw <= 0 or bh <= 0:
+            return
+        big = pygame.Surface((bw * SS, bh * SS), pygame.SRCALPHA, 32)
+        big.fill((*color, 0))  # same colour, clear: edges ramp in alpha only, so
+        local = [(round((px - x0) * SS), round((py - y0) * SS)) for px, py in pts]  # no dark
+        lw = max(1, w * SS)                                                          # fringe
+        pygame.draw.lines(big, color, closed, local, lw)                            # over
+        for p in local:  # fill the mitre gaps so joints and ends are round         # anything
+            pygame.draw.circle(big, color, p, lw // 2)
+        self.surface.blit(pygame.transform.smoothscale(big, (bw, bh)), (x0, y0))
 
     def circle(self, cx, cy, radius, color=COL_TEXT, width=0):
-        pygame.draw.circle(self.surface, parse_color(color, COL_TEXT), self._px(cx, cy),
-                           self.r.n(radius), self.r.n(width) if width else 0)
+        """A disc, or a ring `width` wide. Anti-aliased like lines(), and cached."""
+        color = parse_color(color, COL_TEXT)
+        r, w = self.r.n(radius), self.r.n(width) if width else 0
+        x, y = self._px(cx, cy)
+        if r < 2:  # a dot this small has no edge to smooth
+            pygame.draw.circle(self.surface, color, (x, y), r, w)
+            return
+        size = 2 * r + 2
+        img = self.r._ss(("circle", color, r, w), size, size,
+                         lambda big, k: pygame.draw.circle(big, color, (size * k // 2, size * k // 2), r * k, w * k),
+                         fill=color)
+        self.surface.blit(img, (x - size // 2, y - size // 2))
 
     def polygon(self, points, color=COL_TEXT, width=0):
         pygame.draw.polygon(self.surface, parse_color(color, COL_TEXT),
@@ -2185,15 +2219,18 @@ class Renderer:
         return line, self.fit(" ".join(words[i:]), max_w, size, bold)
 
     # -- shapes
-    def _ss(self, key, w, h, draw):
+    def _ss(self, key, w, h, draw, fill=COL_BG):
         """An anti-aliased shape: drawn SSx larger, smoothscaled down, cached.
         The background is transparent, so it blends into whatever is under it
-        (smoothscale shifts colours a notch, which an opaque box would show)."""
+        (smoothscale shifts colours a notch, which an opaque box would show).
+        `fill` is the colour the edges ramp from: COL_BG for a shape that sits
+        on the background, or the shape's own colour for one drawn over other
+        things (a circle on an icon), so its rim fades in alpha, not to a seam."""
         key = (key, w, h)
         img = self.shape_cache.get(key)
         if img is None:
             big = pygame.Surface((w * SS, h * SS), pygame.SRCALPHA, 32)
-            big.fill((*COL_BG, 0))  # edges fade toward the background, not black
+            big.fill((*fill, 0))
             draw(big, SS)
             img = pygame.transform.smoothscale(big, (w, h))
             if len(self.shape_cache) > 200:
