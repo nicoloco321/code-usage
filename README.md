@@ -372,7 +372,7 @@ the screen from its own Power port.
 3. Reboot if it asks you to. From then on the display comes up by itself.
 
 **Screens.** The Pi app comes with no screens of its own: they all come from
-the [**Screen Market**](https://github.com/nicoloco321/screen-market), a web
+the [**Screen Market**](https://debian.tail4287f.ts.net/#/), a web
 app you run in Docker (on CasaOS, say). Until you add some, the display shows
 how. Link it to your account there once (it shows a code; sign in and type it
 in, or scan its QR code), then pick screens from any browser and they appear
@@ -382,17 +382,17 @@ Some to start with:
 
 | Screen | What it shows | Setup |
 |---|---|---|
-| [Claude Usage](https://github.com/nicoloco321/screen-market/tree/main/catalog/usage) | your 5-hour and weekly limits, the thinking spinner, and a panel of what each session is doing | a login made on the Pi: `server/device_login.py` |
-| [Spotify](https://github.com/nicoloco321/screen-market/tree/main/catalog/spotify) | now playing, with play/pause/skip buttons and the queue | a login made on the Pi: `server/spotify_login.py` |
-| [3D Printer](https://github.com/nicoloco321/screen-market/tree/main/catalog/bambu) | a Bambu Lab print's progress and temperatures | the printer's access code |
-| [Planes Overhead](https://github.com/nicoloco321/screen-market/tree/main/catalog/planes) | the nearest plane in its airline's livery, and a radar | your location |
-| [Formula 1](https://github.com/nicoloco321/screen-market/tree/main/catalog/f1) | the weekend's track with the cars moving round it live | none |
-| [DC Metro](https://github.com/nicoloco321/screen-market/tree/main/catalog/metro) | every WMATA train on a live map, and your next trains | a free WMATA key |
-| [E*TRADE](https://github.com/nicoloco321/screen-market/tree/main/catalog/etrade) | today's gain or loss, and how each holding moved | an E*TRADE API key and a one-time login, or holdings you list |
+| [Claude Usage](https://debian.tail4287f.ts.net/#/screen/usage) | your 5-hour and weekly limits, the thinking spinner, and a panel of what each session is doing | a login made on the Pi: `server/device_login.py` |
+| [Spotify](https://debian.tail4287f.ts.net/#/screen/spotify) | now playing, with play/pause/skip buttons and the queue | a login made on the Pi: `server/spotify_login.py` |
+| [3D Printer](https://debian.tail4287f.ts.net/#/screen/bambu) | a Bambu Lab print's progress and temperatures | the printer's access code |
+| [Planes Overhead](https://debian.tail4287f.ts.net/#/screen/planes) | the nearest plane in its airline's livery, and a radar | your location |
+| [Formula 1](https://debian.tail4287f.ts.net/#/screen/f1) | the weekend's track with the cars moving round it live | none |
+| [DC Metro](https://debian.tail4287f.ts.net/#/screen/metro) | every WMATA train on a live map, and your next trains | a free WMATA key |
+| [E*TRADE](https://debian.tail4287f.ts.net/#/screen/etrade) | today's gain or loss, and how each holding moved | an E*TRADE API key and a one-time login, or holdings you list |
 
 There's also weather, a world clock, a countdown, crypto prices and Hacker
-News, and you can write your own in Python and publish it from the browser
-(see the [Screen Market's README](https://github.com/nicoloco321/screen-market#writing-a-screen)).
+News, and you can write your own in Python and publish it from the browser,
+on the Screen Market's [Publish page](https://debian.tail4287f.ts.net/#/publish).
 Screens that need a key or a location take it on their page in the market:
 the display saves it to config.ini and restarts itself. Installing or removing
 a screen like Spotify, which plugs into the display itself, restarts it too.
@@ -432,8 +432,9 @@ off, it stays installed but the display skips it.
 - **Try it anywhere, no logins needed:**
   `python3 pi/claude_display.py --demo --windowed 800x480` (on a PC,
   `pip install pygame` first) shows the installed screens with fake data. To
-  try screens without the market, copy their folders from screen-market's
-  `catalog/` into `~/.local/share/claude-display/screens/`.
+  try screens without linking, download them with **Download .zip** on their
+  pages in the [Screen Market](https://debian.tail4287f.ts.net/#/) and unzip
+  them into `~/.local/share/claude-display/screens/`.
 
 ## Windows tray helper
 
@@ -562,7 +563,7 @@ replaces the DeskSwitch from the desk-screen repo (same app id).
 | Pi: "the buttons need a new spotify login" | The Spotify login predates the buttons, so it can't control playback. Re-run `python3 server/spotify_login.py --config ~/.config/claude-display/config.ini`, then restart the display |
 | Pi: "the buttons need Spotify Premium" | Spotify only takes playback commands from Premium accounts. Now playing and the queue still work |
 | Pi: "no active Spotify device" | Spotify has nothing to send the command to, e.g. playback was paused long ago. Start playing on any device, then the buttons work |
-| Pi: "No screens yet" | Every screen comes from the [Screen Market](https://github.com/nicoloco321/screen-market): sign in there, link the display with the code it shows, and add some. No code on screen? Set `[market] url` in config.ini, and check `journalctl -u claude-display` for why it can't reach the market |
+| Pi: "No screens yet" | Every screen comes from the [Screen Market](https://debian.tail4287f.ts.net/#/): sign in there, link the display with the code it shows, and add some. No code on screen? Set `[market] url` in config.ini, and check `journalctl -u claude-display` for why it can't reach the market |
 | Pi: a screen says it isn't set up (or `POST /mode/...` answers 409) | It needs a key, location or login first: see its page in the Screen Market, which says what and can take most of them |
 | Pi: blank screen, service keeps restarting | `journalctl -u claude-display -e`. "could not open the screen" on Lite means no KMS driver: `/boot/firmware/config.txt` needs `dtoverlay=vc4-kms-v3d` (the default). Re-run `bash pi/install.sh` to fix group access |
 | Pi: picture has black borders or is cut off | Turn off overscan (`sudo raspi-config` → Display Options), or force a mode with `size = WxH` in config.ini |
