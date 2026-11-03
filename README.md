@@ -411,6 +411,11 @@ off, it stays installed but the display skips it.
   display's address and port, the command that points a computer's Claude
   Code hooks at it, the logins its screens need, and how to SSH in, restart,
   read the logs and update. With a keyboard, the down arrow or M opens it.
+- The home menu's **Standby** button leaves only a dim clock on black, which
+  moves every minute so nothing burns in. Its **Off** button blanks the screen.
+  Double tap anywhere to come back to your screens (or press Esc, Space or
+  Enter). Off draws black rather than cutting power, so a backlit panel still
+  glows faintly. Restarting the display brings the screens back too.
 - The Pi has no status LED, so while Claude works, screens without a spinner
   of their own show a small one and "Claude is working..." in the status line.
 - Some screens have a setup step of their own on the Pi:

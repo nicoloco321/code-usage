@@ -40,8 +40,10 @@ Keys: tap / click / space switches screens, Ctrl+Q quits (Esc too, windowed).
 A screen can have buttons of its own (Spotify's play / pause, say): a tap on
 one presses it instead. Swipe down from the top edge (or drag with the mouse,
 or press the down arrow or M) for the home menu: every screen, to tap the one
-you want, and Settings with the display's address, its logins and the Pi's
-commands. Swipe it back up, or press Esc.
+you want, Settings with the display's address, its logins and the Pi's
+commands, and Standby (a dim clock that keeps moving, so nothing burns in) and
+Off (a blank screen): double tap to come back from those. Swipe it back up, or
+press Esc.
 """
 
 import argparse
@@ -2659,6 +2661,7 @@ class Renderer:
 
 MENU_SECS = 0.25     # sliding all the way down or back up
 MENU_IDLE_SECS = 60  # left down with nobody touching it, it goes back up
+DOUBLE_TAP_SECS = 0.6  # two taps this close together wake standby or off
 # For the commands on the Settings page. DejaVu's ships with Raspberry Pi OS;
 # the others let you try the menu on a desktop. Falls back to the regular font.
 MONO_CANDIDATES = ["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
@@ -2686,6 +2689,12 @@ class HomeMenu:
     is, how to point Claude Code at it, the logins its screens need, and how
     to look after the Pi.
 
+    Its Standby and Off buttons put the screen to rest. Off is all black.
+    Standby is all black but for a dim clock that moves every minute, so no
+    pixel stays lit for long and nothing burns in. Either way only a double
+    tap (or a key) brings the screens back, and the menu goes on taking every
+    touch and drawing until one does.
+
     The sections sit side by side on wide layouts (landscape, bar) and stack
     on tall ones (portrait, strip). The main loop hands it every touch first
     (press / drag / release) and, while it's down, lets it draw (frame)."""
@@ -2701,6 +2710,8 @@ class HomeMenu:
     GRIP = {"landscape": (400, 458, 64, 6), "bar": (740, 305, 72, 6),
             "portrait": (90, 310, 36, 4), "strip": (160, 1450, 80, 8)}
     TEXT = {"landscape": 14, "bar": 15, "portrait": 8, "strip": 16}
+    STANDBY_TEXT = {"landscape": 56, "bar": 72, "portrait": 30, "strip": 44}  # standby's clock
+    STANDBY_COL = (70, 70, 70)  # dim: the less light, the less wear
 
     def __init__(self, model, renderer):
         self.m, self.r = model, renderer
@@ -2716,6 +2727,9 @@ class HomeMenu:
         self.stale = False      # going back up: draw that screen afresh (it may be another one now)
         self.page = "screens"   # or "settings"
         self.sheet = 0          # which page of cards Settings is on (portrait has a few)
+        self.resting = None     # "standby" or "off" while the screen's at rest (see rest)
+        self.rest_key = None    # what the rest screen shows
+        self.tapped = -1e9      # when the rest screen was last tapped
         self.surf = None        # the menu, drawn
         self.under = None       # the screen it slides over
         self.key = None         # what self.surf shows
@@ -2735,8 +2749,8 @@ class HomeMenu:
 
     @property
     def out(self):
-        """Is it on the screen, or on its way?"""
-        return self.pos > 0 or self.fresh or self.moving
+        """Is it on the screen, or on its way? (Or the rest screen, in its place.)"""
+        return self.resting is not None or self.pos > 0 or self.fresh or self.moving
 
     @property
     def moving(self):
@@ -2749,11 +2763,20 @@ class HomeMenu:
         self.glide(1.0)
 
     def close(self):
-        self.glide(0.0)
+        if self.resting:
+            self.resting = None  # back to the screens, drawn afresh
+        else:
+            self.glide(0.0)
 
     def glide(self, to):
         self.slide = (self.pos, to, time.monotonic())
         self.stale = self.stale or to == 0
+
+    def rest(self, kind):
+        """Standby or Off was tapped: the menu's gone at once, not sliding away
+        over the screen, and the rest screen takes its place."""
+        self.pos, self.slide, self.stale, self.under = 0.0, None, False, None
+        self.resting, self.rest_key, self.tapped = kind, None, -1e9
 
     # -- touches, in canvas pixels
     def press(self, pos):
@@ -2798,6 +2821,12 @@ class HomeMenu:
         if not self.out:
             return False
         if abs(t.x - t.x0) < self.slop and abs(t.y - t.y0) < self.slop and not self.slide:
+            if self.resting:
+                now = time.monotonic()
+                if now - self.tapped < DOUBLE_TAP_SECS:
+                    self.close()
+                self.tapped = now
+                return True
             what = next((w for rect, w in self.hits if rect.collidepoint(t.x, t.y)), None)
             if what and what[0] == "show":
                 self.choose(what[1])
@@ -2805,6 +2834,8 @@ class HomeMenu:
                 self.page, self.sheet = what[1], 0
             elif what and what[0] == "sheet":
                 self.sheet += 1
+            elif what and what[0] == "rest":
+                self.rest(what[1])
         return True
 
     def choose(self, sid):
@@ -2819,6 +2850,8 @@ class HomeMenu:
     # -- drawing
     def frame(self, canvas, snap, now):
         """Put the menu on the canvas as it is now; True if that changed it."""
+        if self.resting:
+            return self.rest_frame(canvas, snap, now)
         if self.fresh:  # coming down: keep the screen it covers
             self.fresh, self.under, self.key = False, canvas.copy(), None
         if self.stale and self.under is not None:  # going up: to the screen as it is now
@@ -2850,6 +2883,35 @@ class HomeMenu:
                 self.under = None  # all the way up: the screen gets drawn afresh
         return True
 
+    def rest_frame(self, canvas, snap, now):
+        """Put the rest screen on the canvas, afresh each minute (a window over
+        it won't stay); True if that changed it. A pairing code still shows:
+        someone's standing there waiting to type it in."""
+        minute = int(now.timestamp() // 60)
+        key = (self.resting, minute, snap.pair_code)
+        if key == self.rest_key:
+            return False
+        self.rest_key = key
+        canvas.fill((0, 0, 0))
+        if self.resting == "standby":
+            self.standby(canvas, now, minute)
+        if snap.pair_code:
+            self.r._pair_card(canvas, snap.pair_code)
+        return True
+
+    def standby(self, canvas, now, minute):
+        """The dim clock, somewhere else each minute. The steps of a
+        low-discrepancy sequence spread its places evenly over the whole
+        screen, each a good way from the last."""
+        size = self.STANDBY_TEXT[self.r.layout]
+        hours = self.r.font(size).render(clock_str(now), True, self.STANDBY_COL)
+        day = self.r.font(size * 0.32).render(f"{now.strftime('%a %b')} {now.day}", True, self.STANDBY_COL)
+        w, h = max(hours.get_width(), day.get_width()), hours.get_height() + day.get_height()
+        x = round((self.W - w) * (minute * 0.7548776662 % 1))
+        y = round((self.H - h) * (minute * 0.5698402910 % 1))
+        canvas.blit(hours, (x + (w - hours.get_width()) // 2, y))
+        canvas.blit(day, (x + (w - day.get_width()) // 2, y + hours.get_height()))
+
     def scene_key(self, snap, now):
         """Everything that changes the menu's picture."""
         screens = tuple((s.id, self.m.is_ready(s.id), self.tile_status(s, snap)) for s in self.installed())
@@ -2879,39 +2941,51 @@ class HomeMenu:
 
     def header(self, ui, title, sub, now, page, sheets=None):
         """The title row: the title and a line under it (sub: (text, colour)),
-        the clock, and the button to the other page. sheets = (this one,
-        how many) puts a button for the next one beside it."""
+        the clock, and the buttons: standby, off and the other page. sheets =
+        (this one, how many) puts a button for the next one beside them."""
         L = self.r.layout
         text, color = sub
         label = "Settings" if page == "settings" else "Screens"
         if L == "landscape":
-            self.pill(ui, 768, 27, 50, page, label)
+            left = self.buttons(ui, 768, 31, 42, page, label, gap=8)
+            date = f"{now.strftime('%a %b')} {now.day}"
             ui.text(title, 32, 58, 30, COL_TEXT, bold=True)
-            ui.text(ui.fit(text, 400, 16), 32, 83, 16, color)
-            ui.text(clock_str(now), 590, 58, 26, COL_TEXT, align="r")
-            ui.text(f"{now.strftime('%a %b')} {now.day}", 590, 81, 15, COL_DIM, align="r")
+            ui.text(ui.fit(text, left - 16 - ui.width(date, 15) - 12 - 32, 16), 32, 83, 16, color)
+            ui.text(clock_str(now), left - 16, 58, 26, COL_TEXT, align="r")
+            ui.text(date, left - 16, 81, 15, COL_DIM, align="r")
         elif L == "bar":
-            self.pill(ui, 1452, 14, 48, page, label)
+            left = self.buttons(ui, 1452, 14, 48, page, label, gap=10)
+            clock = clock_str(now)
             ui.text(title, 28, 50, 30, COL_TEXT, bold=True)
             x = 28 + ui.width(title, 30, True) + 24
-            ui.text(ui.fit(text, 1080 - x, 18), x, 50, 18, color)
-            ui.text(clock_str(now), 1268, 49, 24, COL_TEXT, bold=True, align="r")
+            ui.text(ui.fit(text, left - 24 - ui.width(clock, 24, True) - 32 - x, 18), x, 50, 18, color)
+            ui.text(clock, left - 24, 49, 24, COL_TEXT, bold=True, align="r")
         elif L == "strip":
             ui.text(clock_str(now), 160, 64, 22, COL_DIM, align="c")
             ui.text(title, 160, 118, 40, COL_TEXT, bold=True, align="c")
             for i, line in enumerate(ui.wrap(text, 272, 18, lines=2)):
                 ui.text(line, 160, 150 + i * 24, 18, color, align="c")
-            self.pill(ui, 160, 182, 52, page, label, align="c")
-        else:  # portrait: room for the title and the buttons, no more
+            self.buttons(ui, 264, 182, 52, page, label, gap=10, align="icon")  # (three icons, centred)
+        elif page == "settings":  # portrait's screens: room for the title and the buttons, no more
+            left = self.buttons(ui, 168, 11, 25, page, label, gap=3, align="icon")
+            ui.text(title, 12, 29, ui.fit_size(title, left - 16, 16, True), COL_TEXT, bold=True)
+        else:  # portrait's settings: no room for standby and off beside the next sheet's button
             ui.text(title, 12, 29, 16, COL_TEXT, bold=True)
             self.pill(ui, 168, 9, 28, page, label, align="icon")
             if sheets:  # (only portrait's settings come in pages)
                 self.pill(ui, 130, 9, 28, "sheet", f"{sheets[0] + 1}/{sheets[1]}", align="icon")
 
+    def buttons(self, ui, x, y, h, page, label, gap, align="r"):
+        """The title row's buttons, leftwards from x: the other page's, off,
+        standby. Returns their left edge."""
+        for what, text in ((page, label), ("off", "Off"), ("standby", "Standby")):
+            x = self.pill(ui, x, y, h, what, text, align) - gap
+        return x + gap
+
     def pill(self, ui, x, y, h, what, label, align="r"):
-        """A rounded button with an icon and a label: its right edge at x
-        (align "r"), or its centre ("c"); "icon" makes a square one with just
-        the icon, right edge at x - or for "sheet", just the label."""
+        """A rounded button with an icon and a label, its right edge at x;
+        align "icon" makes a square one with just the icon - or for "sheet",
+        just the label. Returns its left edge."""
         s = h * 0.44
         if align == "icon":
             w = h * 1.2
@@ -2924,14 +2998,17 @@ class HomeMenu:
         else:
             size = h * 0.38
             w = h * 0.42 + s + h * 0.24 + ui.width(label, size, True) + h * 0.5
-            x -= w if align == "r" else w / 2
+            x -= w
             ui.rect(x, y, w, h, COL_CARD, radius=h / 2)
             self.glyph(ui, what, x + h * 0.42 + s / 2, y + h / 2, s)
             ui.text(label, x + h * 0.42 + s + h * 0.24, y + h * 0.64, size, COL_TEXT, bold=True)
-        self.hits.append((self.r.rect(x, y, w, h), ("sheet",) if what == "sheet" else ("page", what)))
+        does = ("sheet",) if what == "sheet" else ("rest", what) if what in ("standby", "off") else ("page", what)
+        self.hits.append((self.r.rect(x, y, w, h), does))
+        return x
 
     def glyph(self, ui, what, cx, cy, size):
-        """The buttons' icons: a gear for Settings, four squares for Screens."""
+        """The buttons' icons: a gear for Settings, four squares for Screens,
+        a crescent moon for Standby, the power symbol for Off."""
         px = self.r.n(size)
 
         def draw(big, k):
@@ -2946,6 +3023,14 @@ class HomeMenu:
                         for r, w in ((c * 0.6, -c * 0.2), (c, -c * 0.15), (c, c * 0.15), (c * 0.6, c * 0.2))])
                 pygame.draw.circle(big, COL_TEXT, (c, c), c * 0.74)
                 pygame.draw.circle(big, COL_CARD, (c, c), c * 0.3)
+            elif what == "standby":  # a disc, then a bite out of it
+                pygame.draw.circle(big, COL_TEXT, (c, c), c * 0.94)
+                pygame.draw.circle(big, COL_CARD, (c * 1.4, c * 0.72), c * 0.72)
+            elif what == "off":  # a ring, a gap in its top, and a stroke through the gap
+                w = round(p * 0.13)
+                pygame.draw.circle(big, COL_TEXT, (c, c * 1.1), c * 0.84, w)
+                pygame.draw.rect(big, COL_CARD, (c - w * 1.3, 0, w * 2.6, c))
+                pygame.draw.rect(big, COL_TEXT, (c - w / 2, 0, w, c * 1.1), border_radius=w // 2)
             else:
                 g = p * 0.42
                 for i, j in ((0, 0), (1, 0), (0, 1), (1, 1)):
@@ -2958,7 +3043,8 @@ class HomeMenu:
     # -- the screens
     def screens(self, ui, snap, now):
         L = self.r.layout
-        hint = ("tap one to show it  ·  swipe up to go back", COL_DIM)
+        hint = ("tap one to show it" if L == "landscape" else  # (the buttons leave it less room)
+                "tap one to show it  ·  swipe up to go back", COL_DIM)
         self.header(ui, "Screens", snap.flash or (("Claude is working...", COL_ORANGE)
                                                   if snap.thinking else hint), now, "settings")
         screens = self.installed()
