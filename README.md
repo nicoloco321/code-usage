@@ -383,7 +383,7 @@ Some to start with:
 | Screen | What it shows | Setup |
 |---|---|---|
 | [Claude Usage](https://debian.tail4287f.ts.net/#/screen/usage) | your 5-hour and weekly limits, the thinking spinner, and a panel of what each session is doing | a login made on the Pi: `server/device_login.py` |
-| [Spotify](https://debian.tail4287f.ts.net/#/screen/spotify) | now playing, with play/pause/skip buttons and the queue | a login made on the Pi: `server/spotify_login.py` |
+| [Spotify](https://debian.tail4287f.ts.net/#/screen/spotify) | now playing, with play/pause/skip buttons, the queue and your playlists | a login made on the Pi: `server/spotify_login.py` |
 | [3D Printer](https://debian.tail4287f.ts.net/#/screen/bambu) | a Bambu Lab print's progress and temperatures | the printer's access code |
 | [Planes Overhead](https://debian.tail4287f.ts.net/#/screen/planes) | the nearest plane in its airline's livery, and a radar | your location |
 | [Formula 1](https://debian.tail4287f.ts.net/#/screen/f1) | the weekend's track with the cars moving round it live | none |
@@ -572,6 +572,7 @@ replaces the DeskSwitch from the desk-screen repo (same app id).
 | "nothing playing" but music is on | Spotify only reports an *active* device; start playback from any Spotify app and it appears within one poll (~5 s) |
 | Pi: "auth failed - run device_login.py" | The display's Claude login was rejected (revoked, or signed out). Re-run it on the Pi itself, with `--config`: `python3 server/device_login.py --config ~/.config/claude-display/config.ini` (without it, it only prints a line for config.h). Then restart the display as it says |
 | Pi: "the buttons need a new spotify login" | The Spotify login predates the buttons, so it can't control playback. Re-run `python3 server/spotify_login.py --config ~/.config/claude-display/config.ini`, then restart the display |
+| Pi: Spotify's playlists say "needs a new spotify login" | The Spotify login predates the playlists panel, so it can't list them. Re-run `python3 server/spotify_login.py --config ~/.config/claude-display/config.ini`, then restart the display |
 | Pi: "the buttons need Spotify Premium" | Spotify only takes playback commands from Premium accounts. Now playing and the queue still work |
 | Pi: "no active Spotify device" | Spotify has nothing to send the command to, e.g. playback was paused long ago. Start playing on any device, then the buttons work |
 | Pi: "No screens yet" | Every screen comes from the [Screen Market](https://debian.tail4287f.ts.net/#/): sign in there, link the display with the code it shows, and add some. No code on screen? Set `[market] url` in config.ini, and check the logs (`journalctl -u claude-display`, or `~/.local/state/claude-display/display.log` on the desktop) for why it can't reach the market |
