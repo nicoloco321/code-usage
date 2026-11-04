@@ -3537,6 +3537,18 @@ def unrotate_point(p, rotate, cw, ch):
     return x, y
 
 
+def own_command():
+    """The command line this was started with, to start again with: the same
+    one, so the `pkill -fx` that restarts the display still finds it afterwards.
+    (sys.executable + sys.argv isn't it: "python3" comes back as its full path.)
+    Only Linux says; anywhere else, that's close enough."""
+    try:
+        with open("/proc/self/cmdline", "rb") as f:
+            return [os.fsdecode(arg) for arg in f.read().split(b"\0")[:-1]]
+    except OSError:
+        return [sys.executable] + sys.argv
+
+
 def open_screen(args, cfg):
     pygame.display.init()
     pygame.font.init()
@@ -3702,7 +3714,7 @@ def main():
                 log("restarting with the new screens / settings")
                 time.sleep(0.5)  # let the HTTP reply go out
                 pygame.quit()
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                os.execv(sys.executable, own_command())
 
             mono = time.monotonic()
             if mono - last_ip_check > 10:  # DHCP may hand us a new address
