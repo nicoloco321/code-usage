@@ -35,6 +35,8 @@ find_display.py and the /switch command work unchanged - point them at the Pi.
 Settings live in ~/.config/claude-display/config.ini (see config.example.ini);
 pi/install.sh sets everything up to start fullscreen on boot. Needs pygame 2
 (sudo apt install python3-pygame); everything else is the standard library.
+emoji.pack, beside this file, is what it draws emoji with: without it, they're
+the boxes a font draws for what it doesn't have.
 
 Keys: tap / click / space switches screens, Ctrl+Q quits (Esc too, windowed).
 A screen can have buttons of its own (Spotify's play / pause, say): a tap on
@@ -2106,6 +2108,154 @@ def find_fonts():
     return None, None
 
 
+# -- emoji. Bullseye's font library can't draw a colour emoji font, so emoji are
+# pictures, from emoji.pack (see build_emoji.py), and EmojiFont puts them in
+# among the letters. All the text on every screen goes through a font's size()
+# and render(), so that's all it takes.
+
+EMOJI_PACK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emoji.pack")
+EMOJI_FROM = "‼"  # text with nothing from here up can't have an emoji in it
+AS_TEXT, AS_EMOJI, JOINER = "︎", "️", "‍"
+# Below U+1F000, these are emoji as they stand (Emoji_Presentation in Unicode's
+# emoji-data.txt). The others down there, like the plane and the heart, stay
+# letters unless AS_EMOJI follows: screens use some of them as symbols.
+EMOJI_BY_DEFAULT = frozenset(chr(c) for first, last in (
+    (0x231A, 0x231B), (0x23E9, 0x23EC), (0x23F0, 0x23F0), (0x23F3, 0x23F3), (0x25FD, 0x25FE),
+    (0x2614, 0x2615), (0x2648, 0x2653), (0x267F, 0x267F), (0x2693, 0x2693), (0x26A1, 0x26A1),
+    (0x26AA, 0x26AB), (0x26BD, 0x26BE), (0x26C4, 0x26C5), (0x26CE, 0x26CE), (0x26D4, 0x26D4),
+    (0x26EA, 0x26EA), (0x26F2, 0x26F3), (0x26F5, 0x26F5), (0x26FA, 0x26FA), (0x26FD, 0x26FD),
+    (0x2705, 0x2705), (0x270A, 0x270B), (0x2728, 0x2728), (0x274C, 0x274C), (0x274E, 0x274E),
+    (0x2753, 0x2755), (0x2757, 0x2757), (0x2795, 0x2797), (0x27B0, 0x27B0), (0x27BF, 0x27BF),
+    (0x2B1B, 0x2B1C), (0x2B50, 0x2B50), (0x2B55, 0x2B55)) for c in range(first, last + 1))
+
+
+class EmojiPack:
+    """emoji.pack: finding its emoji in text, and its pictures at a size. With
+    no pack there are no emoji, just the boxes a font draws for them."""
+
+    def __init__(self, path):
+        self.emoji, self.longest, self.images = {}, {}, {}
+        self.file, self.start = None, 0
+        try:
+            self.file = open(path, "rb")  # kept open: a git pull can't change it under us
+            index = json.loads(self.file.readline())
+            self.emoji, self.longest, self.start = index["emoji"], index["longest"], self.file.tell()
+        except (OSError, ValueError, KeyError) as e:
+            log(f"no emoji on this display: {path}: {e}")
+
+    def match(self, s, i):
+        """The emoji that starts at s[i] -> (its characters, the index after
+        it), or None. The longest there is, so a flag isn't two letters and a
+        family isn't four people; AS_EMOJI anywhere in it doesn't count."""
+        most = self.longest.get(s[i])
+        if not most:
+            return None
+        chars, ends, j = "", [], i
+        while j < len(s) and len(chars) < most:
+            if s[j] != AS_EMOJI:
+                chars += s[j]
+                ends.append(j + 1)
+            j += 1
+        for n in range(len(chars), 0, -1):
+            if chars[:n] in self.emoji:
+                end = ends[n - 1]
+                after = s[end] if end < len(s) else ""
+                if n == 1 and (after == AS_TEXT or (after != AS_EMOJI and s[i] < "\U0001f000"
+                                                    and s[i] not in EMOJI_BY_DEFAULT)):
+                    return None  # a letter, as it asks to be or by default
+                return chars[:n], end + (after == AS_EMOJI)
+        return None
+
+    def runs(self, s):
+        """s split into [(True, an emoji's characters) or (False, plain text)].
+        The characters that only mean something to an emoji go: fonts draw
+        them as boxes."""
+        runs, text, i = [], "", 0
+        while i < len(s):
+            found = self.match(s, i)
+            if found:
+                if text:
+                    runs.append((False, text))
+                    text = ""
+                runs.append((True, found[0]))
+                i = found[1]
+            else:
+                if s[i] not in (AS_TEXT, AS_EMOJI, JOINER):
+                    text += s[i]
+                i += 1
+        if text:
+            runs.append((False, text))
+        return runs
+
+    def image(self, chars, px):
+        """An emoji's picture, px square (None if it won't decode)."""
+        key = (chars, px)
+        if key not in self.images:
+            if len(self.images) > 200:
+                self.images.clear()
+            try:
+                at, length = self.emoji[chars]
+                self.file.seek(self.start + at)
+                png = pygame.image.load(io.BytesIO(self.file.read(length)), "emoji.png")
+                # (a few come out with a palette, which smoothscale can't take)
+                full = pygame.Surface(png.get_size(), pygame.SRCALPHA, 32)
+                full.blit(png, (0, 0))
+                self.images[key] = pygame.transform.smoothscale(full, (px, px))
+            except (OSError, pygame.error, ValueError) as e:
+                log(f"could not draw an emoji: {e}")
+                self.images[key] = None
+        return self.images[key]
+
+
+class EmojiFont(pygame.font.Font):
+    """A font that also draws emoji: at the height of its letters, and in colour
+    whatever colour the text is."""
+
+    pack = None  # read the first time some text might need it
+
+    @classmethod
+    def runs(cls, s):
+        """s as EmojiPack.runs has it, or None if it's plain text, as nearly all
+        of it is: that takes next to no time, and draws just as a Font would."""
+        if not isinstance(s, str) or s.isascii() or max(s) < EMOJI_FROM:
+            return None
+        if cls.pack is None:
+            cls.pack = EmojiPack(EMOJI_PACK)
+        runs = cls.pack.runs(s)
+        return None if runs == [(False, s)] else runs
+
+    def emoji_px(self):
+        return max(1, round(self.get_height() * 0.86))
+
+    def size(self, text):
+        runs = self.runs(text)
+        if runs is None:
+            return super().size(text)
+        px, letters = self.emoji_px(), super()
+        return sum(px if emoji else letters.size(part)[0] for emoji, part in runs), self.get_height()
+
+    def render(self, text, antialias, color, background=None):
+        runs = self.runs(text)
+        if runs is None:
+            return super().render(text, antialias, color, background)
+        px, letters = self.emoji_px(), super()
+        parts = [(emoji, self.pack.image(part, px) if emoji else letters.render(part, antialias, color, background))
+                 for emoji, part in runs]
+        width = sum(px if emoji else img.get_width() for emoji, img in parts)
+        height = max([self.get_height()] + [img.get_height() for emoji, img in parts if not emoji])
+        if background is None:
+            out = pygame.Surface((width, height), pygame.SRCALPHA, 32)
+        else:
+            out = pygame.Surface((width, height))
+            out.fill(background)
+        x = 0
+        for emoji, img in parts:
+            if img:
+                out.blit(img, (x, (height - px) // 2 if emoji else 0))
+            x += px if emoji else img.get_width()
+        return out
+
+
 class Renderer:
     """Draws the screens at any resolution. The native screens add their own
     drawing methods (see NativeScreen); add-on screens draw through ScreenUI.
@@ -2169,7 +2319,7 @@ class Renderer:
         f = self.fonts.get(key)
         if f is None:
             regular, bold_path = self.font_paths
-            f = pygame.font.Font(bold_path if bold and bold_path else regular, key[0])
+            f = EmojiFont(bold_path if bold and bold_path else regular, key[0])
             if bold and not bold_path:
                 f.set_bold(True)  # synthesize it
             self.fonts[key] = f
@@ -3461,7 +3611,7 @@ class HomeMenu:
         px = self.r.n(size)
         f = self.mono_fonts.get(px)
         if f is None:
-            f = self.mono_fonts[px] = pygame.font.Font(self.mono_path or self.r.font_paths[0], px)
+            f = self.mono_fonts[px] = EmojiFont(self.mono_path or self.r.font_paths[0], px)
         return f
 
     def mono_text(self, surf, s, x, baseline, size, color):

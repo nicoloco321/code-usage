@@ -308,6 +308,12 @@ layout follows the screen's shape: landscape screens get a wide layout with a
 clock, portrait ones the ESP32's stacked layout, and long bar panels their own
 (below).
 
+**Emoji** anywhere on the screen, like a playlist's name or a song's title, draw
+in colour. They're [Twemoji](https://github.com/jdecked/twemoji) (© Twitter, Inc
+and other contributors, [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/)),
+all 4,009 of them in `pi/emoji.pack`, which
+[pi/build_emoji.py](pi/build_emoji.py) builds.
+
 **Long bar screens** like the Waveshare 11.9" (320×1480) get two dedicated
 layouts. On its side, a **bar** shows two rows of long meters. Standing up, a
 **strip** stacks everything with a big clock at the bottom. The panel is
