@@ -7,7 +7,8 @@ own Spotify authorization, minted once here - the device turns it into
 short-lived access tokens on its own, exactly like the Anthropic login. It
 also allows playback control, for the Raspberry Pi app's previous / play /
 pause / next buttons (Spotify only takes those from Premium accounts), and
-reading your playlists, for its panel of them to play.
+reading your playlists and what you've played lately, for its panel of them
+to play, most played first.
 
 One-time Spotify app setup (free, any account):
 
@@ -46,7 +47,7 @@ AUTH_URL  = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 NOW_URL   = "https://api.spotify.com/v1/me/player/currently-playing"
 SCOPES    = ("user-read-currently-playing user-read-playback-state user-modify-playback-state "
-             "playlist-read-private playlist-read-collaborative")
+             "playlist-read-private playlist-read-collaborative user-read-recently-played")
 PORT      = 8898  # must match the Redirect URI registered on the Spotify app
 REDIRECT  = f"http://127.0.0.1:{PORT}/callback"
 
@@ -242,6 +243,9 @@ def main():
     if "playlist-read-private" not in scope:
         print("WARNING: playlist-read-private was NOT granted - "
               "the Spotify screen can't list your playlists.")
+    if "user-read-recently-played" not in scope:
+        print("WARNING: user-read-recently-played was NOT granted - "
+              "the Spotify screen can't put your most played playlists first.")
 
     # Prove the token works before flashing. 204 = authorized, nothing playing.
     ureq = urllib.request.Request(NOW_URL, headers={"Authorization": "Bearer " + access})

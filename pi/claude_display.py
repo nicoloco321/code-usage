@@ -821,7 +821,7 @@ def qr_matrix(data):
 
 SCREENS_DIR = os.path.expanduser("~/.local/share/claude-display/screens")
 SCREEN_API = 1     # what an add-on screen's manifest "api" may ask for
-NATIVE_API = 2     # what a native screen's "native_api" may ask for: the hooks below (2: + qr_matrix)
+NATIVE_API = 3     # what a native screen's "native_api" may ask for: the hooks below (2: + qr_matrix, 3: + touch)
 WELCOME = "welcome"  # the screen shown while none are installed (or set up)
 SCREEN_ID = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 SCREEN_FILE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
@@ -1129,6 +1129,10 @@ class NativeScreen:
         OWN_SPINNER, spinner_geometry(r), activity(r, surf, snap)   a spinner of its own
         hidden(r)                    another screen is showing (drop big images...)
         press(model, button)         one of its buttons was tapped (see Renderer.buttons)
+        touch(r, kind, pos)          the finger's "down", "move" and "up", at canvas pixel pos,
+                                     to swipe things; True on "up" if it wasn't a tap after all
+        swipeable(r, snap)           there's something to swipe right now, so look for touches
+                                     often enough to catch a quick flick (a resting display doesn't)
         route(req, model, path)      answer an HTTP request; True if it did
         setup(config_path)           python3 pi/claude_display.py --setup <id>
         apply_settings(model, values) -> restart?   the market changed its settings
@@ -3821,6 +3825,11 @@ def main():
     def on_canvas(pos):
         return unrotate_point(pos, rotate, *canvas.get_size())
 
+    def touch(kind, pos):
+        """Tell the screen showing what the finger's doing, for its swipes."""
+        native = model.native()
+        return bool(native and not menu.out and native.hook("touch", renderer, kind, on_canvas(pos)))
+
     clock = pygame.time.Clock()
     last_key, last_frame, last_cars, last_ip_check = None, -1, -1, 0.0
     model.looping = True
@@ -3845,11 +3854,14 @@ def main():
                         model.toggle_mode()
                 elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                     menu.press(on_canvas(ev.pos))
+                    touch("down", ev.pos)
                 elif ev.type == pygame.MOUSEMOTION:
                     menu.drag(on_canvas(ev.pos))
+                    touch("move", ev.pos)
                 elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
-                    if menu.release(on_canvas(ev.pos)):
-                        continue  # a pull on the home menu, or a tap on it
+                    swiped = touch("up", ev.pos)
+                    if menu.release(on_canvas(ev.pos)) or swiped:
+                        continue  # a pull on the home menu, a tap on it, or a screen's swipe
                     # Touchscreens send taps as clicks. A tap on a button
                     # presses it; anywhere else switches screens.
                     button = renderer.button_at(on_canvas(ev.pos), model.mode)
@@ -3896,7 +3908,8 @@ def main():
                     rects.append(renderer.draw_live_map(canvas, snap))
                 if rects:
                     present(*rects)
-            clock.tick(60 if moving else 30 if frame >= 0 or cars >= 0 else 10)
+            swipeable = snap.native and snap.native.hook("swipeable", renderer, snap)
+            clock.tick(60 if moving or swipeable else 30 if frame >= 0 or cars >= 0 else 10)
     finally:
         pygame.quit()
 
