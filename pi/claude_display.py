@@ -3359,7 +3359,8 @@ class HomeMenu:
             big, back, big.get_rect(), border_radius=round(px * k * 0.24))).copy()
         if logo:
             lw, lh = logo.get_size()
-            k = min(px * 0.62 / lw, px * 0.6 / lh)
+            wide = lw > 2 * lh  # a wordmark-like logo (F1's) may run nearer the edges
+            k = min(px * (0.84 if wide else 0.62) / lw, px * 0.6 / lh)
             logo = pygame.transform.smoothscale(logo, (max(1, round(lw * k)), max(1, round(lh * k))))
             img.blit(logo, logo.get_rect(center=(px // 2, px // 2)))
         else:
