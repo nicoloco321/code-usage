@@ -3464,7 +3464,9 @@ class HomeMenu:
         screens, ready = [], 0
         for screen in self.installed():
             native = screen if isinstance(screen, NativeScreen) else None
-            command = native and (native.manifest.get("setup") or {}).get("command")
+            setup = native and native.manifest.get("setup") or {}
+            # (not "on": "computer", a helper on the computer it works with: the meeting screens)
+            command = setup.get("on") != "computer" and setup.get("command")
             if command:  # a login made on the Pi: the thing you'll need again
                 fine = m.is_ready(screen.id) and (m.demo or not native.hook("needs_setup", m.cfg))
                 screens += [("dot", screen.name, COL_GREEN if fine else COL_YELLOW), ("code", command)]
