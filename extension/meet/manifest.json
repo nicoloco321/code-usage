@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Claude display: Meet controls",
+  "version": "1.0.0",
+  "description": "Lets the Claude Code usage display's Google Meet screen press Meet's buttons: mute, camera, push to talk, raise hand and more.",
+  "permissions": ["alarms", "scripting"],
+  "host_permissions": ["https://meet.google.com/*", "http://127.0.0.1/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [
+    {"matches": ["https://meet.google.com/*"], "js": ["meet.js"], "run_at": "document_idle"}
+  ]
+}

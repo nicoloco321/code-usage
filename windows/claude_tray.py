@@ -62,6 +62,10 @@ try:
     import display_hook
 except ImportError:
     display_hook = None
+try:
+    import meetings  # the display's Meet, Zoom and Teams screens press their buttons through it
+except ImportError:
+    meetings = None
 
 APP_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "claude-display")
 SETTINGS_PATH = os.path.join(APP_DIR, "tray.json")
@@ -318,6 +322,8 @@ class TrayApp:
         self.poll_soon = threading.Event()
         # LAN requests only: skip any system proxy.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.meetings = meetings and meetings.MeetingHelper(
+            lambda: (self.settings["host"], self.settings["port"]))
         self.icon = pystray.Icon("claude-display", draw_icon(settings["icon"], None, False, 0),
                                  "Claude display", menu=self.build_menu())
 
@@ -483,7 +489,8 @@ class TrayApp:
             menu_key = (self.status_line(), self.usage_line("seven_day"), walking, self.online,
                         self.mode, tuple(self.screens), self.beacon_enabled(), self.settings["icon"],
                         hooks_status()["ours"], hooks_status()["curl"],
-                        self.settings["host"], startup_enabled())
+                        self.settings["host"], startup_enabled(),
+                        tuple(self.meetings.summary()) if self.meetings else ())
         self.tick += 1
         if icon_key != self.icon_key:
             self.icon_key = icon_key
@@ -543,6 +550,13 @@ class TrayApp:
             yield Item("Planes log...", self.on_planes_log, enabled=lambda _: self.online)
         if "metro" in installed:
             yield Item("Metro station...", self.on_metro_station, enabled=lambda _: self.online)
+        if self.meetings and installed & set(meetings.APPS):
+            yield Menu.SEPARATOR
+            yield Item("Meeting controls", None, enabled=False)
+            for line in self.meetings.summary():
+                yield Item(f"    {line}", None, enabled=False)
+            if "meet" in installed:
+                yield Item("Meet browser extension...", self.on_meet_extension)
         yield Menu.SEPARATOR
         yield Item("Refresh", lambda: self.poll_soon.set())
         yield Item("Quit", self.on_quit)
@@ -554,6 +568,16 @@ class TrayApp:
     def on_metro_station(self):
         """The display's page for picking your Metro station, in the browser."""
         webbrowser.open(f"http://{self.settings['host']}:{self.settings['port']}/metro")
+
+    def on_meet_extension(self):
+        """The Meet screen's browser extension: its folder, and how to load it."""
+        try:
+            os.startfile(meetings.EXTENSION_DIR)
+        except OSError as e:
+            self.notify(f"Couldn't open {meetings.EXTENSION_DIR}: {e}")
+            return
+        self.notify("In Chrome or Edge, open chrome://extensions (edge://extensions), turn on "
+                    "Developer mode, choose Load unpacked, and pick this folder.")
 
     def on_mode(self, what):
         def switch():
@@ -635,11 +659,15 @@ class TrayApp:
         self.stopping.set()
         if self.beaconing:
             self.send_beacon(False)  # don't leave the display stuck on "working"
+        if self.meetings:
+            self.meetings.stop()
         self.icon.stop()
 
     def setup(self, icon):
         icon.visible = True
         threading.Thread(target=self.worker, daemon=True, name="worker").start()
+        if self.meetings:
+            self.meetings.start()
 
 
 def single_instance():

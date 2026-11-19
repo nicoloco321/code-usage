@@ -471,6 +471,9 @@ Windows notification area, next to the clock:
   the display awake through long tool runs. Without hooks, **Guess activity
   from transcripts** falls back to the `beacon.py` approach.
 - **Start with Windows.**
+- **Meeting controls**, when the display has the Screen Market's Zoom,
+  Microsoft Teams or Google Meet screen: see
+  [Meeting controls](#meeting-controls-zoom-teams-meet) below.
 
 It reads everything from the display's `GET /usage` (the Claude Usage
 screen answers it on the Pi), so the PC needs no Anthropic login and adds no
@@ -498,6 +501,49 @@ changes it later (and re-points the hooks). Windows often resolves
 > `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.3.x_…\LocalCache\Roaming\claude-display`,
 > rather than `%APPDATA%`. The hooks pin the same Python as the tray, so they
 > share it.
+
+### Meeting controls (Zoom, Teams, Meet)
+
+The Screen Market's **Zoom**, **Microsoft Teams** and **Google Meet** screens
+are big buttons for the call on your computer, with push to talk: mute,
+camera, share, raise hand, chat and the rest of each app's own toolbar. The
+display only shows them; the tray presses them, through
+[windows/meetings.py](windows/meetings.py). It finds the meeting screens on
+the display by itself, and lists how each call is going in its menu under
+**Meeting controls**.
+
+- **Zoom:** the meeting toolbar's own buttons, through Windows UI
+  Automation (`comtypes`, in requirements.txt), so nothing takes your
+  focus; your video tile says whether you're muted or on camera. Zoom hides
+  the toolbar when the mouse isn't over the call, and then it's Zoom's
+  shortcuts: the meeting comes forward for a moment and you're put back.
+  Turn on **Always show meeting controls** (Zoom's Settings > General) to
+  avoid that. Raise hand and record always use the shortcuts.
+- **Teams:** Teams' third-party app API when it's on (new Teams: **Settings >
+  Privacy > Third-party app API**; allow the display in Teams the first
+  time). Without it, the meeting window's own buttons through UI Automation
+  (raise hand and reactions from its React menu), and Teams' shortcut for
+  background blur.
+- **Meet:** a browser extension, [extension/meet](extension/meet), presses
+  Meet's buttons in its tab. In Chrome or Edge open `chrome://extensions`,
+  turn on **Developer mode**, **Load unpacked**, and pick that folder
+  (**Meet browser extension...** in the menu opens it). It only runs on
+  meet.google.com and only talks to the tray, on 127.0.0.1:47613.
+
+**Push to talk** opens the mic while you hold the button, and shuts it when
+you let go, or 2.5 s after the display last said it's held, so a dropped
+connection can't leave you talking.
+
+To check what UI Automation sees in a meeting window, or what the extension
+sees on Meet's bar (handy when an app renames a button: the names they look
+for are at the top of `meetings.py` and `extension/meet/meet.js`), or to run
+the meeting controls without the tray:
+
+```powershell
+py -3 windows\meetings.py --dump zoom
+py -3 windows\meetings.py --inspect-meet
+py -3 windows\meetings.py --host 192.168.1.42 -v
+```
 
 ## Mac menu bar app
 

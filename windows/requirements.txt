@@ -1,2 +1,3 @@
 pystray>=0.19
 pillow>=10.1
+comtypes>=1.2   # UI Automation: the meeting screens press Zoom's and Teams' buttons with it
