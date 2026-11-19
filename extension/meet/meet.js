@@ -127,7 +127,8 @@
   }
 
   // For checking these selectors against Meet as it is: what's on its bar
-  // (the helper asks: py -3 windows\meetings.py --inspect-meet). Read only.
+  // (the helper asks: py -3 windows\meetings.py --inspect-meet, or on a Mac
+  // DeskSwitch --inspect-meet). Read only.
   function controls() {
     const els = [...document.querySelectorAll("button, [role='button'], [aria-label*='hand' i], [aria-label*='caption' i]")]
       .filter(visible);

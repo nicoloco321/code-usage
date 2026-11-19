@@ -11,6 +11,9 @@
 //     can't list them, gets its own usage and Spotify screens.
 //   - Track Claude with hooks: installs the Claude Code hooks
 //     (server/display_hook.py) and runs their watcher - see ClaudeHooks.swift
+//   - Meeting controls, when the display has the Screen Market's Zoom, Teams
+//     or Google Meet screen: this presses their buttons in the call on this
+//     Mac, and lists how each call is going - see Meetings.swift
 //   - Start at login
 //
 // It speaks the display's HTTP API, the one the /switch Claude Code command uses:
@@ -54,6 +57,13 @@ final class Controller: NSObject, NSMenuDelegate {
     private var screenItems: [NSMenuItem] = []
     private var shownScreens: [Screen]?
 
+    // The meeting screens' buttons, pressed in Zoom, Teams or Meet here.
+    private let meetings = MeetingHelper(address: { (kHost, kPort) })
+    private let meetingsEnd = NSMenuItem.separator()   // their lines go just above this
+    private var meetingItems: [NSMenuItem] = []
+    private var meetingsKey: [String] = []
+    private let meetExtension = Bundle.main.object(forInfoDictionaryKey: "MeetExtensionDir") as? String
+
     private var display = DisplayState()
     private var failures = kOfflineAfter
     private var polling = false, pollAgain = false
@@ -84,7 +94,7 @@ final class Controller: NSObject, NSMenuDelegate {
             item.target = self
             menu.addItem(item)
         }
-        menu.addItem(.separator())
+        menu.addItem(meetingsEnd)
         for item in [hooksItem, loginItem] {
             item.target = self
             menu.addItem(item)
@@ -95,6 +105,7 @@ final class Controller: NSObject, NSMenuDelegate {
                                 keyEquivalent: "q"))
 
         statusItem.menu = menu
+        meetings.start()
         update()
         refresh()
         watch()
@@ -138,6 +149,7 @@ final class Controller: NSObject, NSMenuDelegate {
         let info = screens.code == 200 ? Device.json(screens.body) : nil
         if let info = info {   // the Pi app: its screens come from the Screen Market
             list = Screen.installed(info)
+            meetings.follow(screens: info)   // (a meeting screen just installed: its buttons work straight away)
         }
         if usage.code == 200, let data = Usage(json: usage.body) {
             polled(list, usage: data, mode: data.mode)
@@ -206,7 +218,53 @@ final class Controller: NSObject, NSMenuDelegate {
 
         hooksItem.state = hooksHost != nil ? .on : .off
         hooksItem.isEnabled = hooksHost != nil || hookScript != nil   // removing them needs no script
+        updateMeetings()
         setIcon()
+    }
+
+    /// The meeting screens' section: how each call is going, and what they
+    /// need from you - like the Windows tray's.
+    private func updateMeetings() {
+        let lines = meetings.summary()
+        let following = meetings.following
+        let needsAccess = !following.isDisjoint(with: ["zoom", "teams"]) && !AX.trusted()
+        let key = lines + [needsAccess ? "access" : "", following.contains("meet") ? "meet" : ""]
+        if key == meetingsKey { return }
+        meetingsKey = key
+        for item in meetingItems { menu.removeItem(item) }
+        meetingItems = []
+        guard !lines.isEmpty else { return }
+
+        var items = [NSMenuItem.separator()]
+        let header = infoItem()
+        header.title = "Meeting controls"
+        items.append(header)
+        for line in lines {
+            let item = infoItem()
+            item.title = line
+            item.indentationLevel = 1
+            items.append(item)
+        }
+        if needsAccess {
+            items.append(NSMenuItem(title: "Allow Accessibility access…", action: #selector(openAccessibility),
+                                    keyEquivalent: ""))
+        }
+        if following.contains("meet") {
+            items.append(NSMenuItem(title: "Meet browser extension…", action: #selector(openMeetExtension),
+                                    keyEquivalent: ""))
+        }
+        var at = menu.index(of: meetingsEnd)
+        for item in items {
+            if item.action != nil { item.target = self }
+            menu.insertItem(item, at: at)
+            at += 1
+        }
+        meetingItems = items
+    }
+
+    /// Quitting: shut the mic if push to talk's held, before going.
+    func shutdown() {
+        meetings.stop(wait: 1.5)
     }
 
     private func rebuildScreens() {
@@ -365,6 +423,44 @@ final class Controller: NSObject, NSMenuDelegate {
     }
 
     @objc private func cycle() { switchTo("/mode/toggle") }
+
+    /// Zoom's and Teams' buttons are pressed through Accessibility, which macOS
+    /// has you allow: this puts DeskSwitch in the list and opens it.
+    @objc private func openAccessibility() {
+        _ = AX.trusted(prompt: true)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// The Meet screen's browser extension: where it is, and how to load it.
+    @objc private func openMeetExtension() {
+        guard let dir = meetExtension else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "The Google Meet screen's browser extension"
+        alert.informativeText = """
+            Meet's buttons are pressed by a browser extension, in the code-usage folder:
+
+            \(dir)
+
+            In Chrome or Edge, open chrome://extensions (edge://extensions), turn on Developer mode, \
+            choose Load unpacked, and pick that folder (⌘⇧G in the folder picker takes a pasted path). \
+            It only runs on meet.google.com, and only talks to DeskSwitch, on 127.0.0.1:\(kMeetExtensionPort).
+            """
+        alert.addButton(withTitle: "Show in Finder")
+        alert.addButton(withTitle: "Copy Path")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: dir)])
+        case .alertSecondButtonReturn:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(dir, forType: .string)
+        default:
+            break
+        }
+    }
 
     @objc private func openMarketHelp() {
         if let url = URL(string: "https://github.com/nicoloco321/screen-market#run-it-on-casaos") {

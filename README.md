@@ -510,7 +510,8 @@ camera, share, raise hand, chat and the rest of each app's own toolbar. The
 display only shows them; the tray presses them, through
 [windows/meetings.py](windows/meetings.py). It finds the meeting screens on
 the display by itself, and lists how each call is going in its menu under
-**Meeting controls**.
+**Meeting controls**. (On a Mac, DeskSwitch does: see
+[Meeting controls on a Mac](#meeting-controls-on-a-mac).)
 
 - **Zoom:** the meeting toolbar's own buttons, through Windows UI
   Automation (`comtypes`, in requirements.txt), so nothing takes your
@@ -564,6 +565,9 @@ tray helper, in the menu bar:
   `server/display_hook.py` from this checkout with `/usr/bin/python3`, so
   rebuild the app if you move the repo. (The watcher is a Swift port of
   `display_hook.py`'s, in [mac/ClaudeHooks.swift](mac/ClaudeHooks.swift).)
+- **Meeting controls**, when the display has the Screen Market's Zoom,
+  Microsoft Teams or Google Meet screen: see
+  [Meeting controls on a Mac](#meeting-controls-on-a-mac) below.
 - **Start at login.**
 - The first line of the menu says what's wrong when there are no numbers:
   the display isn't reachable, its firmware predates `GET /usage`, or the Pi
@@ -580,6 +584,53 @@ command line tools to build:
 It looks for the display at `claude-display.local`; change `kHost` at the top
 of [mac/Display.swift](mac/Display.swift) if yours has another name. It
 replaces the DeskSwitch from the desk-screen repo (same app id).
+
+### Meeting controls on a Mac
+
+The Screen Market's **Zoom**, **Microsoft Teams** and **Google Meet** screens
+work with a Mac too: DeskSwitch presses their buttons in the call on the Mac,
+through [mac/Meetings.swift](mac/Meetings.swift), the Mac half of
+`windows/meetings.py`. It finds the meeting screens on the display by itself,
+and lists how each call is going in its menu under **Meeting controls**.
+
+- **Zoom:** the **Meeting** menu in Zoom's menu bar (*Mute audio*, *Start
+  video*, *Raise hand*...) and the meeting window's own buttons, pressed
+  through the Accessibility API, so Zoom doesn't come forward and the app
+  you're in keeps your keyboard. Their names say whether you're muted, on
+  camera or recording. If neither is there, it's Zoom's shortcuts (⇧⌘A and
+  friends), with Zoom in front for a moment, then you're put back. Leaving
+  picks **Leave meeting**, never **End meeting for all**.
+- **Teams:** Teams' third-party app API when it's on (**Settings > Privacy >
+  Third-party app API**; allow the display in Teams the first time). Without
+  it, the meeting window's buttons through Accessibility (raise hand and
+  reactions from its React menu), then Teams' shortcuts (⇧⌘M and friends).
+- **Meet:** the same browser extension as on Windows,
+  [extension/meet](extension/meet), loaded the same way (**Meet browser
+  extension...** in the menu shows you the folder). DeskSwitch listens for
+  it on 127.0.0.1:47613.
+
+Zoom and Teams need DeskSwitch allowed in **System Settings > Privacy &
+Security > Accessibility**. macOS asks the first time a Zoom or Teams screen
+turns up, and until it's allowed the menu has **Allow Accessibility
+access...** and the screen says so. Meet doesn't need it. `build.sh` signs the
+app ad hoc, so macOS takes each rebuild for a new app: if the buttons stop
+working after one, remove DeskSwitch from that list (**-**) and allow it again.
+
+**Push to talk** works as on Windows: the mic shuts when you let go, or 2.5 s
+after the display last said it's held, and quitting DeskSwitch mid-sentence
+shuts it first.
+
+To check what Accessibility sees in Zoom's or Teams' meeting window, or what
+the extension sees on Meet's bar (the names they look for are at the top of
+each app's class in `Meetings.swift`), or to run the meeting controls without
+the menu bar app, from Terminal (which then needs the Accessibility access
+itself):
+
+```sh
+mac/DeskSwitch.app/Contents/MacOS/DeskSwitch --dump zoom
+mac/DeskSwitch.app/Contents/MacOS/DeskSwitch --inspect-meet
+mac/DeskSwitch.app/Contents/MacOS/DeskSwitch --meetings --host 192.168.1.42 -v
+```
 
 ## Customizing
 

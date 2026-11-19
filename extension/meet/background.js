@@ -2,8 +2,8 @@
 //
 // meet.js, in each Meet tab, reports the call and presses Meet's buttons.
 // This hands it the display's taps, from the helper on this computer (the
-// tray app, listening on 127.0.0.1:47613), and hands the helper the call's
-// state: whether you're in one, muted, on camera...
+// Windows tray app, or DeskSwitch on a Mac, listening on 127.0.0.1:47613), and
+// hands the helper the call's state: whether you're in one, muted, on camera...
 
 const HELPER = "http://127.0.0.1:47613";
 const tabs = new Map();  // tab id -> {state, at}: what each Meet tab last said

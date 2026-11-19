@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build DeskSwitch.app - the Mac menu bar helper for the Claude Code usage
-# display: your usage, the display's screens, and the Claude Code hooks.
+# display: your usage, the display's screens, the Claude Code hooks, and the
+# buttons of the Screen Market's Zoom, Teams and Meet screens.
 #
 #   ./mac/build.sh          build into mac/DeskSwitch.app
 #   ./mac/build.sh --run    build, then (re)launch it
@@ -44,10 +45,13 @@ PLIST
 # reads it (the repo is in ~/Documents, which macOS asks permission for).
 plutil -insert DisplayHookScript -string "$(cd .. && pwd)/server/display_hook.py" \
     "$APP/Contents/Info.plist"
+# The Meet screen's browser extension, for the menu to show you in Finder
+# (again, never read by the app).
+plutil -insert MeetExtensionDir -string "$(cd .. && pwd)/extension/meet" "$APP/Contents/Info.plist"
 
 # macOS 13 for SMAppService (Start at login).
-swiftc -O -parse-as-library App.swift DeskSwitch.swift Display.swift ClaudeHooks.swift -o "$BIN" \
-    -framework Cocoa -framework ServiceManagement -target "arm64-apple-macosx13.0"
+swiftc -O -parse-as-library App.swift DeskSwitch.swift Display.swift ClaudeHooks.swift Meetings.swift \
+    -o "$BIN" -framework Cocoa -framework ServiceManagement -framework Network -target "arm64-apple-macosx13.0"
 
 # Ad-hoc signature. Without it macOS kills the app on launch on Apple silicon.
 codesign --force --sign - "$APP" >/dev/null 2>&1 || \
