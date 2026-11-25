@@ -323,20 +323,11 @@ portrait out of the box. To lay it on its side, either rotate it in
 the app turns taps to match, so touch doesn't need turning). Preview it on
 any PC with `--demo --windowed 1480x320`.
 
-```
-+--------------------------------------------------------------+
-| [Clawd] Claude Code                                10:28 PM  |
-|         usage monitor                            Tue Sep 22  |
-|--------------------------------------------------------------|
-|                    5-HOUR                              33%   |
-|    ( spinner )     resets 12:41 AM  ·  in 2h 13m             |
-|                    [##########                          ]    |
-|    working...      WEEKLY                              86%   |
-|                    resets Sat 2:28 AM  ·  in 3d 4h           |
-|                    [##################################  ]    |
-| usage ok                  claude-display.local  192.168.1.42 |
-+--------------------------------------------------------------+
-```
+![The Claude Usage screen on the 11.9" bar: Clawd and the spinner, what each Claude Code session is doing, and the 5-hour and weekly limits](docs/pi/claude-usage.png)
+
+*The Claude Usage screen as the Pi draws it on the 11.9" bar (demo data).
+Each screen's page in the [Screen Market](https://debian.tail4287f.ts.net/#/)
+has pictures like this one, drawn by a Pi, for each shape of screen.*
 
 **You need:** a Pi 2 or newer, a screen, and a network connection. The Pi 2
 has no Wi-Fi, so use Ethernet or a USB Wi-Fi dongle. Use **Raspberry Pi OS
@@ -389,10 +380,14 @@ Some to start with:
 | Screen | What it shows | Setup |
 |---|---|---|
 | [Claude Usage](https://debian.tail4287f.ts.net/#/screen/usage) | your 5-hour and weekly limits, the thinking spinner, and a panel of what each session is doing | a login made on the Pi: `server/device_login.py` |
-| [Spotify](https://debian.tail4287f.ts.net/#/screen/spotify) | now playing, with play/pause/skip buttons, the queue and your playlists | a login made on the Pi: `server/spotify_login.py` |
+| [Codex Usage](https://debian.tail4287f.ts.net/#/screen/codex) | your Codex 5-hour and weekly limits | a ChatGPT login, made on the screen with a code |
+| [Ollama](https://debian.tail4287f.ts.net/#/screen/ollama) | the models your Ollama server has loaded | the server's address (and an API key through Open WebUI) |
+| [Spotify](https://debian.tail4287f.ts.net/#/screen/spotify) | now playing, with play/pause/skip buttons, the queue, and your playlists, most played first, to swipe through and tap to play | a login made on the Pi: `server/spotify_login.py` |
 | [3D Printer](https://debian.tail4287f.ts.net/#/screen/bambu) | a Bambu Lab print's progress and temperatures | the printer's access code |
 | [Planes Overhead](https://debian.tail4287f.ts.net/#/screen/planes) | the nearest plane in its airline's livery, and a radar | your location |
 | [Formula 1](https://debian.tail4287f.ts.net/#/screen/f1) | the weekend's track with the cars moving round it live | none |
+| [Hockey](https://debian.tail4287f.ts.net/#/screen/hockey) | your NHL team's live score and the game's events, or its next games and standings | your team |
+| [Zoom](https://debian.tail4287f.ts.net/#/screen/zoom), [Teams](https://debian.tail4287f.ts.net/#/screen/teams), [Meet](https://debian.tail4287f.ts.net/#/screen/meet) | the call's buttons, and hold to talk | the tray helper or DeskSwitch on the computer with the call (see [Meeting controls](#meeting-controls-zoom-teams-meet)) |
 | [DC Metro](https://debian.tail4287f.ts.net/#/screen/metro) | every WMATA train on a live map, and your next trains | a free WMATA key |
 | [E*TRADE](https://debian.tail4287f.ts.net/#/screen/etrade) | today's gain or loss, and how each holding moved | an E*TRADE API key and a one-time login, or holdings you list |
 
@@ -417,6 +412,10 @@ off, it stays installed but the display skips it.
   display's address and port, the command that points a computer's Claude
   Code hooks at it, the logins its screens need, and how to SSH in, restart,
   read the logs and update. With a keyboard, the down arrow or M opens it.
+
+  ![The home menu on the 11.9" bar: a card for each screen with its logo and how it's doing, and Standby, Off and Settings buttons](docs/pi/home-menu.png)
+
+  ![The home menu's Settings page: this display's address, the hooks command for Claude Code, the screens' logins, and SSH, restart and log commands](docs/pi/settings.png)
 - The home menu's **Standby** button leaves only a dim clock on black, which
   moves every minute so nothing burns in. Its **Off** button blanks the screen.
   Double tap anywhere to come back to your screens (or press Esc, Space or
