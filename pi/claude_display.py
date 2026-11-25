@@ -563,6 +563,16 @@ class Model:
                 thinking=self.thinking(now), flash=flash and flash[:2],
                 host=self.host, ip=self.ip, port=self.cfg.port, mono=now, **fields)
 
+    def snapshot_as(self, snap, mode):
+        """snap as it'd be with `mode` showing, and nothing over it - for
+        drawing that screen off-screen (see Warmer)."""
+        screen = self.addons.get(mode)
+        addon = screen if isinstance(screen, AddonScreen) else None
+        native = screen if isinstance(screen, NativeScreen) else None
+        return SimpleNamespace(**{**vars(snap), "mode": mode, "addon": addon, "native": native,
+                                  "addon_view": addon.view() if addon else None,
+                                  "flash": None, "pair_code": None})
+
 
 # ---------------------------------------------------------------- helpers for screens
 
@@ -1505,7 +1515,7 @@ class ScreenUI:
         key = ("alpha", s, id(f), color)
         img = r.text_cache.get(key)
         if img is None:
-            trim(r.text_cache, 400)
+            trim(r.text_cache, TEXT_CACHE)
             img = r.text_cache[key] = blit_ready(f.render(s, True, color))
         px = r.x(x)
         if align == "c":
@@ -2127,6 +2137,10 @@ class BeaconHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- drawing
 
 SS = 3  # supersampling factor for anti-aliased shapes
+# The renderer's caches, in drawn pieces: big enough for every screen's
+# texts and shapes at once, as Warmer keeps them all drawn (~20 MB at most)
+TEXT_CACHE = 800
+SHAPE_CACHE = 400
 
 
 def blit_ready(surf):
@@ -2393,7 +2407,7 @@ class Renderer:
         key = (s, id(f), color)
         img = self.text_cache.get(key)
         if img is None:
-            trim(self.text_cache, 400)
+            trim(self.text_cache, TEXT_CACHE)
             img = self.text_cache[key] = blit_ready(f.render(s, True, color, COL_BG))
         px = self.x(x)
         if align == "c":
@@ -2412,7 +2426,7 @@ class Renderer:
                 while s and f.size(s + "\u2026")[0] > limit:
                     s = s[:-1]
                 out = s.rstrip() + "\u2026"
-            trim(self.fit_cache, 600)
+            trim(self.fit_cache, 3 * TEXT_CACHE // 2)
             self.fit_cache[key] = out
         return out
 
@@ -2437,7 +2451,7 @@ class Renderer:
         return line, self.fit(" ".join(words[i:]), max_w, size, bold)
 
     # -- shapes
-    def _ss(self, key, w, h, draw, fill=COL_BG, cache=None, most=200):
+    def _ss(self, key, w, h, draw, fill=COL_BG, cache=None, most=SHAPE_CACHE):
         """An anti-aliased shape: drawn SSx larger, smoothscaled down, cached.
         The background is transparent, so it blends into whatever is under it
         (smoothscale shifts colours a notch, which an opaque box would show).
@@ -2582,6 +2596,26 @@ class Renderer:
         self._status(surf, snap)
         if snap.pair_code:
             self._pair_card(surf, snap.pair_code)
+
+    def warm(self, surf, snap, now):
+        """Draw snap's screen onto surf, off-screen, to be thrown away. What a
+        screen draws the first time - fonts at new sizes, its text, shapes,
+        logos, a map - is what makes switching to it slow (100-300 ms on a Pi
+        2, where a redraw from the caches is 15-30). The screen showing keeps
+        its buttons, and the one warmed is told it's hidden again afterwards
+        (Planes keeps a photo only while it's really on screen)."""
+        buttons = self.buttons
+        self.buttons = (snap.mode, [])
+        try:
+            surf.fill(COL_BG)
+            if snap.addon:
+                self._addon(surf, snap, now)
+            elif snap.native:
+                self._native(surf, snap, now)
+                snap.native.hook("hidden", self)
+            self._status(surf, snap)
+        finally:
+            self.buttons = buttons
 
     def _native(self, surf, snap, now):
         """A native screen draws itself; if it throws, say so on the screen."""
@@ -3106,15 +3140,17 @@ class HomeMenu:
         (a few hundred ms on a Pi 2). The main loop calls this when nothing's
         sliding. It looks every 10 s at most - every minute while something
         animates (`busy`: drawing it costs a spinner a frame or two) - and
-        draws only if it'd change."""
+        draws only if it'd change. True if it drew."""
         if self.out or snap.mono - self.prepared < (60 if busy else 10):
-            return
+            return False
         self.prepared = snap.mono
         self.page, self.sheet = "screens", 0  # (what coming down shows)
         key = self.scene_key(snap, now)
-        if key != self.key:
-            self.key, self.drawn = key, None
-            self.render(snap, now)
+        if key == self.key:
+            return False
+        self.key, self.drawn = key, None
+        self.render(snap, now)
+        return True
 
     def rest_frame(self, canvas, snap, now):
         """Put the rest screen on the canvas, afresh each minute (a window over
@@ -3736,6 +3772,46 @@ class HomeMenu:
         return out + [line] if line else out
 
 
+class Warmer:
+    """Draws the screens that aren't showing, off-screen, one now and then
+    while the display has nothing else to do, so the first draw after a
+    switch isn't that screen's first draw at all (see Renderer.warm). Each
+    is drawn again once what it shows has changed (new data, a logo come in)
+    - 30 s after it was last drawn at the soonest, or five minutes while
+    something on screen animates, since a warm draw costs a spinner a frame."""
+
+    def __init__(self, model, renderer):
+        self.m, self.r = model, renderer
+        self.surf = None      # what they're drawn on (and thrown away)
+        self.seen = {}        # screen -> (its scene key, when) as last drawn, warm or for real
+        self.looked = -1e9    # when step() last looked
+
+    def drawn(self, mode, key, mono):
+        """The main loop drew `mode` for real."""
+        self.seen[mode] = (key, mono)
+
+    def step(self, canvas, snap, now, busy):
+        """Warm one screen, if one's due; True if it drew."""
+        if snap.mono - self.looked < (5 if busy else 1):
+            return False
+        self.looked = snap.mono
+        again = 300 if busy else 30
+        for mode in self.m.modes():
+            key, at = self.seen.get(mode, (None, -1e9))
+            if mode == snap.mode or snap.mono - at < again or not self.m.is_ready(mode):
+                continue
+            other = self.m.snapshot_as(snap, mode)
+            fresh = self.r.scene_key(other, now)
+            self.seen[mode] = (fresh, snap.mono)  # (unchanged: not looked at again for a while)
+            if fresh == key:
+                continue
+            if self.surf is None or self.surf.get_size() != canvas.get_size():
+                self.surf = canvas.copy()
+            self.r.warm(self.surf, other, now)
+            return True
+        return False
+
+
 # ---------------------------------------------------------------- main
 
 def forever(fn, *args):
@@ -3883,6 +3959,7 @@ def main():
         native.hook("on_layout", model, renderer)  # e.g. how big Spotify's album art is
     renderer.warm_spinner()  # draw the spark's frames now, not mid-animation
     menu = HomeMenu(model, renderer)
+    warmer = Warmer(model, renderer)
     menu.render(model.snapshot(), datetime.datetime.now().astimezone())  # and the menu's icons
     market = cfg.get("market", "url", MARKET_URL)  # once the layout's known: the market shows it
     if market and not args.demo:
@@ -3981,6 +4058,7 @@ def main():
             if key != last_key:
                 last_key, last_frame, last_cars = key, frame, cars
                 renderer.draw(canvas, snap, now)
+                warmer.drawn(snap.mode, key, snap.mono)
                 present()
             else:  # repaint and push only what moved
                 rects = [renderer.draw_slide(canvas, snap, now)] if moving else []
@@ -3993,8 +4071,11 @@ def main():
                 if rects:
                     present(*rects)
             swipeable = snap.native and snap.native.hook("swipeable", renderer, snap)
-            if not moving:  # (not mid-slide: drawing it would cost the slide frames)
-                menu.prepare(snap, now, busy=frame >= 0 or cars >= 0)
+            # Off-screen drawing, one at most a frame, never mid-slide (it'd
+            # cost the slide frames) or with a finger maybe on a list
+            busy = frame >= 0 or cars >= 0
+            if not moving and not menu.prepare(snap, now, busy) and not swipeable:
+                warmer.step(canvas, snap, now, busy)
             clock.tick(60 if moving or swipeable else 30 if frame >= 0 or cars >= 0 else 10)
     finally:
         pygame.quit()
