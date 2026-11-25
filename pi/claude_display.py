@@ -79,13 +79,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-# piwheels' pygame (Bullseye) warns about NEON on every start; it's harmless.
+# piwheels' pygame (Bullseye) warns about NEON on every start. What its lack
+# costs is pygame's own blending of see-through pixels, which blit_ready()
+# steers round, so the warning has nothing left to say.
 warnings.filterwarnings("ignore", message="Your system is neon capable")
+# pygame drags in two big things the display never uses: pkg_resources (to
+# find its own data files; it has a fallback) and numpy (for surfarray). On a
+# Pi 2 they're 2.8 s of the 3.2 s pygame takes to import, at every start. So
+# they're kept out while it imports. Either can still be imported afterwards -
+# a screen that wants numpy gets it; only pygame.surfarray goes without.
+_KEPT_OUT = [name for name in ("numpy", "pkg_resources") if name not in sys.modules]
+sys.modules.update(dict.fromkeys(_KEPT_OUT))
 try:
     import pygame
     import pygame.gfxdraw  # anti-aliased discs with an exact colour inside (ScreenUI.circle)
 except ImportError:
     sys.exit("pygame is missing - on the Pi run:  sudo apt install python3-pygame")
+finally:
+    for _name in _KEPT_OUT:
+        if sys.modules.get(_name, False) is None:
+            del sys.modules[_name]
 
 # Native screens `from claude_display import *`, even when this runs as __main__.
 sys.modules.setdefault("claude_display", sys.modules[__name__])
@@ -535,6 +548,7 @@ class Model:
         screen = self.addons.get(self.mode)
         addon = screen if isinstance(screen, AddonScreen) else None
         native = screen if isinstance(screen, NativeScreen) else None
+        on = len(self.modes())  # (once: it's every frame, and each screen's looked up)
         with self.lock:
             flash = self.flash_msg if self.flash_msg and self.flash_msg[2] > now else None
             fields = {}
@@ -543,8 +557,7 @@ class Model:
             return SimpleNamespace(
                 mode=self.mode, sessions=self.sessions_now(now),
                 addon=addon, addon_view=addon.view() if addon else None, native=native,
-                pair_code=self.pairing.showing, screens=len(self.modes()),
-                screens_off=len(self.addons.ids()) - len(self.modes()),
+                pair_code=self.pairing.showing, screens=on, screens_off=len(self.addons.ids()) - on,
                 link_code=self.link and self.link.code, link_url=self.link and self.link.code_url,
                 market=self.link and self.link.site,
                 thinking=self.thinking(now), flash=flash and flash[:2],
@@ -1492,9 +1505,8 @@ class ScreenUI:
         key = ("alpha", s, id(f), color)
         img = r.text_cache.get(key)
         if img is None:
-            if len(r.text_cache) > 400:
-                r.text_cache.clear()
-            img = r.text_cache[key] = f.render(s, True, color)
+            trim(r.text_cache, 400)
+            img = r.text_cache[key] = blit_ready(f.render(s, True, color))
         px = r.x(x)
         if align == "c":
             px -= img.get_width() // 2
@@ -1559,6 +1571,19 @@ class ScreenUI:
         if w <= 1:  # a hairline doesn't gain from supersampling
             pygame.draw.lines(self.surface, color, closed, [self._px(x, y) for x, y in points], w)
             return
+        # Drawn lines are kept: a chart's are the same each redraw until its
+        # data changes, and one across a bar takes ~10 ms to draw on a Pi 2.
+        key = (tuple(map(tuple, points)), color, w, closed)
+        cache = self.r.line_cache
+        drawn = cache.get(key)
+        if drawn is None:
+            trim(cache, 60)
+            drawn = cache[key] = self._draw_lines(points, color, w, closed)
+        if drawn:
+            self.surface.blit(*drawn)
+
+    def _draw_lines(self, points, color, w, closed):
+        """lines(), drawn: (the picture, where it goes), or None for nothing."""
         r = self.r  # (unrounded pixels: a curve's many points would each round a different way)
         pts = [(r.ox + x * r.s, r.oy + y * r.s) for x, y in points]
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
@@ -1567,7 +1592,7 @@ class ScreenUI:
         bw = int(max(xs) + pad) - x0
         bh = int(max(ys) + pad) - y0
         if bw <= 0 or bh <= 0:
-            return
+            return None
         big = pygame.Surface((bw * SS, bh * SS), pygame.SRCALPHA, 32)
         big.fill((*color, 0))  # same colour, clear: edges ramp in alpha only, so
         local = [(round((px - x0) * SS), round((py - y0) * SS)) for px, py in pts]  # no dark
@@ -1575,7 +1600,7 @@ class ScreenUI:
         pygame.draw.lines(big, color, closed, local, lw)                            # over
         for p in local:  # fill the mitre gaps so joints and ends are round         # anything
             pygame.draw.circle(big, color, p, lw // 2)
-        self.surface.blit(pygame.transform.smoothscale(big, (bw, bh)), (x0, y0))
+        return blit_ready(pygame.transform.smoothscale(big, (bw, bh))), (x0, y0)
 
     def circle(self, cx, cy, radius, color=COL_TEXT, width=0):
         """A disc, or a ring `width` wide, anti-aliased. A disc is drawn with
@@ -1632,11 +1657,10 @@ class ScreenUI:
                 src = pygame.image.load(io.BytesIO(data))
             iw, ih = src.get_size()
             k = min(box.w / iw, box.h / ih)
-            img = pygame.transform.smoothscale(src.convert_alpha() if pygame.display.get_init()
-                                               and pygame.display.get_surface() else src,
-                                               (max(1, int(iw * k)), max(1, int(ih * k))))
-            if len(cache) > 40:
-                cache.clear()
+            img = blit_ready(pygame.transform.smoothscale(
+                src.convert_alpha() if pygame.display.get_init() and pygame.display.get_surface() else src,
+                (max(1, int(iw * k)), max(1, int(ih * k)))))
+            trim(cache, 40)
             cache[ck] = img
         self.surface.blit(img, img.get_rect(center=box.center))
 
@@ -2105,6 +2129,33 @@ class BeaconHandler(BaseHTTPRequestHandler):
 SS = 3  # supersampling factor for anti-aliased shapes
 
 
+def blit_ready(surf):
+    """surf, made quick to blit; keep what it returns. pygame blends a
+    see-through surface itself, a pixel at a time, and the pygame a Pi gets
+    from piwheels has no NEON: on a Pi 2 that's ~0.4 us a pixel, 21 ms for
+    one usage bar. Run-length encoded, SDL blends it instead and skips the
+    clear and solid runs - 10 to 40 times quicker, quicker even for a surface
+    blitted once, and the same picture to within 1 in 255. An opaque one (a
+    font's 8-bit text, a 24-bit JPEG) is converted to the screen's own pixel
+    format, which blits at twice the speed."""
+    if surf.get_flags() & pygame.SRCALPHA:
+        surf.set_alpha(255, pygame.RLEACCEL)
+        return surf
+    screen = pygame.display.get_surface()
+    if screen is not None and surf.get_bitsize() != screen.get_bitsize():
+        return surf.convert()
+    return surf
+
+
+def trim(cache, most):
+    """Keep a cache (a dict, oldest first) to `most` entries by forgetting the
+    oldest quarter once it's past that - not all of it, which left the next
+    frame to draw every text and shape afresh at once."""
+    if len(cache) > most:
+        for key in list(cache)[:len(cache) - most * 3 // 4]:
+            del cache[key]
+
+
 def find_fonts():
     for regular, bold in FONT_CANDIDATES:
         if os.path.exists(regular):
@@ -2204,7 +2255,7 @@ class EmojiPack:
                 # (a few come out with a palette, which smoothscale can't take)
                 full = pygame.Surface(png.get_size(), pygame.SRCALPHA, 32)
                 full.blit(png, (0, 0))
-                self.images[key] = pygame.transform.smoothscale(full, (px, px))
+                self.images[key] = blit_ready(pygame.transform.smoothscale(full, (px, px)))
             except (OSError, pygame.error, ValueError) as e:
                 log(f"could not draw an emoji: {e}")
                 self.images[key] = None
@@ -2298,24 +2349,28 @@ class Renderer:
         self.fonts = {}
         self.text_cache = {}
         self.shape_cache = {}
+        self.bar_cache = {}     # bar()'s, apart: see there
+        self.line_cache = {}    # add-on screens' anti-aliased lines, drawn: see ScreenUI.lines
         self.addon_images = {}  # add-on screens' decoded images: see ScreenUI.image
         self.natives = list(natives)
         for native in self.natives:
             native.hook("init_renderer", self)
 
-    # design units -> pixels
+    # design units -> pixels. (Called thousands of times a frame, so kept to
+    # the bone: round() of a float is already an int.)
     def x(self, v):
-        return int(round(self.ox + v * self.s))
+        return round(self.ox + v * self.s)
 
     def y(self, v):
-        return int(round(self.oy + v * self.s))
+        return round(self.oy + v * self.s)
 
     def n(self, v):
-        return max(1, int(round(v * self.s)))
+        return max(1, round(v * self.s))
 
     def rect(self, x, y, w, h):
-        x0, y0 = self.x(x), self.y(y)
-        return pygame.Rect(x0, y0, self.x(x + w) - x0, self.y(y + h) - y0)
+        s, ox, oy = self.s, self.ox, self.oy
+        x0, y0 = round(ox + x * s), round(oy + y * s)
+        return pygame.Rect(x0, y0, round(ox + (x + w) * s) - x0, round(oy + (y + h) * s) - y0)
 
     # -- text
     def font(self, size, bold=False):
@@ -2338,9 +2393,8 @@ class Renderer:
         key = (s, id(f), color)
         img = self.text_cache.get(key)
         if img is None:
-            if len(self.text_cache) > 400:
-                self.text_cache.clear()
-            img = self.text_cache[key] = f.render(s, True, color, COL_BG)
+            trim(self.text_cache, 400)
+            img = self.text_cache[key] = blit_ready(f.render(s, True, color, COL_BG))
         px = self.x(x)
         if align == "c":
             px -= img.get_width() // 2
@@ -2358,8 +2412,7 @@ class Renderer:
                 while s and f.size(s + "\u2026")[0] > limit:
                     s = s[:-1]
                 out = s.rstrip() + "\u2026"
-            if len(self.fit_cache) > 600:
-                self.fit_cache.clear()
+            trim(self.fit_cache, 600)
             self.fit_cache[key] = out
         return out
 
@@ -2384,23 +2437,24 @@ class Renderer:
         return line, self.fit(" ".join(words[i:]), max_w, size, bold)
 
     # -- shapes
-    def _ss(self, key, w, h, draw, fill=COL_BG):
+    def _ss(self, key, w, h, draw, fill=COL_BG, cache=None, most=200):
         """An anti-aliased shape: drawn SSx larger, smoothscaled down, cached.
         The background is transparent, so it blends into whatever is under it
         (smoothscale shifts colours a notch, which an opaque box would show).
         `fill` is the colour the edges ramp from: COL_BG for a shape that sits
         on the background, or the shape's own colour for one drawn over other
-        things (a circle on an icon), so its rim fades in alpha, not to a seam."""
+        things (a circle on an icon), so its rim fades in alpha, not to a seam.
+        `cache` (default shape_cache) keeps up to `most` of them."""
+        cache = self.shape_cache if cache is None else cache
         key = (key, w, h)
-        img = self.shape_cache.get(key)
+        img = cache.get(key)
         if img is None:
             big = pygame.Surface((w * SS, h * SS), pygame.SRCALPHA, 32)
             big.fill((*fill, 0))
             draw(big, SS)
-            img = pygame.transform.smoothscale(big, (w, h))
-            if len(self.shape_cache) > 200:
-                self.shape_cache.clear()
-            self.shape_cache[key] = img
+            img = blit_ready(pygame.transform.smoothscale(big, (w, h)))
+            trim(cache, most)
+            cache[key] = img
         return img
 
     def mascot(self, surf, x, y, cell):
@@ -2433,7 +2487,9 @@ class Renderer:
                 pygame.draw.rect(big, color, big.get_rect(), border_radius=r * k)
                 big.set_clip(None)
 
-        surf.blit(self._ss(("bar", fill, color, r), w, h, draw), rect.topleft)
+        # (in a cache of their own: a progress bar's fill moves on every second,
+        # and those would crowd everything else out of shape_cache)
+        surf.blit(self._ss(("bar", fill, color, r), w, h, draw, cache=self.bar_cache, most=16), rect.topleft)
 
     def spinner(self, surf, cx, cy, size, frame):
         """Claude's spark: 12 teardrop rays, long and short alternating, fat end
@@ -2660,7 +2716,7 @@ class Renderer:
     def text_on(self, surf, s, x, baseline, size, color, bold=False):
         """Centred text with a transparent background, for drawing on cards."""
         f = self.font(size, bold)
-        img = f.render(s, True, color)
+        img = blit_ready(f.render(s, True, color))
         surf.blit(img, (self.x(x) - img.get_width() // 2, self.y(baseline) - f.get_ascent()))
 
     # where the status line starts: (x, baseline, text size)
@@ -2886,7 +2942,9 @@ class HomeMenu:
         self.tapped = -1e9      # when the rest screen was last tapped
         self.surf = None        # the menu, drawn
         self.under = None       # the screen it slides over
+        self.spare = None       # the surface that holds it, kept (a fresh copy is 8 ms on a Pi 2)
         self.key = None         # what self.surf shows
+        self.prepared = -1e9    # when prepare() last looked
         self.drawn = None       # how far down it was last put on the canvas
         self.hits = []          # [(rect, what tapping there does)] as last drawn
         self.touched = 0.0      # when anyone last touched it
@@ -2900,6 +2958,7 @@ class HomeMenu:
         self.shadow = pygame.Surface((self.W, depth), pygame.SRCALPHA)
         for i in range(depth):
             self.shadow.fill((0, 0, 0, round(130 * (1 - i / depth) ** 2)), (0, i, self.W, 1))
+        self.shadow = blit_ready(self.shadow)  # it's blitted every frame of a slide
 
     @property
     def out(self):
@@ -3007,7 +3066,11 @@ class HomeMenu:
         if self.resting:
             return self.rest_frame(canvas, snap, now)
         if self.fresh:  # coming down: keep the screen it covers
-            self.fresh, self.under, self.key = False, canvas.copy(), None
+            if self.spare is None or self.spare.get_size() != canvas.get_size():
+                self.spare = canvas.copy()
+            else:
+                self.spare.blit(canvas, (0, 0))
+            self.fresh, self.under, self.drawn = False, self.spare, None
         if self.stale and self.under is not None:  # going up: to the screen as it is now
             self.stale = False
             self.r.draw(self.under, snap, now)
@@ -3036,6 +3099,22 @@ class HomeMenu:
             if self.pos <= 0 and not self.moving:
                 self.under = None  # all the way up: the screen gets drawn afresh
         return True
+
+    def prepare(self, snap, now, busy=False):
+        """Draw the screens page ahead of time while the menu's up out of
+        sight, so a pull starts moving at once rather than after drawing it
+        (a few hundred ms on a Pi 2). The main loop calls this when nothing's
+        sliding. It looks every 10 s at most - every minute while something
+        animates (`busy`: drawing it costs a spinner a frame or two) - and
+        draws only if it'd change."""
+        if self.out or snap.mono - self.prepared < (60 if busy else 10):
+            return
+        self.prepared = snap.mono
+        self.page, self.sheet = "screens", 0  # (what coming down shows)
+        key = self.scene_key(snap, now)
+        if key != self.key:
+            self.key, self.drawn = key, None
+            self.render(snap, now)
 
     def rest_frame(self, canvas, snap, now):
         """Put the rest screen on the canvas, afresh each minute (a window over
@@ -3301,6 +3380,7 @@ class HomeMenu:
             corners = pygame.Surface(size, pygame.SRCALPHA)
             pygame.draw.rect(corners, (255, 255, 255, 255), corners.get_rect(), border_radius=radius)
             img.blit(corners, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+            img = self.backs[key] = blit_ready(img)
         return img
 
     @staticmethod
@@ -3344,9 +3424,10 @@ class HomeMenu:
         key = (screen.id, px, ready)
         img = self.icons.get(key)
         if img is None:
-            img = self.icons[key] = self.make_icon(screen, px, accent)
+            img = self.make_icon(screen, px, accent)
             if not ready:  # faded, like a greyed-out app
                 img.fill((255, 255, 255, 105), special_flags=pygame.BLEND_RGBA_MULT)
+            img = self.icons[key] = blit_ready(img)
         ui.surface.blit(img, (self.r.x(x), self.r.y(y)))
 
     def make_icon(self, screen, px, accent):
@@ -3626,7 +3707,7 @@ class HomeMenu:
         key = ("mono", s, id(f), color)
         img = self.r.text_cache.get(key)
         if img is None:
-            img = self.r.text_cache[key] = f.render(s, True, color)
+            img = self.r.text_cache[key] = blit_ready(f.render(s, True, color))
         surf.blit(img, (self.r.x(x), self.r.y(baseline) - f.get_ascent()))
 
     def wrap_code(self, text, max_w, size):
@@ -3912,6 +3993,8 @@ def main():
                 if rects:
                     present(*rects)
             swipeable = snap.native and snap.native.hook("swipeable", renderer, snap)
+            if not moving:  # (not mid-slide: drawing it would cost the slide frames)
+                menu.prepare(snap, now, busy=frame >= 0 or cars >= 0)
             clock.tick(60 if moving or swipeable else 30 if frame >= 0 or cars >= 0 else 10)
     finally:
         pygame.quit()
